@@ -1,0 +1,211 @@
+"""Integration tests for :class:`EchosStatusWorker` on a real ``QThread``.
+
+Mirrors ``test_info_worker.py``: the worker lives on a real QThread,
+``configure`` crosses the boundary via QueuedConnection exactly as the
+production GUI drives it, and snapshots come back the same way. The
+device is the M1-A fake firmware behind ``httpx.MockTransport``,
+injected through the worker's ``client_factory``.
+
+Per the qt-worker-threading skill, new workers must pin:
+a start→stop→start cycle (fresh worker per cycle — like InfoWorker,
+a stopped worker stays stopped by design) and a stop-during-busy-slot
+case (here: a transport that hangs forever inside asyncio — only the
+task-cancel path in ``stop()`` can unwind it, since httpx timeouts
+live in the real transport, not in a custom mock).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import httpx
+from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, Signal
+
+from echosmonitor.core.echos_api import EchosApiClient
+from echosmonitor.core.echos_status import EchosStatusWorker
+from echosmonitor.core.models import EchosDeviceSnapshot, EchosPollTarget
+from tests.core.echos_fake import FakeEchosFirmware
+
+_SNAPSHOT_DEADLINE_MS = 5000
+_THREAD_JOIN_MS = 2000
+
+
+class _Trigger(QObject):
+    """Test-thread emitter so ``configure`` crosses the thread boundary
+    queued, exactly as the GUI's ``_echosTargetsChanged`` signal does."""
+
+    configureRequested = Signal(object)  # noqa: N815
+
+
+class _HangingTransport(httpx.AsyncBaseTransport):
+    """A device that accepts the request and never answers.
+
+    httpx timeout config is enforced by the real transport (httpcore),
+    so a custom mock sleeping forever is NOT bounded by the client's
+    timeouts — only ``EchosStatusWorker.stop()``'s task-cancel can
+    unwind it. That makes this the sharpest stop-during-busy probe.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(60.0)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _target(poll_interval_s: float = 1.0) -> EchosPollTarget:
+    return EchosPollTarget(
+        name="echos-field-01",
+        host="echos-test.local",
+        http_port=80,
+        poll_interval_s=poll_interval_s,
+    )
+
+
+def _factory_for(fw: FakeEchosFirmware) -> Any:
+    def factory(target: EchosPollTarget) -> EchosApiClient:
+        return EchosApiClient(
+            target.host,
+            target.http_port,
+            transport=fw.transport,
+            get_retries=0,
+            retry_delay_s=0.0,
+        )
+
+    return factory
+
+
+def _spawn(qtbot: Any, factory: Any) -> tuple[EchosStatusWorker, QThread, _Trigger]:
+    thread = QThread()
+    thread.setObjectName("echos-status-test")
+    worker = EchosStatusWorker(client_factory=factory)
+    worker.moveToThread(thread)
+    trigger = _Trigger()
+    trigger.configureRequested.connect(
+        worker.configure, type=Qt.ConnectionType.QueuedConnection
+    )
+    thread.start()
+    qtbot.waitUntil(thread.isRunning, timeout=1000)
+    # Same queued start the production MainWindow uses — the QTimer must
+    # be constructed on the worker thread (skill §5).
+    QMetaObject.invokeMethod(worker, "start", Qt.ConnectionType.QueuedConnection)
+    return worker, thread, trigger
+
+
+def _shutdown(worker: EchosStatusWorker, thread: QThread) -> None:
+    worker.stop()
+    thread.quit()
+    assert thread.wait(_THREAD_JOIN_MS), "echos-status thread did not join in time"
+
+
+def test_snapshot_crosses_real_thread(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS) as blocker:
+            trigger.configureRequested.emit((_target(),))
+        (snapshot,) = blocker.args
+        assert isinstance(snapshot, EchosDeviceSnapshot)
+        assert snapshot.device == "echos-field-01"
+        assert snapshot.firmware_version == "1.4.2"
+        assert snapshot.gnss_fix is True
+        assert snapshot.gnss_satellites == 9
+        assert snapshot.pps_locked is True
+        assert snapshot.clients_connected == 1
+        assert snapshot.ring_used_pct == 12.5
+        assert snapshot.calibration_state == "idle"
+        assert snapshot.polled_at > 0.0
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_device_is_repolled_on_interval(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        # 1 s interval → the second poll lands two scheduler ticks later.
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            trigger.configureRequested.emit((_target(poll_interval_s=1.0),))
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            pass  # second poll arrives without any new configure
+        status_polls = [r for r in fw.requests if r == ("GET", "/api/status")]
+        assert len(status_polls) >= 2
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_poll_failure_emits_closed_kind(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    fw.flaky["/api/status"] = 10**6  # unreachable forever
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        with qtbot.waitSignal(worker.pollFailed, timeout=_SNAPSHOT_DEADLINE_MS) as blocker:
+            trigger.configureRequested.emit((_target(),))
+        device, kind, message = blocker.args
+        assert device == "echos-field-01"
+        assert kind == "unreachable"
+        assert "echos-test.local" in message
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_bad_configure_payload_is_ignored(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        # Garbage payloads must not crash the worker thread (rule 4
+        # isinstance guard) — and a valid configure afterwards works.
+        trigger.configureRequested.emit("not a tuple")
+        trigger.configureRequested.emit(("not", "targets"))
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            trigger.configureRequested.emit((_target(),))
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_start_stop_start_cycle(qtbot: Any) -> None:
+    """Two full worker lifecycles against the same fake (skill §7)."""
+    fw = FakeEchosFirmware()
+    for _cycle in (1, 2):
+        worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+        try:
+            with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+                trigger.configureRequested.emit((_target(),))
+        finally:
+            _shutdown(worker, thread)
+
+
+def test_stop_interrupts_in_flight_poll(qtbot: Any) -> None:
+    """``stop()`` from the test (GUI) thread unwinds a hung poll promptly.
+
+    The hanging transport would block the poll slot for 60 s; the join
+    below succeeds within the 2 s budget only if ``stop()`` actually
+    cancels the in-flight asyncio task (rule 7: every wait bounded,
+    observable, interruptible).
+    """
+
+    def factory(target: EchosPollTarget) -> EchosApiClient:
+        return EchosApiClient(
+            target.host, target.http_port, transport=_HangingTransport(), get_retries=0
+        )
+
+    worker, thread, trigger = _spawn(qtbot, factory)
+    trigger.configureRequested.emit((_target(),))
+    # Wait until the poll is genuinely in flight — the cancel must reach
+    # an installed task, not win a race against poll start.
+    qtbot.waitUntil(lambda: worker._in_flight is not None, timeout=3000)
+    _shutdown(worker, thread)  # asserts the bounded join
+
+
+def test_stopped_worker_emits_nothing(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        worker.stop()
+        emitted: list[object] = []
+        worker.snapshotReady.connect(emitted.append)
+        trigger.configureRequested.emit((_target(),))
+        qtbot.wait(700)  # > one scheduler tick
+        assert emitted == []
+        assert fw.requests == []
+    finally:
+        _shutdown(worker, thread)

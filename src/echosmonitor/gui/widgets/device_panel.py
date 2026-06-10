@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from echosmonitor.core.exceptions import ConfigError
-from echosmonitor.core.models import ConnState
+from echosmonitor.core.models import ConnState, EchosDeviceSnapshot
 
 if TYPE_CHECKING:
     from echosmonitor.core.config_store import ConfigStore
@@ -94,6 +94,15 @@ _COL_NAME = 0
 _COL_STATE = 1
 _COL_DIAG = 2
 _COL_STATS = 3
+# M1-C: Echos firmware status (fw / uptime / clients / ring / GNSS /
+# calibration) fed by the EchosStatusWorker poller. Empty for generic
+# SeedLink devices (no ``echos:`` config section).
+_COL_ECHOS = 4
+
+# Echos column render colours: healthy text uses the default palette;
+# a failed poll renders dim amber so it reads as "stale/unreachable",
+# not as a device-down alarm (the SeedLink State column owns that).
+_ECHOS_FAIL_COLOR = "#c98f2a"
 
 # QStackedWidget pages for the body. Page 0 is the populated tree;
 # page 1 is the centred empty-state with the inline "Add device..."
@@ -129,6 +138,54 @@ def _format_bytes(n: int) -> str:
     if n < 1024**3:
         return f"{n / (1024**2):.1f} MB"
     return f"{n / (1024**3):.1f} GB"
+
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 48 * 3600:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def _format_echos_text(snapshot: EchosDeviceSnapshot) -> str:
+    """Compose the compact Echos column text for one device.
+
+    ``cal <state>`` appears only while a calibration is running or after
+    it failed — the attention states. ``idle`` is steady-state noise and
+    ``done`` persists in device RAM until reboot, so it would sit in the
+    column for days; both are visible in the tooltip instead.
+    """
+    gnss = f"GNSS {snapshot.gnss_satellites}sat" if snapshot.gnss_fix else "GNSS no fix"
+    parts = [
+        f"fw {snapshot.firmware_version}",
+        f"up {_format_uptime(snapshot.uptime_s)}",
+        f"{snapshot.clients_connected} cli",
+        f"ring {snapshot.ring_used_pct:.0f}%",
+        gnss,
+    ]
+    if snapshot.calibration_state in ("running", "failed"):
+        parts.append(f"cal {snapshot.calibration_state}")
+    return " · ".join(parts)
+
+
+def _format_echos_tooltip(snapshot: EchosDeviceSnapshot) -> str:
+    gnss_line = (
+        f"GNSS: fix, {snapshot.gnss_satellites} satellites"
+        if snapshot.gnss_fix
+        else "GNSS: no fix"
+    )
+    pps = "locked" if snapshot.pps_locked else "not locked"
+    return (
+        f"Firmware {snapshot.firmware_version} · up {_format_uptime(snapshot.uptime_s)}\n"
+        f"{gnss_line} · PPS {pps}\n"
+        f"SeedLink clients: {snapshot.clients_connected} · "
+        f"ring {snapshot.ring_used_pct:.1f}% used\n"
+        f"Calibration: {snapshot.calibration_state}"
+    )
 
 
 def _format_stats_text(status: DeviceStatus) -> str:
@@ -204,8 +261,8 @@ class DevicePanel(QDockWidget):
         self._stack = QStackedWidget(self._body)
 
         self._tree = QTreeWidget(self._stack)
-        self._tree.setColumnCount(4)
-        self._tree.setHeaderLabels(["Stream", "State", "Diagnostics", "Stats"])
+        self._tree.setColumnCount(5)
+        self._tree.setHeaderLabels(["Stream", "State", "Diagnostics", "Stats", "Echos"])
         self._tree.setRootIsDecorated(True)
         self._tree.setUniformRowHeights(True)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -223,6 +280,9 @@ class DevicePanel(QDockWidget):
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COL_DIAG, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COL_STATS, QHeaderView.ResizeMode.Stretch)
+        # Echos status is compact, fixed-shape text; sizing to contents
+        # keeps the elastic Stats column as the only width absorber.
+        header.setSectionResizeMode(_COL_ECHOS, QHeaderView.ResizeMode.ResizeToContents)
         header.setStretchLastSection(False)
         self._stack.addWidget(self._tree)
 
@@ -383,6 +443,45 @@ class DevicePanel(QDockWidget):
         color_hex = _STATE_COLORS.get(state, "#888888")
         item.setForeground(_COL_STATE, QBrush(QColor(color_hex)))
 
+    @Slot(object)
+    def on_echos_snapshot(self, snapshot: object) -> None:
+        """Render one Echos status poll into the Echos column (M1-C).
+
+        Wired QueuedConnection from ``EchosStatusWorker.snapshotReady``;
+        the payload is type-erased through ``Signal(object)`` so it gets
+        the standard isinstance guard (rule 4).
+        """
+        if not isinstance(snapshot, EchosDeviceSnapshot):
+            return
+        item = self._device_items.get(snapshot.device)
+        if item is None:
+            # Stale cross-thread delivery: rows are pre-created from the
+            # store, so an unknown device here means it was just REMOVED
+            # while a poll was in flight. Creating a row would resurrect
+            # it as a ghost (M1-C review finding) — drop the payload.
+            return
+        item.setText(_COL_ECHOS, _format_echos_text(snapshot))
+        item.setForeground(_COL_ECHOS, QBrush(self.palette().text().color()))
+        item.setToolTip(_COL_ECHOS, _format_echos_tooltip(snapshot))
+
+    @Slot(str, str, str)
+    def on_echos_poll_failed(self, device_name: str, kind: str, message: str) -> None:
+        """Mark the Echos column stale after a failed poll.
+
+        ``kind`` is the closed ``EchosErrorKind`` set from the REST
+        client; the column shows it compactly and the tooltip carries
+        the full message. The last good snapshot text is replaced —
+        showing stale numbers as if they were live would be worse than
+        showing "unreachable".
+        """
+        item = self._device_items.get(device_name)
+        if item is None:
+            # Same stale-delivery guard as ``on_echos_snapshot``.
+            return
+        item.setText(_COL_ECHOS, f"({kind})")
+        item.setForeground(_COL_ECHOS, QBrush(QColor(_ECHOS_FAIL_COLOR)))
+        item.setToolTip(_COL_ECHOS, f"Echos status poll failed: {message}")
+
     @Slot(str, str)
     def on_new_stream(self, device_name: str, nslc: str) -> None:
         device_item = self._device_items.get(device_name)
@@ -391,7 +490,7 @@ class DevicePanel(QDockWidget):
         key = (device_name, nslc)
         if key in self._stream_items:
             return
-        child = QTreeWidgetItem(device_item, [nslc, "", "", ""])
+        child = QTreeWidgetItem(device_item, [nslc, "", "", "", ""])
         device_item.addChild(child)
         device_item.setExpanded(True)
         self._stream_items[key] = child
@@ -402,7 +501,7 @@ class DevicePanel(QDockWidget):
     def _add_device_row(self, device_name: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem(
             self._tree,
-            [device_name, ConnState.DISCONNECTED.name, "", ""],
+            [device_name, ConnState.DISCONNECTED.name, "", "", ""],
         )
         item.setForeground(_COL_STATE, QBrush(QColor(_STATE_COLORS[int(ConnState.DISCONNECTED)])))
         self._tree.addTopLevelItem(item)
@@ -813,3 +912,15 @@ class DevicePanel(QDockWidget):
 
     def _stats_timer_active_for_test(self) -> bool:
         return self._stats_timer.isActive()
+
+    def _echos_text_for_test(self, device_name: str) -> str:
+        item = self._device_items.get(device_name)
+        if item is None:
+            return ""
+        return item.text(_COL_ECHOS)
+
+    def _echos_tooltip_for_test(self, device_name: str) -> str:
+        item = self._device_items.get(device_name)
+        if item is None:
+            return ""
+        return item.toolTip(_COL_ECHOS)

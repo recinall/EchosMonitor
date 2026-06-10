@@ -167,9 +167,39 @@ app connects) AND server side (the firmware's own config) — from one dialog.
         password-shaped keys out of the YAML. Commented example block in
         both `default.yaml` copies (byte-identical, loader test enforces)
         pinned by `tests/config/test_schema_echos.py`.
-- [ ] **C. Status poller** `core/echos_status.py` on a worker QThread
+- [x] **C. Status poller** `core/echos_status.py` on a worker QThread
       (pattern: InfoWorker). Feeds DevicePanel columns: firmware version,
       uptime, clients connected, ring usage, GNSS lock, calibration state.
+      Landed 2026-06-10 (15 tests; gate 813 green; code-reviewer +
+      qt-concurrency-auditor both passed after one shared finding fixed):
+  - [x] `EchosStatusWorker`: one shared worker; QTimer built inside the
+        queued `start()` slot (skill §5); each due device polled with
+        `asyncio.run` inside the tick slot (thread never parked — skill
+        §4); public GETs only (status/seedlink-status/calibrate-status),
+        sequential on one keep-alive connection (ESP32-polite), client
+        built with `get_retries=0` and NO credentials → cannot trip the
+        lockout. `stop()` is a plain method: lock-guarded in-flight
+        (loop, task) + `call_soon_threadsafe(task.cancel)` — the asyncio
+        analogue of the socket nudge; pinned by a hanging-transport test
+        that only passes if the cancel really lands (rule 7).
+  - [x] payloads `EchosPollTarget` / `EchosDeviceSnapshot` (frozen, in
+        `core/models.py`), Signal(object) + isinstance guards (rule 4);
+        targets re-pushed on every `configChanged` (only devices with an
+        `echos:` section are polled). Poller is passive fleet status —
+        rule 13 (engine autostart) untouched, M2 owns that.
+  - [x] DevicePanel: 5th column "Echos" (`fw · up · cli · ring · GNSS` +
+        `cal` only when running/failed; full detail in tooltip); failed
+        polls replace stale numbers with `(kind)` in dim amber. The old
+        4-column defensive pin consciously updated to 5 columns.
+  - [x] review finding fixed + regression-tested: a poll in flight when
+        its device is removed used to resurrect the row as a ghost —
+        late payloads for unknown rows are now dropped at the receiver.
+  - [ ] **CARRY-FORWARD (blocks M1-D sign-off):** the wire contract
+        (JSON field names) is still pinned only by the test fake — M1-C
+        now consumes `firmware_version/uptime_s/gnss.*/client_count/
+        ring_used_pct/state` and this has NOT been verified against
+        echos.local/pihw.local (devices not to be probed without the
+        user). Do a real-device smoke check before/with M1-D.
 - [ ] **D. Device dialog**: tabs *Connection* (client-side: name, host,
       SeedLink port, selectors auto-derived from StationXML channels),
       *Acquisition* (server-side: OSR, per-channel gains, emit_hn1),

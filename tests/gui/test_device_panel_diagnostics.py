@@ -184,13 +184,14 @@ def test_tooltip_absent_in_connecting_within_budget(qtbot) -> None:
     assert panel._tooltip_text_for_test("fresh") == ""
 
 
-def test_diagnostics_column_has_four_columns(qtbot) -> None:
-    """Defensive: the panel is built with 4 columns (Stream, State,
-    Diagnostics, Stats). A future header relayout that drops back to 3
-    columns would silently break diagnostics rendering — this test
-    catches that without depending on the exact column indexes."""
+def test_diagnostics_column_has_five_columns(qtbot) -> None:
+    """Defensive: the panel is built with 5 columns (Stream, State,
+    Diagnostics, Stats + the M1-C Echos status column). A future header
+    relayout that drops a column would silently break diagnostics or
+    Echos rendering — this test catches that without depending on the
+    exact column indexes."""
     statuses: dict[str, DeviceStatus] = {}
     panel, _ = _make_panel_with_status(qtbot, statuses)
-    assert panel._tree.columnCount() == 4
-    headers = [panel._tree.headerItem().text(i) for i in range(4)]
-    assert headers == ["Stream", "State", "Diagnostics", "Stats"]
+    assert panel._tree.columnCount() == 5
+    headers = [panel._tree.headerItem().text(i) for i in range(5)]
+    assert headers == ["Stream", "State", "Diagnostics", "Stats", "Echos"]

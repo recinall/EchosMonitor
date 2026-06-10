@@ -15,7 +15,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
-from PySide6.QtCore import QByteArray, QRect, QSettings, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QMetaObject,
+    QRect,
+    QSettings,
+    Qt,
+    QThread,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -50,8 +59,10 @@ from echosmonitor.core.archive_window_loader import (
 )
 from echosmonitor.core.config_store import ConfigStore
 from echosmonitor.core.deconvolution_worker import DeconvolutionWorker
+from echosmonitor.core.echos_status import EchosStatusWorker
 from echosmonitor.core.hvsr_engine import HvsrEngine
 from echosmonitor.core.info_worker import InfoWorker
+from echosmonitor.core.models import EchosPollTarget
 from echosmonitor.core.response import ResponseProvider
 from echosmonitor.core.streaming_engine import StreamingEngine
 from echosmonitor.gui.dialogs.first_run_wizard import FirstRunWizard
@@ -120,6 +131,11 @@ _SPECTROGRAM_DOCK_HEIGHT_WEIGHT = 260
 # event loop to exit. Should comfortably exceed the worker's internal
 # 2 s ``stop()`` cap so a clean shutdown never logs a join warning.
 _INFO_THREAD_JOIN_MS = 2000
+
+# closeEvent join budget for the Echos status poller thread. Its stop()
+# cancels the in-flight asyncio poll, so the slot unwinds in
+# milliseconds; 2 s matches the other worker-thread budgets.
+_ECHOS_THREAD_JOIN_MS = 2000
 
 # How long ``closeEvent`` blocks waiting for the deconvolution QThread's
 # event loop to exit. A one-shot deconvolution is sub-second, so a 2 s cap
@@ -208,6 +224,10 @@ class MainWindow(QMainWindow):
     # boundary (QueuedConnection). Carries
     # ``(token, device, nslc, output, samples, fs, start_epoch)``.
     _deconRequested = Signal(int, str, str, str, object, float, float)  # noqa: N815
+    # M1-C: Echos poll-target set, emitted from the GUI thread and
+    # delivered to ``EchosStatusWorker.configure`` across the thread
+    # boundary (QueuedConnection). Carries tuple[EchosPollTarget, ...].
+    _echosTargetsChanged = Signal(object)  # noqa: N815
 
     def __init__(
         self,
@@ -284,6 +304,27 @@ class MainWindow(QMainWindow):
         self._info_worker = InfoWorker()
         self._info_worker.moveToThread(self._info_thread)
         self._info_thread.start()
+
+        # M1-C: Echos status poller on its own QThread (one shared worker
+        # for all Echos devices — public GETs only, no credentials, so it
+        # can never trip the firmware's auth lockout). The timer is
+        # constructed inside the queued ``start()`` slot so its thread
+        # affinity is the worker thread (qt-worker-threading skill §5).
+        # Polling is passive fleet status, not acquisition — rule 13's
+        # "nothing starts without the user" applies to the engine, which
+        # stays untouched here. Panel wiring + the initial target push
+        # happen in ``_wire_engine`` (the panel exists by then).
+        self._echos_thread = QThread(self)
+        self._echos_thread.setObjectName("echos-status")
+        self._echos_worker = EchosStatusWorker()
+        self._echos_worker.moveToThread(self._echos_thread)
+        self._echosTargetsChanged.connect(
+            self._echos_worker.configure, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._echos_thread.start()
+        QMetaObject.invokeMethod(
+            self._echos_worker, "start", Qt.ConnectionType.QueuedConnection
+        )
 
         # M11 B: instrument-response deconvolution for the detail pane.
         # The provider is pure config-driven; the worker runs on its OWN
@@ -1216,6 +1257,38 @@ class MainWindow(QMainWindow):
         self._device_panel.set_connect_timeouts(
             {d.name: float(d.reconnect.connect_timeout_s) for d in self._config.devices}
         )
+        # M1-C: Echos status snapshots into the panel's Echos column.
+        # Worker → GUI is cross-thread, so both connections are
+        # explicitly Queued; payload isinstance-guarded in the slot.
+        self._echos_worker.snapshotReady.connect(
+            self._device_panel.on_echos_snapshot, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._echos_worker.pollFailed.connect(
+            self._device_panel.on_echos_poll_failed, type=Qt.ConnectionType.QueuedConnection
+        )
+        # Target set follows the config: push now and on every change
+        # (devices added/removed/edited in the dialog).
+        self._push_echos_targets()
+        self._store.configChanged.connect(self._push_echos_targets)
+
+    def _push_echos_targets(self) -> None:
+        """Rebuild the Echos poll-target set from config (M1-C).
+
+        Only devices with an ``echos:`` section are polled; the rest are
+        generic SeedLink servers with no REST API. The full tuple is the
+        payload — the worker treats it as a replacement set.
+        """
+        targets = tuple(
+            EchosPollTarget(
+                name=d.name,
+                host=d.host,
+                http_port=d.echos.http_port,
+                poll_interval_s=d.echos.poll_interval_s,
+            )
+            for d in self._store.root.devices
+            if d.echos is not None
+        )
+        self._echosTargetsChanged.emit(targets)
 
     def _on_new_stream(self, device_name: str, nslc: str) -> None:
         assert self._live_tabs is not None
@@ -1926,6 +1999,13 @@ class MainWindow(QMainWindow):
         self._info_thread.quit()
         if not self._info_thread.wait(_INFO_THREAD_JOIN_MS):
             _log.warning("info_thread_join_timeout")
+        # M1-C: stop the Echos status poller. stop() is a plain method
+        # (not a queued slot) so it interrupts an in-flight poll via the
+        # asyncio task-cancel path before the bounded join.
+        self._echos_worker.stop()
+        self._echos_thread.quit()
+        if not self._echos_thread.wait(_ECHOS_THREAD_JOIN_MS):
+            _log.warning("echos_thread_join_timeout")
         # M11 B: stop the dedicated deconvolution thread. It runs a plain
         # Qt event loop dispatching one-shot ``compute`` slots (no parked
         # blocking loop), so ``quit()`` returns it promptly.

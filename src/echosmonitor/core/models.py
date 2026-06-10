@@ -75,6 +75,51 @@ EchosErrorKind = Literal[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class EchosPollTarget:
+    """One device the M1-C status poller should poll (config → worker).
+
+    Built by the GUI from ``DeviceConfig`` (name/host) + its ``echos``
+    section and pushed to :class:`~echosmonitor.core.echos_status.
+    EchosStatusWorker` via a queued ``Signal(object)`` carrying a tuple
+    of these (rule 4: frozen payloads, isinstance-guarded on receipt).
+    Polling uses only the firmware's PUBLIC GET endpoints, so no
+    credentials travel with the target.
+    """
+
+    name: str
+    host: str
+    http_port: int = 80
+    poll_interval_s: float = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class EchosDeviceSnapshot:
+    """One successful Echos status poll (worker → GUI wire payload).
+
+    Aggregates ``GET /api/status`` (firmware, uptime, GNSS),
+    ``GET /api/seedlink/status`` (clients, ring) and
+    ``GET /api/calibrate/status`` (calibration state) into the flat,
+    Qt-free shape the DevicePanel's Echos column renders. Frozen so a
+    single instance can cross the thread boundary via a queued
+    ``Signal(object)`` safely.
+
+    ``polled_at`` is ``time.monotonic()`` at poll completion — for
+    staleness arithmetic on the GUI side, not wall-clock display.
+    """
+
+    device: str
+    firmware_version: str
+    uptime_s: float
+    gnss_fix: bool
+    gnss_satellites: int
+    pps_locked: bool
+    clients_connected: int
+    ring_used_pct: float
+    calibration_state: str
+    polled_at: float
+
+
 # Separator used to namespace per-stream engine state by device. The same
 # NSLC arriving from two different SeedLink servers must not share a ring
 # buffer, coalescer, or chain — keying by ``f"{device}{DEVICE_KEY_SEP}{nslc}"``
