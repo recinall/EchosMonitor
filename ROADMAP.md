@@ -64,26 +64,31 @@ decision log).
   - [x] fix the two surviving `unused-ignore` mypy errors
         (`streaming_engine.py:1940,2000`; the third dies with the
         event-persister block) so the gate is green from this commit.
-- [ ] **A. Rename** package `seedlink_dashboard` → `echosmonitor`; entry point
+- [x] **A. Rename** package `seedlink_dashboard` → `echosmonitor`; entry point
       `echosmonitor`; update pyproject, imports, QSettings org/app keys
       (decided: reset, log once — see decision log), platformdirs app name
       (`echosmonitor`). Full 13-surface checklist in docs/AUDIT.md §2; the
       non-import surfaces are:
-  - [ ] QSettings org/app `"SeedLinkDashboard"` (`gui/main_window.py:86–87`,
+  - [x] QSettings org/app `"SeedLinkDashboard"` (`gui/main_window.py:86–87`,
         `gui/widgets/station_browser.py:92–93`).
-  - [ ] platformdirs data dir `("seedlink_dashboard", "SeedTiLa")` in
+  - [x] platformdirs data dir `("seedlink_dashboard", "SeedTiLa")` in
         `streaming_engine.py:1689,1900`; config dir `"seedlink-dashboard"`
         in `config/loader.py:27,55`. No data migration (decision log).
-  - [ ] distribution name (`pyproject.toml:2`) + `version("seedlink-dashboard")`
+  - [x] distribution name (`pyproject.toml:2`) + `version("seedlink-dashboard")`
         lookups (`__init__.py:8`, `streaming_engine.py:1869`); entry point
         (`pyproject.toml:52`); hatch packages + `default.yaml` force-include
         (`pyproject.toml:59,62`); `importlib.resources` anchor
         (`loader.py:38`).
-  - [ ] CLI `prog` (`__main__.py:34`), structlog `app=` binding
+  - [x] CLI `prog` (`__main__.py:34`), structlog `app=` binding
         (`utils/logging.py:99`), exception base `SeedLinkDashboardError`
         (`core/exceptions.py:11` + subclasses), UI strings
         (`main_window.py:246,1043,1112–1113`, `first_run_wizard.py:185,190,564`,
         `hvsr_report.py:329`), path docstrings (`loader.py:6`, `schema.py:34`).
+  - [x] verified 2026-06-10: acceptance grep empty (only the deliberate
+        `_LEGACY_*` constants remain); ruff + mypy green;
+        `uv run echosmonitor --version` works; offscreen smoke passed with
+        both one-time notices observed (`legacy_config_ignored`,
+        `qsettings_reset_after_rename`). Reviewed: code-reviewer approve.
 - [ ] **C. Gate green + scaffold** (re-scoped: there are no tests to prune):
   - [ ] create `tests/` scaffold: conftest, import smoke test, config
         round-trip test, offscreen MainWindow construct/teardown smoke

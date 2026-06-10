@@ -45,7 +45,7 @@ uv sync                      # install (NO 'ai' extra — it must not exist)
 uv run pytest                # default gate (excludes -m perf)
 uv run ruff check src tests
 uv run mypy src
-uv run seedlink-dashboard    # rename target: uv run echosmonitor
+uv run echosmonitor
 ```
 
 ---
