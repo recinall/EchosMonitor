@@ -1,0 +1,108 @@
+# ======================
+# Python
+# ======================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg-info/
+.eggs/
+distutils/
+pip-wheel-metadata/
+
+# ======================
+# Virtual environments
+# ======================
+venv/
+.env/
+.venv/
+
+# ======================
+# Secrets — device admin passwords, WiFi credentials, SSH host passwords.
+# Use .env.example as template. Source via `source .env` for shell sessions.
+# NEVER commit .env or any variant — tracked .env.example is placeholder-only.
+# ======================
+.env
+.env.local
+.env.*
+!.env.example
+
+# ======================
+# Build artifacts (PyInstaller / Briefcase)
+# ======================
+build/
+dist/
+*.spec.bak
+*.manifest
+*.toc
+
+# ======================
+# IDE / Editor
+# ======================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ======================
+# OS files
+# ======================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ======================
+# Logs / temp / runtime state
+# ======================
+*.log
+*.tmp
+*.lock
+*.pid
+!firmware_*/dependencies.lock
+
+# ======================
+# Jupyter (se usato)
+# ======================
+.ipynb_checkpoints/
+
+# ======================
+# Test / coverage
+# ======================
+.coverage
+htmlcov/
+
+# ======================
+# Qt
+# ======================
+*.qmlc
+*.jsc
+
+# ======================
+# ESP-IDF managed components (recreated by idf.py from dependencies.lock)
+# ======================
+firmware_*/managed_components/
+
+# ======================
+# ESP-IDF generated config (sdkconfig is regenerated from sdkconfig.defaults
+# at build configure time; sdkconfig.old is auto-backup). Currently tracked
+# in repo for visibility, but ignored for new dev clones / future modifications
+# to prevent accidental commits of dev-local Kconfig drift.
+# Single source of truth: sdkconfig.defaults per variant.
+# ======================
+firmware_*/sdkconfig
+firmware_*/sdkconfig.old
+
+# ======================
+# graphify code-visualization output (regenerable)
+# ======================
+graphify-out/
+
+# ======================
+# echos_monitor runtime artefacts (per-device event recordings) — the
+# CLI / GUI defaults its EventWriter output_dir to the CWD when run
+# from the repo root, leaving `events/` at the top level. Throwaway.
+# ======================
+events/
+
