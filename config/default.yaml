@@ -13,6 +13,20 @@ ui:
   max_display_rate_hz: 250  # display-only peak decimation cap (rule 11)
 
 devices: []
+# Echos nodes carry an additional `echos:` section — CLIENT-side settings
+# only (rule 15: server-side config such as OSR, gains and the SeedLink
+# ring lives on the device, managed via its REST API; the admin password
+# lives in the OS keyring / fallback file, NEVER in this YAML):
+#
+# devices:
+#   - name: echos-field-01
+#     host: echos.local
+#     port: 18000
+#     echos:
+#       http_port: 80
+#       poll_interval_s: 5.0
+#       # position_override: { lat: 45.4, lon: 11.9, elev_m: 20.0 }  # wins over StationXML (rule 16)
+#
 # Example: TWO public servers in parallel (best-effort, throttled — for
 # smoke testing only). Each device has its own dsp_chain; the chain
 # stages are tuned to the seismic context of the network so the live

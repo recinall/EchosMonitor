@@ -259,6 +259,45 @@ class ResponseMetadataConfig(_Base):
         return self
 
 
+class PositionOverride(_Base):
+    """Manual device position (rule 16): wins over StationXML when set.
+
+    Used by the Map tab and multi-device HVSR via the shared
+    ``DevicePosition`` resolver (M4 ``core/positions.py``). Set it for
+    deployments where the device's StationXML coordinates are absent or
+    wrong (e.g. GNSS-less indoor installs).
+    """
+
+    lat: Annotated[float, Field(ge=-90.0, le=90.0)]
+    lon: Annotated[float, Field(ge=-180.0, le=180.0)]
+    elev_m: Annotated[float, Field(ge=-500.0, le=9000.0)] = 0.0
+
+
+class EchosDeviceConfig(_Base):
+    """Client-side settings for an Echos ``firmware_seedlink`` node (M1).
+
+    Deliberately minimal (rule 15): the device's REST API is the single
+    truth for server-side settings (OSR, gains, SeedLink port/ring/auth,
+    StationXML profile, network) — the YAML carries only what the app
+    needs to *reach* the device. The admin password is NEVER stored here:
+    it lives in the OS keyring (file fallback) via
+    :class:`~echosmonitor.config.credentials.CredentialsStore`, keyed by
+    the device's config ``name`` (the rule-15 "credentials reference").
+
+    A device without an ``echos`` section is a generic SeedLink server
+    (e.g. the public test servers): no REST features, no status poller.
+    """
+
+    # The firmware's HTTP REST server (plain HTTP on the LAN).
+    http_port: Annotated[int, Field(ge=1, le=65535)] = 80
+    # Manual position override (rule 16); null → StationXML coordinates.
+    position_override: PositionOverride | None = None
+    # Cadence of the M1-C status poller (status / clients / ring usage).
+    # Lower bound 1 s keeps the poller polite to the ESP32's HTTP server;
+    # upper bound 1 h rules out "never" misconfigurations.
+    poll_interval_s: Annotated[float, Field(ge=1.0, le=3600.0)] = 5.0
+
+
 class DeviceConfig(_Base):
     name: str = Field(min_length=1)
     host: str = Field(min_length=1)
@@ -270,6 +309,10 @@ class DeviceConfig(_Base):
     # M11: optional instrument-response metadata for physical-unit display
     # on fixed windows. Blank = this device stays counts-only.
     response_metadata: ResponseMetadataConfig = Field(default_factory=ResponseMetadataConfig)
+    # M1: present ⇔ this device is an Echos firmware_seedlink node managed
+    # via its REST API. Null = generic SeedLink server (rule 15 keeps
+    # server-side settings on the device, not here).
+    echos: EchosDeviceConfig | None = None
 
 
 class HvsrConfig(_Base):

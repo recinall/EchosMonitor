@@ -143,9 +143,30 @@ app connects) AND server side (the firmware's own config) — from one dialog.
   - [x] deferred to M1-C/D (reviewer notes): consider `retries=0` +
         tolerating transient 5xx for restart-status polls once the wire
         contract is pinned against real firmware.
-- [ ] **B. Credentials store** (keyring with file fallback, rule 15) +
+- [x] **B. Credentials store** (keyring with file fallback, rule 15) +
       device schema extension: `echos: {http_port: 80, position_override,
-      poll_interval_s}`.
+      poll_interval_s}`. Landed 2026-06-10 (27 tests, gate 798 green,
+      code-reviewer findings fixed + regression-tested):
+  - [x] `config/credentials.py` `CredentialsStore`: OS keyring primary
+        (injectable for tests — the real keyring is never touched), JSON
+        file fallback at `user_data_dir/credentials.json` chmod 0600 with
+        atomic writes and a loud one-time warning. Read order
+        keyring→file; a keyring write purges any stale plaintext copy;
+        delete is idempotent across both backends. Keyring errors logged
+        by exception TYPE only (backends can echo call args). Lookup key
+        = device config `name` (the rule-15 "credentials reference").
+        Blocking caveat documented: keyring can block on D-Bus/unlock —
+        never call from the GUI thread (rule 1; M1-C/D run it on workers).
+  - [x] review blocker fixed: stale `.tmp` from a hard kill used to make
+        every future fallback write fail on O_EXCL forever (and could
+        strand a secret) — now pre-unlinked, with regression test.
+  - [x] schema: optional `DeviceConfig.echos` (None = generic SeedLink
+        device, e.g. the public-server examples) with `http_port`,
+        `poll_interval_s` (1–3600 s, poller cadence) and rule-16
+        `position_override {lat, lon, elev_m}`; `extra="forbid"` keeps
+        password-shaped keys out of the YAML. Commented example block in
+        both `default.yaml` copies (byte-identical, loader test enforces)
+        pinned by `tests/config/test_schema_echos.py`.
 - [ ] **C. Status poller** `core/echos_status.py` on a worker QThread
       (pattern: InfoWorker). Feeds DevicePanel columns: firmware version,
       uptime, clients connected, ring usage, GNSS lock, calibration state.

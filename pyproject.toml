@@ -36,6 +36,10 @@ dependencies = [
     # Echos REST client (core/echos_api.py): async, typed, timeout-bounded
     # HTTP to the firmware's API (rule 15). httpx ships py.typed.
     "httpx>=0.27",
+    # Device admin-password storage (config/credentials.py, rule 15):
+    # OS keyring (Secret Service / Keychain / Credential Locker) with a
+    # chmod-600 file fallback when no usable backend exists.
+    "keyring>=25.0",
 ]
 
 # Dev tooling lives in a dependency-group (PEP 735), not an optional extra:
