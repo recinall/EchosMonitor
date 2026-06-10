@@ -152,12 +152,11 @@ class SpectrogramDock(QWidget):
         nslc: str,
         det_id: int,
         t_on: float,
-        phase: str | None = None,
     ) -> None:
         """Add an onset marker to the matching stream's wall-clock view."""
         view = self._views.get((device_name, nslc))
         if view is not None:
-            view.add_detection_marker(det_id, t_on, phase)
+            view.add_detection_marker(det_id, t_on)
 
     def set_markers_visible(self, visible: bool) -> None:
         for view in self._views.values():

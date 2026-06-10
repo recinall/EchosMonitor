@@ -24,8 +24,7 @@ What we own, and what lives here:
 
 ``hvsrpy`` objects MUST NOT leak past this module: :meth:`compute` returns a
 frozen :class:`HvsrResult` dataclass carrying only primitives / numpy arrays
-/ :class:`UTCDateTime`, exactly like the AI subsystem's ``AIAnnotation``
-boundary. The GUI layer never imports ``hvsrpy``.
+/ :class:`UTCDateTime`. The GUI layer never imports ``hvsrpy``.
 
 Counts vs physical units: H/V is a *ratio*, so when the three components
 share an identical instrument response (a single 3C sensor — the common

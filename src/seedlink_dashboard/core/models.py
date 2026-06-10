@@ -240,9 +240,8 @@ class Detection:
     * A trigger that opens and closes within one packet surfaces already
       finalised (``t_off`` set) and is recorded as a single closed row.
 
-    ``kind`` is ``'sta_lta'`` today; M9 adds ``'phasenet'`` etc. ``score``
-    is the detector-agnostic magnitude — the peak STA/LTA ratio now, a
-    model probability later. ``meta`` holds JSON-friendly extras
+    ``kind`` is ``'sta_lta'``. ``score`` is the detector-agnostic
+    magnitude — the peak STA/LTA ratio. ``meta`` holds JSON-friendly extras
     (thresholds, window lengths) and round-trips through the DAO's
     ``meta_json`` column.
     """

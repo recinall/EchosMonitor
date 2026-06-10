@@ -18,10 +18,13 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, cast
 
+import structlog
 import yaml
 from platformdirs import user_config_dir
 
 from seedlink_dashboard.config.schema import RootConfig
+
+_log = structlog.get_logger(__name__)
 
 DEFAULT_CONFIG_NAME = "config.yaml"
 _APP_NAME = "seedlink-dashboard"
@@ -94,6 +97,21 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
+def _strip_legacy_ai_key(data: dict[str, Any], source: Path) -> dict[str, Any]:
+    """Drop the removed top-level ``ai:`` section from pre-rule-12 configs.
+
+    The schema is ``extra="forbid"``, so a user file written before the AI
+    subsystem was removed would otherwise fail validation outright. Strip
+    the key and warn once per load instead; the section is never written
+    back (ConfigStore serialises from the validated model, which no longer
+    has the field).
+    """
+    if "ai" in data:
+        data = {k: v for k, v in data.items() if k != "ai"}
+        _log.warning("config_legacy_ai_key_stripped", source=str(source))
+    return data
+
+
 def load_config(path: Path | None = None) -> tuple[RootConfig, Path]:
     """Load and validate the configuration.
 
@@ -117,13 +135,13 @@ def load_config(path: Path | None = None) -> tuple[RootConfig, Path]:
     if path is not None:
         if not path.exists():
             raise FileNotFoundError(f"config file not found: {path}")
-        user_data = _read_yaml(path)
+        user_data = _strip_legacy_ai_key(_read_yaml(path), source=path)
         merged = _deep_merge(base, user_data)
         return RootConfig.model_validate(merged), path
 
     user_path = _user_config_path()
     if user_path.exists():
-        user_data = _read_yaml(user_path)
+        user_data = _strip_legacy_ai_key(_read_yaml(user_path), source=user_path)
         merged = _deep_merge(base, user_data)
         return RootConfig.model_validate(merged), user_path
 

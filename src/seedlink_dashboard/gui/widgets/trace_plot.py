@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from seedlink_dashboard.gui.widgets.marker_style import STA_LTA_COLOR, marker_color
+from seedlink_dashboard.gui.widgets.marker_style import STA_LTA_COLOR
 from seedlink_dashboard.gui.widgets.pane_header import (
     PANE_HEADER_MARGINS,
     PANE_TITLE_OBJECT_NAME,
@@ -64,20 +64,9 @@ _DROP_BADGE_DIM_STYLE = (
 
 # Detection-marker styling (M8 C1): amber, distinct from the grey trace.
 # A vertical line marks the onset (t_on); a semi-transparent region spans
-# t_on..t_off once the trigger closes. These are the default-None (STA/LTA)
-# path; AI picks build their pen/brush from ``marker_color(phase)`` (M9 C1).
+# t_on..t_off once the trigger closes.
 _MARKER_LINE_PEN = pg.mkPen(STA_LTA_COLOR, width=1)
 _MARKER_REGION_BRUSH = pg.mkBrush(224, 160, 48, 50)
-# Alpha (0..255) applied to a phase colour for its shaded region brush so
-# AI-pick regions match the amber region's translucency.
-_MARKER_REGION_ALPHA = 50
-
-
-def _region_brush_for(color: str) -> pg.mkBrush:
-    """Translucent region brush for a marker colour (matches the amber alpha)."""
-    qcolor = pg.mkColor(color)
-    qcolor.setAlpha(_MARKER_REGION_ALPHA)
-    return pg.mkBrush(qcolor)
 
 
 def _minmax_decimate(
@@ -422,48 +411,30 @@ class TracePlot(QWidget):
         t_on: float,
         t_off: float | None,
         score: float,
-        phase: str | None = None,
     ) -> None:
         """Add (or replace) a detection marker at wall-clock ``t_on``.
 
         ``t_on`` / ``t_off`` are POSIX seconds on the same axis as the
         trace (the M6 wall-clock X axis). An open detection (``t_off is
         None``) is a single onset line; a closed one also gets a shaded
-        region spanning the trigger. AI annotations (``phase`` ``"P"`` /
-        ``"S"`` picks, or ``"detection"`` for an EQTransformer span) colour
-        the line/label/region by :func:`marker_color`; STA/LTA
-        (``phase is None``) keeps the amber default. P/S picks carry
-        ``t_off=None`` so they render as just the onset line; a detection
-        segment carries ``t_off`` and so also gets a green region. Markers
-        scroll with the data and are pruned once they leave the visible
-        window (:meth:`_prune_markers`).
+        amber region spanning the trigger. Markers scroll with the data
+        and are pruned once they leave the visible window
+        (:meth:`_prune_markers`).
         """
         self._remove_marker(det_id)
-        # Any AI phase (``"P"`` / ``"S"`` / ``"detection"``) colours via the
-        # single-source ``marker_color`` — the same call the spectrogram twin
-        # makes unconditionally (rule 10 corollary: both widgets must agree on
-        # the same detection). Only STA/LTA (``phase is None``) keeps the
-        # cached amber pens. A green ``eqt_detection`` segment thus renders
-        # green on the trace AND the spectrogram, never amber on one twin.
-        if phase is not None:
-            color = marker_color(phase)
-            line_pen = pg.mkPen(color, width=1)
-            region_brush = _region_brush_for(color)
-        else:
-            color = STA_LTA_COLOR
-            line_pen = _MARKER_LINE_PEN
-            region_brush = _MARKER_REGION_BRUSH
         line = pg.InfiniteLine(
             pos=t_on,
             angle=90,
-            pen=line_pen,
+            pen=_MARKER_LINE_PEN,
             label=f"{score:.1f}",
-            labelOpts={"color": color, "position": 0.9, "movable": False},
+            labelOpts={"color": STA_LTA_COLOR, "position": 0.9, "movable": False},
         )
         self._raw_plot.addItem(line)
         region: pg.LinearRegionItem | None = None
         if t_off is not None:
-            region = pg.LinearRegionItem(values=(t_on, t_off), brush=region_brush, movable=False)
+            region = pg.LinearRegionItem(
+                values=(t_on, t_off), brush=_MARKER_REGION_BRUSH, movable=False
+            )
             region.setZValue(-10)
             self._raw_plot.addItem(region)
         marker = _DetMarker(t_on, t_off, line, region)

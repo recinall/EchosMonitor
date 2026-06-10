@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from seedlink_dashboard.config.loader import load_config
 from seedlink_dashboard.config.schema import (
-    AiConfig,
     AppConfig,
     ArchiveConfig,
     BandpassStage,
@@ -24,7 +23,6 @@ from seedlink_dashboard.config.schema import (
 )
 
 __all__ = [
-    "AiConfig",
     "AppConfig",
     "ArchiveConfig",
     "BandpassStage",

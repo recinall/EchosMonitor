@@ -69,7 +69,6 @@ from seedlink_dashboard.core.seedlink_worker import SeedLinkWorker
 from seedlink_dashboard.core.spectrogram_router import _SpectrogramRouter
 from seedlink_dashboard.dsp.factory import build_chain
 from seedlink_dashboard.storage.dao import ArchiveDao
-from seedlink_dashboard.storage.event_persister import EventPersister
 from seedlink_dashboard.storage.gap_detector import GapDetector
 from seedlink_dashboard.storage.mseed_writer import MseedWriter
 
@@ -518,12 +517,6 @@ class StreamingEngine(QObject):
         self._archive_thread: QThread | None = None
         self._archive_writers: dict[str, MseedWriter] = {}
         self._archive_senders: dict[str, _ArchiveSender] = {}
-        # M10 Stage D — persist-on-detection writer. Created on demand by
-        # :meth:`attach_event_persister` (called when an AI engagement with
-        # an enabled persist policy is wired) and moved to the storage
-        # ``_archive_thread`` so event file writes never touch the GUI/data
-        # thread (rule 8). ``None`` until attached; torn down in :meth:`stop`.
-        self._event_persister: EventPersister | None = None
         # Per-device bounded inbox: drop-oldest backpressure happens
         # naturally via ``deque(maxlen=...)``. Drained on every flush
         # tick into the per-device sender → writer pipeline.
@@ -731,25 +724,6 @@ class StreamingEngine(QObject):
         # the DSP teardown above.
         for name in list(self._archive_writers.keys()):
             self._teardown_archive_writer(name)
-        # Stop the persist-on-detection writer (M10 Stage D) before the
-        # storage thread quits so an in-flight ``persist`` is refused and no
-        # request lands on a torn-down thread. The persister shares the
-        # engine DAO (closed below), so nothing else to release here.
-        if self._event_persister is not None:
-            QMetaObject.invokeMethod(  # type: ignore[call-overload]
-                self._event_persister,
-                "close",
-                Qt.ConnectionType.BlockingQueuedConnection,
-            )
-            # ``close`` is a BlockingQueuedConnection, so it returns only once
-            # any in-flight ``persist`` on the storage thread has finished, and
-            # the ``_closed`` guard refuses every later request — no
-            # ``persisted`` / ``persistFailed`` can fire after this point. The
-            # connections are therefore dropped automatically when the object
-            # is released below; an explicit ``disconnect()`` here would only
-            # emit a spurious "Failed to disconnect (None)" RuntimeWarning when
-            # no consumer was wired.
-            self._event_persister = None
         if self._archive_thread is not None:
             self._archive_thread.quit()
             if not self._archive_thread.wait(_THREAD_JOIN_MS):
@@ -928,29 +902,13 @@ class StreamingEngine(QObject):
         samples = buf.read_last(n)
         return samples, fs, buf.latest_t
 
-    def live_streams(self) -> dict[str, list[str]]:
-        """Map each device to the NSLCs currently flowing through it.
-
-        Sourced from the live ring buffers (a stream appears once its
-        first packet has been seen), so it reflects what the user can
-        actually engage an AI agent on right now. Used by the AI
-        engagement dialog to auto-group Z/N/E components. Pure read.
-        """
-        out: dict[str, list[str]] = {}
-        for key in self._buffers:
-            device_name, _, nslc = key.partition(DEVICE_KEY_SEP)
-            out.setdefault(device_name, []).append(nslc)
-        for nslcs in out.values():
-            nslcs.sort()
-        return out
-
     def archive_root(self, device_name: str | None = None) -> Path:
-        """Resolved SDS archive root for READING (M9 Stage C).
+        """Resolved SDS archive root for READING.
 
         For a known device, returns its effective root (per-device
         ``archive.root_dir`` override, else the app default); otherwise
-        the app-level default. Used by the archive reader to run agents on
-        historical data -- pure path resolution, no I/O.
+        the app-level default. Used by the archive reader for historical
+        data -- pure path resolution, no I/O.
         """
         if device_name is not None:
             dev_cfg = next((d for d in self._engine_devices if d.name == device_name), None)
@@ -965,85 +923,6 @@ class StreamingEngine(QObject):
         index. ``None`` when no archiving/detection device created a DAO.
         """
         return self._archive_dao
-
-    def record_ai_detection(
-        self,
-        device_name: str,
-        nslc: str,
-        detection: Detection,
-    ) -> int | None:
-        """Persist an AI-agent annotation as a detection row; return its id.
-
-        The single bridge by which the AI subsystem reaches the metadata
-        DB without violating the storage boundary (CLAUDE.md rule 8):
-        :class:`~seedlink_dashboard.core.ai_engine.AIEngine` builds a
-        :class:`Detection` (``kind`` ``'phasenet'`` / ``'eqtransformer'``,
-        with the phase in ``meta``) and calls this; the row commits here
-        BEFORE AIEngine emits its ``aiAnnotation`` signal, so the pick is
-        durable before it is announced.
-
-        Unlike STA/LTA picks this does NOT emit ``detectionRecorded`` —
-        AIEngine owns the announcement (``aiAnnotation``) so the live AI
-        and STA/LTA paths stay distinguishable end to end while sharing
-        the table, markers and detail pane. AI picks are instantaneous
-        onsets (``t_off is None``) and are never updated, so they bypass
-        the open-row cache entirely.
-
-        Lazily creates the metadata DAO if no archiving/detection device
-        has triggered one yet — engaging an agent is itself a reason to
-        persist. Mutates ``detection.id`` in place. Must be called on the
-        engine thread (the same thread the DAO writes on); AIEngine
-        satisfies this by persisting in its GUI-thread slot. Returns
-        ``None`` if the stream row cannot be resolved.
-        """
-        if self._archive_dao is None:
-            self._ensure_archive_dao(self._resolve_db_root())
-        if self._archive_dao is None:  # pragma: no cover - defensive
-            return None
-        stream_id = self._ensure_stream_row(device_name, nslc)
-        if stream_id is None:
-            return None
-        det_id = self._archive_dao.record_detection(stream_id, detection)
-        detection.id = det_id
-        self._bump_detection_status(device_name, detection.t_on)
-        return det_id
-
-    def attach_event_persister(self) -> EventPersister | None:
-        """Create (idempotently) the storage-thread persist-on-detection writer.
-
-        The storage-owned half of the M10 Stage D bridge (rule 8: storage
-        code lives in storage/; the engine merely OWNS the writer object on
-        its storage thread). Returns the :class:`EventPersister` so the
-        caller (main window / AIEngine wiring) can connect
-        ``AIEngine.persistRequested → persister.persist`` via
-        ``QueuedConnection`` — that connection is what makes the file write
-        run on the storage thread.
-
-        Lazily ensures the metadata DAO and the storage ``_archive_thread``
-        exist (engaging an agent with a persist policy is itself a reason to
-        stand them up, exactly as :meth:`record_ai_detection` lazily creates
-        the DAO). Returns ``None`` only if no DAO can be created.
-        """
-        if self._event_persister is not None:
-            return self._event_persister
-        root = self._resolve_db_root()
-        if self._archive_dao is None:
-            self._ensure_archive_dao(root)
-        if self._archive_dao is None:  # pragma: no cover - defensive
-            return None
-        if self._archive_thread is None:
-            self._archive_thread = QThread(self)
-            self._archive_thread.setObjectName("storage")
-            self._archive_thread.start()
-        persister = EventPersister(root, self._archive_dao)
-        persister.moveToThread(self._archive_thread)
-        self._event_persister = persister
-        _log.info("streaming_engine_event_persister_attached", archive_root=str(root))
-        return persister
-
-    def event_persister(self) -> EventPersister | None:
-        """The persist-on-detection writer if attached this session, else None."""
-        return self._event_persister
 
     # ------------------------------------------------------------------
     # Internal
@@ -1691,7 +1570,7 @@ class StreamingEngine(QObject):
     @staticmethod
     def _device_has_detection(dev_cfg: DeviceConfig) -> bool:
         """True if the device's DSP chain contains a detection-producing
-        stage (STA/LTA today; AI detectors join the same predicate in M9)."""
+        stage (STA/LTA)."""
         return any(getattr(stage, "type", None) == "sta_lta" for stage in dev_cfg.dsp_chain)
 
     def _ensure_stream_row(self, device_name: str, nslc: str) -> int | None:
@@ -1937,7 +1816,7 @@ class StreamingEngine(QObject):
             status.archive_last_error = None
 
         # Kick the writer's fsync timer on its own thread.
-        QMetaObject.invokeMethod(  # type: ignore[call-overload]
+        QMetaObject.invokeMethod(
             writer,
             "start",
             Qt.ConnectionType.QueuedConnection,
@@ -1997,7 +1876,7 @@ class StreamingEngine(QObject):
         # way the M3p2 / M4 closure flake demonstrated for the DSP
         # router (POSTMORTEMS 2026-05-10 entry "Flaky multi-device
         # tests resolved").
-        QMetaObject.invokeMethod(  # type: ignore[call-overload]
+        QMetaObject.invokeMethod(
             writer,
             "close_all",
             Qt.ConnectionType.BlockingQueuedConnection,

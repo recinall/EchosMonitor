@@ -51,16 +51,9 @@ from PySide6.QtWidgets import (
 )
 
 from seedlink_dashboard.core.models import Detection
-from seedlink_dashboard.gui.widgets.marker_style import marker_color
 
 # Refresh cadence for open-duration ticks + time-window re-filtering.
 _TICK_MS = 1000
-# STA/LTA kind string; everything else (phasenet/eqtransformer/gpd) is an
-# AI pick and gets a faint phase-coloured row tint in the Kind cell.
-_STA_LTA_KIND = "sta_lta"
-# Alpha (0..255) for the AI-pick Kind-cell tint — subtle so it reads as a
-# hint, not a highlight.
-_AI_KIND_TINT_ALPHA = 48
 # A custom role returning a sortable scalar per column (posix time, float
 # score, float duration) so the proxy sorts numerically/chronologically
 # regardless of the display string.
@@ -171,26 +164,7 @@ class DetectionTableModel(QAbstractTableModel):
             from PySide6.QtGui import QColor
 
             return QColor("#888")
-        if role == Qt.ItemDataRole.BackgroundRole and col == DetectionColumn.KIND:
-            return self._kind_tint(det)
         return None
-
-    @staticmethod
-    def _kind_tint(det: Detection) -> object:
-        """Faint phase-coloured tint for AI-pick Kind cells; None for STA/LTA.
-
-        AI picks (``kind != "sta_lta"``) tint the Kind cell pale blue (P)
-        / red (S) via :func:`marker_color` at low alpha so they read as
-        visually distinct from amber STA/LTA rows without shouting.
-        """
-        if det.kind == _STA_LTA_KIND:
-            return None
-        from PySide6.QtGui import QColor
-
-        phase = det.meta.get("phase") if isinstance(det.meta, dict) else None
-        color = QColor(marker_color(phase if isinstance(phase, str) else None))
-        color.setAlpha(_AI_KIND_TINT_ALPHA)
-        return color
 
     # ----- mutation ----------------------------------------------------
     def add_detection(self, detection: Detection, *, historical: bool = False) -> None:
@@ -298,18 +272,11 @@ class DetectionFilterProxy(QSortFilterProxyModel):
         self._nslc: str | None = None
         self._min_score: float = 0.0
         self._window_s: float | None = None
-        # Kind filter: None = all, True = STA/LTA only, False = AI picks only.
-        self._sta_lta_only: bool | None = None
         self._now: Callable[[], UTCDateTime] = now_provider or (lambda: UTCDateTime())
         self.setSortRole(_SORT_ROLE)
 
     def set_device(self, device: str | None) -> None:
         self._device = device
-        self.invalidate()
-
-    def set_sta_lta_only(self, sta_lta_only: bool | None) -> None:
-        """Filter by kind: ``None`` all, ``True`` STA/LTA, ``False`` AI picks."""
-        self._sta_lta_only = sta_lta_only
         self.invalidate()
 
     def set_nslc(self, nslc: str | None) -> None:
@@ -342,8 +309,6 @@ class DetectionFilterProxy(QSortFilterProxyModel):
             return False
         if self._nslc is not None and det.nslc != self._nslc:
             return False
-        if self._sta_lta_only is not None and (det.kind == _STA_LTA_KIND) != self._sta_lta_only:
-            return False
         if det.score < self._min_score:
             return False
         return not (
@@ -370,12 +335,6 @@ class DetectionTable(QWidget):
     inspectInUnitRequested = Signal(object, str)  # (Detection, unit_code)  # noqa: N815
 
     _ALL = "All"
-    # Kind-filter combo labels. The mapping label -> sta_lta_only value
-    # lives in :meth:`_on_kind_filter`.
-    _KIND_ALL = "All"
-    _KIND_STA_LTA = "STA/LTA"
-    _KIND_AI = "AI picks"
-    _KIND_OPTIONS = (_KIND_ALL, _KIND_STA_LTA, _KIND_AI)
 
     def __init__(
         self,
@@ -395,10 +354,6 @@ class DetectionTable(QWidget):
         self._nslc_combo = QComboBox()
         self._nslc_combo.addItem(self._ALL)
         self._nslc_combo.currentTextChanged.connect(self._on_nslc_filter)
-        self._kind_combo = QComboBox()
-        for label in self._KIND_OPTIONS:
-            self._kind_combo.addItem(label)
-        self._kind_combo.currentTextChanged.connect(self._on_kind_filter)
         self._score_spin = QDoubleSpinBox()
         self._score_spin.setRange(0.0, 1000.0)
         self._score_spin.setSingleStep(0.5)
@@ -416,8 +371,6 @@ class DetectionTable(QWidget):
         toolbar.addWidget(self._device_combo)
         toolbar.addWidget(QLabel("NSLC:"))
         toolbar.addWidget(self._nslc_combo)
-        toolbar.addWidget(QLabel("Kind:"))
-        toolbar.addWidget(self._kind_combo)
         toolbar.addWidget(QLabel("Score:"))
         toolbar.addWidget(self._score_spin)
         toolbar.addWidget(QLabel("Window:"))
@@ -532,15 +485,6 @@ class DetectionTable(QWidget):
 
     def _on_nslc_filter(self, text: str) -> None:
         self._proxy.set_nslc(None if text == self._ALL else text)
-        self._refresh_empty_state()
-
-    def _on_kind_filter(self, text: str) -> None:
-        if text == self._KIND_STA_LTA:
-            self._proxy.set_sta_lta_only(True)
-        elif text == self._KIND_AI:
-            self._proxy.set_sta_lta_only(False)
-        else:
-            self._proxy.set_sta_lta_only(None)
         self._refresh_empty_state()
 
     def _on_window_filter(self, index: int) -> None:

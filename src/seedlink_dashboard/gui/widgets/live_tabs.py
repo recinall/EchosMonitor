@@ -479,10 +479,9 @@ class LiveTabs(QTabWidget):
         t_on: float,
         t_off: float | None,
         score: float,
-        phase: str | None = None,
     ) -> None:
         self._fan_plots(
-            device, nslc, lambda p: p.add_detection_marker(det_id, t_on, t_off, score, phase)
+            device, nslc, lambda p: p.add_detection_marker(det_id, t_on, t_off, score)
         )
 
     def update_detection_marker(self, device: str, nslc: str, det_id: int, t_off: float) -> None:

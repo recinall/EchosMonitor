@@ -1,4 +1,4 @@
-"""SeedLink Dashboard — realtime seismic monitoring with AI augmentation."""
+"""SeedLink Dashboard — realtime seismic monitoring."""
 
 from __future__ import annotations
 

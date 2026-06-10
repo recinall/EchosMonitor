@@ -18,8 +18,6 @@ window dispatches an off-thread archive read (see
 arrays here for a STATIC 3-component view (Stacked / Overlaid toggle, no
 playback). The ``show_detection`` scrolled-out branch remains as a
 defensive fallback with an honest brief message.
-
-This sets the pattern M9 reuses for AI picks.
 """
 
 from __future__ import annotations
@@ -43,12 +41,6 @@ from PySide6.QtWidgets import (
 )
 
 from seedlink_dashboard.dsp.stages import sta_lta_ratio
-from seedlink_dashboard.gui.widgets.marker_style import (
-    ANOMALY_COLOR,
-    DETECTION_COLOR,
-    P_COLOR,
-    S_COLOR,
-)
 
 if TYPE_CHECKING:
     from obspy import UTCDateTime
@@ -69,18 +61,6 @@ _N_PEN = pg.mkPen("#5cc8ff", width=1)  # cyan-blue
 _E_PEN = pg.mkPen("#ff9a52", width=1)  # orange
 _ARC_COMP_PENS: dict[str, pg.mkPen] = {"Z": _Z_PEN, "N": _N_PEN, "E": _E_PEN}
 _ARC_COMPONENTS: tuple[str, ...] = ("Z", "N", "E")
-# AI probability-curve pens (P blue / S red), matching the marker colours.
-_PROB_P_PEN = pg.mkPen(P_COLOR, width=1)
-_PROB_S_PEN = pg.mkPen(S_COLOR, width=1)
-# M10 Stage C learning-agent curve pens, matching the marker colours.
-_RECON_PEN = pg.mkPen(ANOMALY_COLOR, width=1)  # orange (autoencoder anomaly)
-_DETECTION_PEN = pg.mkPen(DETECTION_COLOR, width=1)  # green (EQTransformer detection)
-_RECON_THR_PEN = pg.mkPen(ANOMALY_COLOR, width=1, style=Qt.PenStyle.DashLine)
-_DETECTION_THR_PEN = pg.mkPen(DETECTION_COLOR, width=1, style=Qt.PenStyle.DashLine)
-# Detection.kind for STA/LTA; everything else carries probability curves.
-_STA_LTA_KIND = "sta_lta"
-_AUTOENCODER_KIND = "autoencoder_anomaly"
-_EQT_DETECTION_KIND = "eqt_detection"
 _DEFAULT_RATIO_LABEL = "STA/LTA"
 # Top-trace Y-axis label when showing raw counts (the source of truth).
 _COUNTS_LABEL = "counts"
@@ -109,8 +89,8 @@ class DetectionDetailPane(QWidget):
     M11 B adds a unit selector on the title row that re-renders the TOP
     trace in physical units (velocity / acceleration / displacement) by
     deconvolving the instrument response off the GUI thread. Counts remain
-    the source of truth; the bottom ratio/probability plot is untouched by
-    the unit choice (it always operates on counts).
+    the source of truth; the bottom ratio plot is untouched by the unit
+    choice (it always operates on counts).
     """
 
     # ``unitChangeRequested(unit_code)`` — emitted when the user picks a
@@ -214,41 +194,10 @@ class DetectionDetailPane(QWidget):
         self._ratio_plot.setXLink(self._trace_plot)
         self._ratio_plot.setLabel("left", "STA/LTA")
         self._ratio_curve = self._ratio_plot.plot(pen=_RATIO_PEN)
-        # AI probability curves (M9 C3): two persistent items, created once
-        # and fed via setData on show — never leaked/recreated. Hidden for
-        # STA/LTA detections; shown (with the ratio curve cleared) for AI
-        # picks carrying ``prob_p`` / ``prob_s`` in meta.
-        self._prob_p_curve = self._ratio_plot.plot(pen=_PROB_P_PEN, name="P")
-        self._prob_s_curve = self._ratio_plot.plot(pen=_PROB_S_PEN, name="S")
-        self._prob_p_curve.setVisible(False)
-        self._prob_s_curve.setVisible(False)
-        # M10 Stage C: two more persistent curves for the learning agents'
-        # diagnostic outputs — the autoencoder reconstruction-error curve
-        # (orange) and the EQTransformer detection-probability curve (green).
-        # Same discipline: created once, fed via setData on show, toggled by
-        # visibility, never recreated.
-        self._recon_curve = self._ratio_plot.plot(pen=_RECON_PEN, name="recon")
-        self._detection_curve = self._ratio_plot.plot(pen=_DETECTION_PEN, name="detection")
-        self._recon_curve.setVisible(False)
-        self._detection_curve.setVisible(False)
 
         # Reusable overlay items (added/removed per render to keep them tidy).
         self._on_line = pg.InfiniteLine(angle=0, pen=_ON_PEN, movable=False)
         self._off_line = pg.InfiniteLine(angle=0, pen=_OFF_PEN, movable=False)
-        # AI probability threshold line (horizontal), attached once with the
-        # P/S curves; visibility tracks the AI-pick branch.
-        self._prob_thr_line = pg.InfiniteLine(angle=0, pen=_ON_PEN, movable=False)
-        self._prob_thr_line.setVisible(False)
-        self._ratio_plot.addItem(self._prob_thr_line)
-        # M10 Stage C: dedicated horizontal decision lines for the two
-        # learning-agent curves (orange recon threshold, green detection
-        # threshold), attached once; visibility tracks their branches.
-        self._recon_thr_line = pg.InfiniteLine(angle=0, pen=_RECON_THR_PEN, movable=False)
-        self._recon_thr_line.setVisible(False)
-        self._ratio_plot.addItem(self._recon_thr_line)
-        self._detection_thr_line = pg.InfiniteLine(angle=0, pen=_DETECTION_THR_PEN, movable=False)
-        self._detection_thr_line.setVisible(False)
-        self._ratio_plot.addItem(self._detection_thr_line)
         self._trace_region = pg.LinearRegionItem(brush=_REGION_BRUSH, movable=False)
         self._ratio_region = pg.LinearRegionItem(brush=_REGION_BRUSH, movable=False)
         for item in (self._trace_region, self._ratio_region):
@@ -337,12 +286,9 @@ class DetectionDetailPane(QWidget):
         self._arc_ratio_plot.setXLink(self._arc_plots["Z"])
         self._arc_ratio_plot.setLabel("left", _DEFAULT_RATIO_LABEL)
         self._arc_ratio_curve = self._arc_ratio_plot.plot(pen=_RATIO_PEN)
-        self._arc_ratio_curve2 = self._arc_ratio_plot.plot(pen=_PROB_S_PEN)
-        self._arc_ratio_curve2.setVisible(False)
         self._arc_on_line = pg.InfiniteLine(angle=0, pen=_ON_PEN, movable=False)
         self._arc_off_line = pg.InfiniteLine(angle=0, pen=_OFF_PEN, movable=False)
-        self._arc_ratio_thr_line = pg.InfiniteLine(angle=0, pen=_ON_PEN, movable=False)
-        for line in (self._arc_on_line, self._arc_off_line, self._arc_ratio_thr_line):
+        for line in (self._arc_on_line, self._arc_off_line):
             line.setVisible(False)
             self._arc_ratio_plot.addItem(line)
         self._arc_ratio_region = pg.LinearRegionItem(brush=_REGION_BRUSH, movable=False)
@@ -519,7 +465,7 @@ class DetectionDetailPane(QWidget):
     def show_physical_trace(self, unit_label: str, samples: np.ndarray) -> None:
         """Swap the TOP trace to physical units (same X window as counts).
 
-        The bottom ratio/probability plot is untouched — it stays on
+        The bottom ratio plot is untouched — it stays on
         counts. Clears any "computing…" busy state.
         """
         y = np.asarray(samples, dtype=np.float64)
@@ -761,8 +707,7 @@ class DetectionDetailPane(QWidget):
         are untouched. ``np.nan_to_num`` is applied ONLY to the STA/LTA input
         — the component TRACE plots keep their NaN gaps.
         """
-        self._arc_ratio_curve2.setVisible(False)
-        for line in (self._arc_on_line, self._arc_off_line, self._arc_ratio_thr_line):
+        for line in (self._arc_on_line, self._arc_off_line):
             line.setVisible(False)
         if trigger_trace is None:
             self._arc_ratio_curve.setData(np.empty(0), np.empty(0))
@@ -772,70 +717,25 @@ class DetectionDetailPane(QWidget):
         x = trigger_trace.x
         sta_s = meta.get("sta_s")
         lta_s = meta.get("lta_s")
-        if detection.kind == _STA_LTA_KIND or (
-            isinstance(sta_s, (int, float)) and isinstance(lta_s, (int, float))
-        ):
-            if not (isinstance(sta_s, (int, float)) and isinstance(lta_s, (int, float))):
-                self._arc_ratio_curve.setData(np.empty(0), np.empty(0))
-                return
-            y_clean = np.nan_to_num(trigger_trace.y, nan=0.0)
-            ratio = sta_lta_ratio(y_clean, float(sta_s), float(lta_s), trigger_trace.fs)
-            self._arc_ratio_plot.setLabel("left", _DEFAULT_RATIO_LABEL)
-            if ratio.size != x.shape[0]:
-                self._arc_ratio_curve.setData(np.empty(0), np.empty(0))
-                return
-            self._arc_ratio_curve.setData(x, ratio)
-            on_thr = meta.get("on_thr")
-            off_thr = meta.get("off_thr")
-            if isinstance(on_thr, (int, float)):
-                self._arc_on_line.setValue(float(on_thr))
-                self._arc_on_line.setVisible(True)
-            if isinstance(off_thr, (int, float)):
-                self._arc_off_line.setValue(float(off_thr))
-                self._arc_off_line.setVisible(True)
+        if not (isinstance(sta_s, (int, float)) and isinstance(lta_s, (int, float))):
+            # No STA/LTA params recorded — clear rather than guess.
+            self._arc_ratio_curve.setData(np.empty(0), np.empty(0))
             return
-
-        # Probability-style curve (P prob / detection prob / recon error).
-        t0 = meta.get("prob_t0")
-        dt = meta.get("prob_dt")
-        if isinstance(t0, (int, float)) and isinstance(dt, (int, float)):
-            values, label, thr_key = self._arc_prob_series(meta)
-            if values is not None:
-                self._set_prob_curve(self._arc_ratio_curve, values, float(t0), float(dt))
-                self._arc_ratio_plot.setLabel("left", label)
-                thr = meta.get(thr_key)
-                if not isinstance(thr, (int, float)):
-                    thr = detection.score
-                self._arc_ratio_thr_line.setValue(float(thr))
-                self._arc_ratio_thr_line.setVisible(True)
-                return
-        # recon-error series carries its own t0/dt keys.
-        rt0 = meta.get("recon_t0")
-        rdt = meta.get("recon_dt")
-        recon_err = meta.get("recon_err")
-        if (
-            isinstance(rt0, (int, float))
-            and isinstance(rdt, (int, float))
-            and isinstance(recon_err, (list, tuple))
-            and recon_err
-        ):
-            self._set_prob_curve(self._arc_ratio_curve, recon_err, float(rt0), float(rdt))
-            self._arc_ratio_plot.setLabel("left", "recon error")
-            thr = meta.get("recon_threshold")
-            if isinstance(thr, (int, float)):
-                self._arc_ratio_thr_line.setValue(float(thr))
-                self._arc_ratio_thr_line.setVisible(True)
+        y_clean = np.nan_to_num(trigger_trace.y, nan=0.0)
+        ratio = sta_lta_ratio(y_clean, float(sta_s), float(lta_s), trigger_trace.fs)
+        self._arc_ratio_plot.setLabel("left", _DEFAULT_RATIO_LABEL)
+        if ratio.size != x.shape[0]:
+            self._arc_ratio_curve.setData(np.empty(0), np.empty(0))
             return
-        self._arc_ratio_curve.setData(np.empty(0), np.empty(0))
-
-    @staticmethod
-    def _arc_prob_series(meta: dict[str, object]) -> tuple[object, str, str]:
-        """Pick the primary probability series + label + threshold key."""
-        if isinstance(meta.get("prob_p"), (list, tuple)) and meta.get("prob_p"):
-            return meta.get("prob_p"), "P prob", "threshold_p"
-        if isinstance(meta.get("prob_det"), (list, tuple)) and meta.get("prob_det"):
-            return meta.get("prob_det"), "detection prob", "detection_threshold"
-        return None, _DEFAULT_RATIO_LABEL, ""
+        self._arc_ratio_curve.setData(x, ratio)
+        on_thr = meta.get("on_thr")
+        off_thr = meta.get("off_thr")
+        if isinstance(on_thr, (int, float)):
+            self._arc_on_line.setValue(float(on_thr))
+            self._arc_on_line.setVisible(True)
+        if isinstance(off_thr, (int, float)):
+            self._arc_off_line.setValue(float(off_thr))
+            self._arc_off_line.setVisible(True)
 
     def _shade_arc_regions(
         self, detection: Detection, trigger_trace: ComponentTrace | None
@@ -862,26 +762,6 @@ class DetectionDetailPane(QWidget):
         y: np.ndarray,
         fs: float,
     ) -> None:
-        # M10 Stage C: route the two learning-agent kinds to their own
-        # render methods BEFORE the generic prob-curve / STA-LTA fallbacks,
-        # so a detection or anomaly never falls into the empty P/S branch.
-        if detection.kind == _AUTOENCODER_KIND and self._has_recon_curve(detection):
-            self._render_recon_curve(detection)
-            return
-        if detection.kind == _EQT_DETECTION_KIND and self._has_detection_curve(detection):
-            self._render_detection_curve(detection)
-            return
-        # AI picks carry decimated P/S probability curves in meta — plot
-        # those (against a wall-clock axis anchored to prob_t0) instead of
-        # an STA/LTA ratio that was never computed for them (rule 10
-        # corollary: the X axis anchors to the real epoch, not a sample
-        # index).
-        if detection.kind != _STA_LTA_KIND and self._has_prob_curves(detection):
-            self._render_prob_curves(detection)
-            return
-        self._set_prob_curves_visible(False)
-        self._set_recon_curve_visible(False)
-        self._set_detection_curve_visible(False)
         self._ratio_plot.setLabel("left", _DEFAULT_RATIO_LABEL)
         sta_s = detection.meta.get("sta_s")
         lta_s = detection.meta.get("lta_s")
@@ -896,140 +776,6 @@ class DetectionDetailPane(QWidget):
             self._ratio_curve.setData(np.empty(0), np.empty(0))
             return
         self._ratio_curve.setData(x, ratio)
-
-    @staticmethod
-    def _has_prob_curves(detection: Detection) -> bool:
-        meta = detection.meta
-        if not isinstance(meta, dict):
-            return False
-        return isinstance(meta.get("prob_t0"), (int, float)) and isinstance(
-            meta.get("prob_dt"), (int, float)
-        )
-
-    def _render_prob_curves(self, detection: Detection) -> None:
-        """Plot decimated P/S probability curves on the wall-clock axis.
-
-        ``meta["prob_t0"]`` is the POSIX epoch of curve sample 0 and
-        ``meta["prob_dt"]`` the seconds per stored point, so ``x[i] =
-        prob_t0 + i * prob_dt`` anchors the curve to real wall-clock time
-        (rule 10 corollary). The amber STA/LTA ratio curve is cleared so
-        the two never overlap.
-        """
-        self._ratio_curve.setData(np.empty(0), np.empty(0))
-        self._set_recon_curve_visible(False)
-        self._set_detection_curve_visible(False)
-        self._ratio_plot.setLabel("left", _DEFAULT_RATIO_LABEL)
-        meta = detection.meta
-        t0 = float(meta["prob_t0"])  # type: ignore[arg-type]
-        dt = float(meta["prob_dt"])  # type: ignore[arg-type]
-        self._set_prob_curve(self._prob_p_curve, meta.get("prob_p"), t0, dt)
-        self._set_prob_curve(self._prob_s_curve, meta.get("prob_s"), t0, dt)
-        self._set_prob_curves_visible(True)
-        thr = meta.get("threshold_p")
-        if not isinstance(thr, (int, float)):
-            thr = detection.score
-        self._prob_thr_line.setValue(float(thr))
-        self._prob_thr_line.setVisible(True)
-
-    @staticmethod
-    def _set_prob_curve(curve: pg.PlotDataItem, values: object, t0: float, dt: float) -> None:
-        if not isinstance(values, (list, tuple)) or not values:
-            curve.setData(np.empty(0), np.empty(0))
-            return
-        y = np.asarray(values, dtype=np.float64)
-        x = t0 + np.arange(y.shape[0], dtype=np.float64) * dt
-        curve.setData(x, y)
-
-    def _set_prob_curves_visible(self, visible: bool) -> None:
-        self._prob_p_curve.setVisible(visible)
-        self._prob_s_curve.setVisible(visible)
-        if not visible:
-            self._prob_thr_line.setVisible(False)
-
-    # ----- M10 Stage C: autoencoder anomaly -----
-    @staticmethod
-    def _has_recon_curve(detection: Detection) -> bool:
-        meta = detection.meta
-        if not isinstance(meta, dict):
-            return False
-        return (
-            isinstance(meta.get("recon_t0"), (int, float))
-            and isinstance(meta.get("recon_dt"), (int, float))
-            and isinstance(meta.get("recon_err"), (list, tuple))
-            and bool(meta.get("recon_err"))
-        )
-
-    def _render_recon_curve(self, detection: Detection) -> None:
-        """Plot the autoencoder reconstruction-error curve (orange).
-
-        ``meta["recon_t0"]`` is the POSIX epoch of curve sample 0 and
-        ``meta["recon_dt"]`` the seconds per stored point, so ``x[i] =
-        recon_t0 + i * recon_dt`` anchors the curve to real wall-clock
-        time (rule 10 corollary). The decision line is drawn at
-        ``meta["recon_threshold"]``; the trigger segment itself is already
-        shaded by ``_apply_overlays`` via ``t_on``/``t_off``.
-        """
-        self._ratio_curve.setData(np.empty(0), np.empty(0))
-        self._set_prob_curves_visible(False)
-        self._set_detection_curve_visible(False)
-        meta = detection.meta
-        t0 = float(meta["recon_t0"])  # type: ignore[arg-type]
-        dt = float(meta["recon_dt"])  # type: ignore[arg-type]
-        self._set_prob_curve(self._recon_curve, meta.get("recon_err"), t0, dt)
-        self._ratio_plot.setLabel("left", "recon error")
-        self._set_recon_curve_visible(True)
-        thr = meta.get("recon_threshold")
-        if isinstance(thr, (int, float)):
-            self._recon_thr_line.setValue(float(thr))
-            self._recon_thr_line.setVisible(True)
-        else:
-            self._recon_thr_line.setVisible(False)
-
-    def _set_recon_curve_visible(self, visible: bool) -> None:
-        self._recon_curve.setVisible(visible)
-        if not visible:
-            self._recon_thr_line.setVisible(False)
-
-    # ----- M10 Stage C: EQTransformer detection -----
-    @staticmethod
-    def _has_detection_curve(detection: Detection) -> bool:
-        meta = detection.meta
-        if not isinstance(meta, dict):
-            return False
-        return (
-            isinstance(meta.get("prob_t0"), (int, float))
-            and isinstance(meta.get("prob_dt"), (int, float))
-            and isinstance(meta.get("prob_det"), (list, tuple))
-            and bool(meta.get("prob_det"))
-        )
-
-    def _render_detection_curve(self, detection: Detection) -> None:
-        """Plot the EQTransformer detection-probability curve (green).
-
-        Closes the Stage A gap where ``prob_det`` was decimated into meta
-        but never rendered. ``x[i] = prob_t0 + i * prob_dt`` anchors the
-        curve to wall-clock time (rule 10 corollary); the decision line is
-        drawn at ``meta["detection_threshold"]`` (a probability in [0, 1]).
-        """
-        self._ratio_curve.setData(np.empty(0), np.empty(0))
-        self._set_prob_curves_visible(False)
-        self._set_recon_curve_visible(False)
-        meta = detection.meta
-        t0 = float(meta["prob_t0"])  # type: ignore[arg-type]
-        dt = float(meta["prob_dt"])  # type: ignore[arg-type]
-        self._set_prob_curve(self._detection_curve, meta.get("prob_det"), t0, dt)
-        self._ratio_plot.setLabel("left", "detection prob")
-        self._set_detection_curve_visible(True)
-        thr = meta.get("detection_threshold")
-        if not isinstance(thr, (int, float)):
-            thr = detection.score
-        self._detection_thr_line.setValue(float(thr))
-        self._detection_thr_line.setVisible(True)
-
-    def _set_detection_curve_visible(self, visible: bool) -> None:
-        self._detection_curve.setVisible(visible)
-        if not visible:
-            self._detection_thr_line.setVisible(False)
 
     def _apply_overlays(self, detection: Detection, x: np.ndarray) -> None:
         if not self._overlays_attached:
@@ -1071,24 +817,6 @@ class DetectionDetailPane(QWidget):
 
     def _ratio_curve_for_test(self) -> pg.PlotDataItem:
         return self._ratio_curve
-
-    def _prob_p_curve_for_test(self) -> pg.PlotDataItem:
-        return self._prob_p_curve
-
-    def _prob_s_curve_for_test(self) -> pg.PlotDataItem:
-        return self._prob_s_curve
-
-    def _recon_curve_for_test(self) -> pg.PlotDataItem:
-        return self._recon_curve
-
-    def _detection_curve_for_test(self) -> pg.PlotDataItem:
-        return self._detection_curve
-
-    def _recon_threshold_for_test(self) -> float:
-        return float(self._recon_thr_line.value())
-
-    def _detection_threshold_for_test(self) -> float:
-        return float(self._detection_thr_line.value())
 
     def _ratio_label_for_test(self) -> str:
         return str(self._ratio_plot.getAxis("left").labelText)

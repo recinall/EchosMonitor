@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from seedlink_dashboard.gui.widgets.marker_style import marker_color
+from seedlink_dashboard.gui.widgets.marker_style import STA_LTA_COLOR
 from seedlink_dashboard.gui.widgets.pane_header import (
     PANE_HEADER_MARGINS,
     PANE_TITLE_OBJECT_NAME,
@@ -359,19 +359,18 @@ class SpectrogramView(QWidget):
     # ------------------------------------------------------------------
     # Detection markers (M8 C2) — wall-clock (time_axis) views only.
     # ------------------------------------------------------------------
-    def add_detection_marker(self, det_id: int, t_on: float, phase: str | None = None) -> None:
+    def add_detection_marker(self, det_id: int, t_on: float) -> None:
         """Place a thin vertical onset line at wall-clock ``t_on``.
 
         No-op on a column-index (inline) view: a POSIX coordinate has no
         meaning on its axis. The dock view (``time_axis=True``) shares the
         trace's wall-clock axis, so the marker aligns with the trace
-        marker for the same detection (M6 shared axis). AI picks colour
-        by ``phase`` via :func:`marker_color` (rule 10 twin of the trace
-        plot); STA/LTA (``phase is None``) keeps the amber default."""
+        marker for the same detection (M6 shared axis); the amber colour
+        matches the trace plot (rule 10 twin)."""
         if not self._time_axis:
             return
         self._remove_marker(det_id)
-        line = pg.InfiniteLine(pos=t_on, angle=90, pen=pg.mkPen(marker_color(phase), width=1))
+        line = pg.InfiniteLine(pos=t_on, angle=90, pen=pg.mkPen(STA_LTA_COLOR, width=1))
         self._plot.addItem(line)
         line.setVisible(self._markers_visible)
         self._det_markers[det_id] = line

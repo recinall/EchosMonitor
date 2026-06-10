@@ -17,7 +17,7 @@ Stage A (this skeleton): the browser — device/station selection, extent +
 coverage display, a sensible default interval, and a "Load window" button that
 emits :attr:`loadRequested`. Stage B fills in the static 3C view, the
 spectrogram, the physical-unit selector, and the measurement cursors; Stage C
-adds the HVSR / AI hand-off buttons.
+adds the HVSR hand-off button.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def _epoch_from_qdt(qdt: QDateTime) -> float:
 
     Mirrors :class:`HvsrWidget`'s archive-field interpretation exactly (the
     displayed naive wall-clock is treated as UTC) so an interval handed off to
-    HVSR/AI round-trips to the same instant.
+    HVSR round-trips to the same instant.
     """
     return float(UTCDateTime(qdt.toString("yyyy-MM-ddTHH:mm:ss")).timestamp)
 
@@ -163,7 +163,6 @@ class ArchiveTab(QWidget):
     # device, group({"Z","N","E": nslc}), t_start_epoch, t_end_epoch
     loadRequested = Signal(str, object, float, float)  # noqa: N815
     hvsrRequested = Signal(str, object, float, float)  # noqa: N815
-    aiRequested = Signal(str, object, float, float)  # noqa: N815
     unitChangeRequested = Signal(str)  # unit code  # noqa: N815
 
     def __init__(
@@ -311,9 +310,7 @@ class ArchiveTab(QWidget):
             self._readout_combo.addItem(comp, comp)
         self._reset_button = QPushButton("Reset view", self)
         self._hvsr_button = QPushButton("Run HVSR on this window", self)
-        self._ai_button = QPushButton("Run AI agent on this window", self)
-        for b in (self._hvsr_button, self._ai_button):
-            b.setEnabled(False)
+        self._hvsr_button.setEnabled(False)
         bar.addWidget(QLabel("Units:"))
         bar.addWidget(self._unit_combo)
         bar.addWidget(self._stacked_radio)
@@ -323,7 +320,6 @@ class ArchiveTab(QWidget):
         bar.addWidget(self._reset_button)
         bar.addStretch(1)
         bar.addWidget(self._hvsr_button)
-        bar.addWidget(self._ai_button)
         # The toolbar's long-text buttons + combos would otherwise pin this tab
         # page's minimum width and inflate the central QTabWidget minimum (the
         # layout trap HVSR already paid for). Let them shrink horizontally so
@@ -333,7 +329,6 @@ class ArchiveTab(QWidget):
             self._readout_combo,
             self._reset_button,
             self._hvsr_button,
-            self._ai_button,
         ):
             w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         outer.addLayout(bar)
@@ -429,7 +424,6 @@ class ArchiveTab(QWidget):
         self._readout_combo.currentIndexChanged.connect(lambda _i: self._refresh_readout())
         self._reset_button.clicked.connect(self._reset_view)
         self._hvsr_button.clicked.connect(lambda: self._emit_handoff(self.hvsrRequested))
-        self._ai_button.clicked.connect(lambda: self._emit_handoff(self.aiRequested))
 
     # ------------------------------------------------------------------
     # Device / station selection (mirrors HvsrWidget)
@@ -587,7 +581,7 @@ class ArchiveTab(QWidget):
             return
         self._update_coverage()
         # Record the selection the load was requested for; the result + the
-        # HVSR/AI hand-off and unit decon all operate on exactly this window.
+        # HVSR hand-off and unit decon all operate on exactly this window.
         self._loaded_device = device
         self._loaded_group = dict(group)
         self._win_t_start = t_start
@@ -626,7 +620,6 @@ class ArchiveTab(QWidget):
             self._overlay_plot.enableAutoRange(axis="y")
         self._place_cursors()
         self._hvsr_button.setEnabled(True)
-        self._ai_button.setEnabled(True)
         self._status_label.setText(
             f"Loaded {len(result.traces)} component(s) over "
             f"{UTCDateTime(self._win_t_start)} → {UTCDateTime(self._win_t_end)}."
@@ -643,7 +636,6 @@ class ArchiveTab(QWidget):
                 line.setVisible(False)
         self._readout_label.setText("")
         self._hvsr_button.setEnabled(False)
-        self._ai_button.setEnabled(False)
         self._unit_combo.setEnabled(False)
         self._status_label.setText("No archived data for this interval.")
 

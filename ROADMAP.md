@@ -20,7 +20,7 @@ Audit 2026-06-10 (docs/AUDIT.md): baseline gate is NOT green — mypy has 3
 though code comments cite its entries. Order decided: **B before A** (see
 decision log).
 
-- [ ] **B. Remove AI**: delete `ai/`, `core/ai_engine.py`, `ai_panel.py`,
+- [x] **B. Remove AI**: delete `ai/`, `core/ai_engine.py`, `ai_panel.py`,
       engage dialogs, `AiConfig` + `persist_on_detection`, `ai`/`remote`
       extras, `ai` pytest marker, `record_ai_detection`,
       `attach_event_persister`/`EventPersister` (no non-AI consumer — remove;
@@ -28,32 +28,40 @@ decision log).
       history stays linear). Strip AI wiring from `main_window.py`,
       `default.yaml`, README.
       Audit additions (complete map in docs/AUDIT.md §2):
-  - [ ] also delete `storage/event_persister.py` and the events DAO surface:
+  - [x] also delete `storage/event_persister.py` and the events DAO surface:
         `Event` dataclass + `record_event`/`events_for_detection`/
         `recent_events`/`_row_to_event` (`storage/dao.py:50, 505–608` —
         AI-only callers, rule 12); in `storage/db.py`, dropping the
         `_EVENTS_DDL` body must include its concatenation into
         `_CREATE_SCHEMA_SQL` at `db.py:180`.
-  - [ ] also remove the Archive tab's AI surface — **not caught by the
+  - [x] also remove the Archive tab's AI surface — **not caught by the
         acceptance grep**: `aiRequested` signal (`archive_tab.py:166`),
         `_ai_button` "Run AI agent on this window" + wiring
         (`archive_tab.py:314–315,326,336,432,629,646`), and in
         `main_window.py` the connect at `:494` plus the whole
         `_handoff_archive_to_ai` method (`:1653–…`).
-  - [ ] also remove `PersistOnDetectionConfig` (`config/schema.py:276–307`,
+  - [x] also remove `PersistOnDetectionConfig` (`config/schema.py:276–307`,
         a separate class from `AiConfig`), the `AiConfig` re-export in
         `config/__init__.py:7,27`, the seisbench/torch mypy override
         (`pyproject.toml:87–90`), the "with AI" project description
         (`pyproject.toml:4`), and the `ai:` section in **both**
         `default.yaml` copies (the packaged `src/.../config/default.yaml`
         is the one actually loaded, `loader.py:38`).
-  - [ ] loader strips a legacy top-level `ai:` key with a one-time warning —
+  - [x] loader strips a legacy top-level `ai:` key with a one-time warning —
         schema is `extra="forbid"` (`config/schema.py:26`), so old user
         configs would otherwise fail validation.
-  - [ ] verified safe: STA/LTA detection path (`dao.record_detection`,
-        `detectionRecorded`) is independent; `detection_table.py` /
-        `detection_detail.py` are kind-generic and stay unchanged.
-  - [ ] fix the two surviving `unused-ignore` mypy errors
+  - [x] verified safe: STA/LTA detection path (`dao.record_detection`,
+        `detectionRecorded`) is independent and untouched.
+  - [x] discovered during removal (audit had under-scoped these — the
+        widgets were NOT purely kind-generic): `detection_detail.py` AI
+        rendering (P/S pick-probability curves, autoencoder recon-error
+        curve, EQTransformer detection curve, −272 lines),
+        `marker_style.py` phase-colour palette + `marker_color` and the
+        `phase` parameter threaded through trace_plot/spectrogram/
+        live_tabs marker APIs, `detection_table.py` Kind filter combo +
+        AI-kind row tint, and `StreamingEngine.live_streams()` (orphaned,
+        only engage dialogs called it) — all removed per rule 12.
+  - [x] fix the two surviving `unused-ignore` mypy errors
         (`streaming_engine.py:1940,2000`; the third dies with the
         event-persister block) so the gate is green from this commit.
 - [ ] **A. Rename** package `seedlink_dashboard` → `echosmonitor`; entry point

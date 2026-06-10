@@ -1,7 +1,7 @@
 [project]
 name = "seedlink-dashboard"
 version = "0.1.0"
-description = "Professional GUI for real-time SeedLink seismic monitoring with AI"
+description = "Professional GUI for real-time SeedLink seismic monitoring"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -36,8 +36,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ai = ["seisbench>=0.8", "torch>=2.2"]
-remote = ["boto3>=1.34", "paramiko>=3.4"]
 dev = [
     "ruff>=0.4",
     "mypy>=1.10",
@@ -84,12 +82,6 @@ module = ["obspy", "obspy.*", "pyqtgraph", "pyqtgraph.*", "scipy", "scipy.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# Optional 'ai' extra — no py.typed / stubs shipped. Imported lazily inside
-# ai/agents/seisbench_picker.py so the app runs without these installed.
-module = ["seisbench", "seisbench.*", "torch", "torch.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 # hvsrpy ships no py.typed / stubs. Imported lazily inside core/hvsr.py so
 # the boundary stays the only place hvsrpy types appear.
 module = ["hvsrpy", "hvsrpy.*", "matplotlib", "matplotlib.*"]
@@ -108,16 +100,7 @@ qt_api = "pyside6"
 # expression. Note: this does NOT cover the stop()/timeout
 # interruptibility tests — those verify a correctness contract
 # (CLAUDE.md rule 7) with generous slack and stay in the default gate.
-#
-# The `ai` marker tags tests that require the optional `ai` extra
-# (seisbench + torch): the scientific phase-picker acceptance test and
-# archive-inference. The app — and the whole default gate — runs without
-# torch installed (the torch-free fake-agent path proves the
-# abstraction), so `ai` is excluded from the default gate alongside
-# `perf`. Run the real-model tests with `uv run pytest -m ai` after
-# `uv sync --extra ai`.
-addopts = "-m 'not perf and not ai'"
+addopts = "-m 'not perf'"
 markers = [
     "perf: absolute wall-time compute-throughput bound; load-sensitive, excluded from the default gate (run with -m perf)",
-    "ai: requires the optional 'ai' extra (seisbench + torch); excluded from the default gate (run with -m ai)",
 ]

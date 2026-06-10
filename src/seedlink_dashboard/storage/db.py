@@ -111,10 +111,10 @@ CREATE INDEX IF NOT EXISTS idx_files_stream   ON files(stream_id);
 # Detection rows (schema v2). A ``detections`` row is the persisted,
 # device-scoped form of a transient dsp ``Trigger`` (see
 # :class:`core.models.Detection`). ``kind`` distinguishes detector
-# families — ``'sta_lta'`` today, ``'phasenet'`` in M9 — so a single
-# table serves both the classical and the AI pickers. ``score`` is a
-# generic detector-agnostic magnitude (peak STA/LTA ratio now, model
-# probability later); ``t_off`` is NULL while a trigger is still open.
+# families (``'sta_lta'`` today) so a single table can serve future
+# detector kinds. ``score`` is a generic detector-agnostic magnitude
+# (the peak STA/LTA ratio); ``t_off`` is NULL while a trigger is still
+# open.
 #
 # This DDL lives in BOTH the base schema (fresh installs) and the
 # v1→v2 migration (existing M5 databases). Both forms are idempotent
@@ -138,46 +138,12 @@ CREATE INDEX IF NOT EXISTS idx_detections_t_on   ON detections(t_on);
 
 _CREATE_SCHEMA_SQL = _CREATE_SCHEMA_SQL + _DETECTIONS_DDL
 
-# Curated-event rows (schema v3 / M10 Stage D). An ``events`` row is the
-# persisted record of a "persist-on-detection" side-effect: an AI agent's
-# :class:`~core.models.Detection` cleared the engagement policy's
-# ``min_score`` and the policy requested that the surrounding window be
-# saved as a curated event (see
-# :class:`config.schema.PersistOnDetectionConfig`).
-#
-# ``mode`` is per-row and CHECK-constrained to one of the two ELEMENTARY
-# modes — ``'dedicated_window'`` (a trimmed MiniSEED file was written under
-# ``events/``; ``file_path`` is set) or ``'tag_in_sds'`` (no file written,
-# the region is only marked in the existing SDS; ``file_path`` is NULL).
-# The config's ``'both'`` mode is NOT a row value: it is represented as TWO
-# rows, one ``'dedicated_window'`` and one ``'tag_in_sds'``, so the per-row
-# CHECK stays simple and each row is independently meaningful.
-#
-# ``detection_id`` FK is ``ON DELETE SET NULL`` so a curated event outlives
-# the deletion of its originating detection (the saved waveform is still
-# valuable). ``stream_id`` FK is ``ON DELETE CASCADE`` (an event is
-# meaningless without its stream). Like ``_DETECTIONS_DDL`` this lives in
-# BOTH the base schema (fresh installs) and the v2→v3 migration; both are
-# idempotent (``IF NOT EXISTS``).
-_EVENTS_DDL = """
-CREATE TABLE IF NOT EXISTS events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    detection_id INTEGER REFERENCES detections(id) ON DELETE SET NULL,
-    stream_id    INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
-    mode         TEXT NOT NULL CHECK (mode IN ('dedicated_window','tag_in_sds')),
-    t_start      TEXT NOT NULL,
-    t_end        TEXT NOT NULL,
-    score        REAL NOT NULL,
-    file_path    TEXT,
-    created_at   TEXT NOT NULL,
-    meta_json    TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_events_detection ON events(detection_id);
-CREATE INDEX IF NOT EXISTS idx_events_stream    ON events(stream_id);
-"""
-
-_CREATE_SCHEMA_SQL = _CREATE_SCHEMA_SQL + _EVENTS_DDL
+# Schema v3 historically added the ``events`` table (the removed AI
+# persist-on-detection feature, CLAUDE.md rule 12). The version number is
+# retained so the migration ladder stays linear, but fresh installs no
+# longer create the table and the v2→v3 step is a no-op stub. Old v3
+# databases may still contain an orphaned ``events`` table with rows;
+# nothing reads or writes it.
 
 _log = structlog.get_logger(__name__)
 
@@ -236,10 +202,10 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
     table DDL is idempotent so it is safe even though the base schema
     of a fresh v2 install already created it.
 
-    v2 → v3 (M10 Stage D): add the ``events`` table + indexes for the
-    persist-on-detection curated-event collection. Same shape as the
-    v1→v2 step — idempotent DDL applied in-transaction, version bumped
-    only after it succeeds.
+    v2 → v3: historically added the ``events`` table for the removed AI
+    persist-on-detection feature (rule 12). Now a no-op stub — only the
+    version bump remains, so v2 databases still step to v3 and the
+    ladder stays linear.
     """
     if from_version == SCHEMA_VERSION:
         return
@@ -248,7 +214,6 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
         conn.executescript(_DETECTIONS_DDL)
         version = 2
     if version == 2:
-        conn.executescript(_EVENTS_DDL)
         version = 3
     if version != SCHEMA_VERSION:
         # Unknown / future version we don't know how to migrate. Leave

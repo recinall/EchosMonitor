@@ -15,8 +15,6 @@ if TYPE_CHECKING:
     from seedlink_dashboard.core.hvsr import HvsrSettings
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
-ModelName = Literal["phasenet", "eqtransformer", "gpd"]
-DeviceKind = Literal["cpu", "cuda", "mps"]
 Theme = Literal["dark", "light"]
 
 
@@ -274,55 +272,6 @@ class DeviceConfig(_Base):
     response_metadata: ResponseMetadataConfig = Field(default_factory=ResponseMetadataConfig)
 
 
-class PersistOnDetectionConfig(_Base):
-    """M10 Stage D — the persist-on-detection engagement policy.
-
-    When ``enabled``, an AI agent's annotation whose score clears
-    ``min_score`` triggers a storage side-effect: the engagement policy in
-    :class:`~seedlink_dashboard.core.ai_engine.AIEngine` emits a
-    ``persistRequested`` signal that the storage-thread
-    :class:`~seedlink_dashboard.storage.event_persister.EventPersister`
-    turns into a curated event (a dedicated MiniSEED window file and/or an
-    ``events`` index row). The agent itself stays storage-ignorant — it
-    only ever returns an :class:`~seedlink_dashboard.ai.base.AIAnnotation`.
-
-    ``mode`` chooses what the side-effect is:
-
-    * ``dedicated_window`` — write a trimmed ``[t_on-pre, t_off+post]``
-      MiniSEED file under ``<archive_root>/events/`` and record an
-      ``events`` row pointing at it.
-    * ``tag_in_sds`` — no file write, no data duplication: record an
-      ``events`` row marking the region inside the already-archived SDS.
-    * ``both`` — do both, stored as TWO ``events`` rows (one per mode).
-
-    ``pre_seconds`` / ``post_seconds`` bound the captured window around the
-    detection; ``min_score`` gates which detections persist.
-    """
-
-    enabled: bool = False
-    mode: Literal["dedicated_window", "tag_in_sds", "both"] = "dedicated_window"
-    pre_seconds: Annotated[float, Field(ge=0, le=3600)] = 10.0
-    post_seconds: Annotated[float, Field(ge=0, le=3600)] = 30.0
-    min_score: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
-
-
-class AiConfig(_Base):
-    enabled: bool = False
-    model: ModelName = "phasenet"
-    device: DeviceKind = "cpu"
-    window_seconds: Annotated[int, Field(ge=1, le=3600)] = 60
-    step_seconds: Annotated[int, Field(ge=1, le=3600)] = 10
-    threshold_p: Annotated[float, Field(ge=0.0, le=1.0)] = 0.3
-    threshold_s: Annotated[float, Field(ge=0.0, le=1.0)] = 0.3
-    # M10 fit-then-infer: length (s) of the baseline window pulled to
-    # ``fit`` a learning agent before it starts inferring. Inference-only
-    # agents (picker / detector) ignore it. Longer than an inference window
-    # (it is the "quiet period" the user is asked to pick); 5 min by default.
-    baseline_seconds: Annotated[int, Field(ge=1, le=86400)] = 300
-    # M10 Stage D — persist-on-detection engagement policy (off by default).
-    persist_on_detection: PersistOnDetectionConfig = Field(default_factory=PersistOnDetectionConfig)
-
-
 class HvsrConfig(_Base):
     """HVSR (Nakamura H/V spectral ratio) analysis defaults.
 
@@ -381,7 +330,6 @@ class RootConfig(_Base):
     app: AppConfig = Field(default_factory=AppConfig)
     ui: UiConfig = Field(default_factory=UiConfig)
     devices: list[DeviceConfig] = Field(default_factory=list)
-    ai: AiConfig = Field(default_factory=AiConfig)
     hvsr: HvsrConfig = Field(default_factory=HvsrConfig)
 
     @model_validator(mode="after")

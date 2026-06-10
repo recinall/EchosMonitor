@@ -1,9 +1,8 @@
-"""Read historical waveforms back from the SDS MiniSEED archive (M9 Stage C).
+"""Read historical waveforms back from the SDS MiniSEED archive.
 
 This is the read counterpart to :class:`~seedlink_dashboard.storage.
-mseed_writer.MseedWriter`. It lets an AI agent run over data the dashboard
-already archived — the validation workflow: take a known event from your
-own archive, run the picker, see the picks.
+mseed_writer.MseedWriter`. It lets analyses (archive detection detail,
+archive-range HVSR) run over data the dashboard already archived.
 
 Strictly READ-ONLY (CLAUDE.md rule 8 — the MiniSEED file is the source of
 truth; this never writes). It lives in ``storage/`` because all archive

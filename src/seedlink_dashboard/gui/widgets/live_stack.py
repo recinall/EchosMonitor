@@ -73,8 +73,7 @@ _FREQ_FILTER_TYPES = frozenset({"bandpass", "highpass", "lowpass", "notch"})
 # solely of these produces no meaningful "processed" trace, so the stacked
 # raw+filtered plot would only show an empty (or duplicate) lower pane. The
 # second plot is therefore shown only when the chain has at least one
-# waveform-producing stage (detrend, taper, a filter, decimation). AI
-# detectors join this set in M9.
+# waveform-producing stage (detrend, taper, a filter, decimation).
 _DETECTOR_STAGE_TYPES = frozenset({"sta_lta"})
 
 _SPEC_TOGGLE_STYLE = "QToolButton#DeviceGroupSpec { font-size: 10px; padding: 0 4px; }"

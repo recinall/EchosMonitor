@@ -3,8 +3,8 @@
 A `StreamingEngine` is constructed at startup; signals flow to the
 `DevicePanel` (state badges + stream rows) and the `LiveTabs` facade
 (an "All" overview plus one per-device tab, each rendering its streams).
-The window owns a central `QTabWidget` (Detections | Live | PSD | AI |
-HVSR) set via :meth:`setCentralWidget` plus four docks in a stable
+The window owns a central `QTabWidget` (Detections | Live | PSD | HVSR |
+Archive) set via :meth:`setCentralWidget` plus four docks in a stable
 workflow order (see :class:`MainWindow`) with focus mode (F11) and dock
 detach (Ctrl+Shift+N) layered on by M7.
 """
@@ -26,7 +26,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QDialog,
     QDockWidget,
     QLabel,
     QMainWindow,
@@ -40,7 +39,6 @@ from PySide6.QtWidgets import (
 
 from seedlink_dashboard import __version__
 from seedlink_dashboard.config import RootConfig
-from seedlink_dashboard.core.ai_engine import AIEngine
 from seedlink_dashboard.core.archive_detail_loader import (
     ArchiveDetailLoader,
     ArchiveDetailResult,
@@ -58,7 +56,6 @@ from seedlink_dashboard.core.response import ResponseProvider
 from seedlink_dashboard.core.streaming_engine import StreamingEngine
 from seedlink_dashboard.gui.dialogs.first_run_wizard import FirstRunWizard
 from seedlink_dashboard.gui.dialogs.shortcuts_dialog import ShortcutsDialog
-from seedlink_dashboard.gui.widgets.ai_panel import AiPanel
 from seedlink_dashboard.gui.widgets.archive_tab import ArchiveTab
 from seedlink_dashboard.gui.widgets.detection_detail import (
     NO_RESPONSE_TOOLTIP,
@@ -136,8 +133,8 @@ _ARCHIVE_INSPECT_POST_S = 30.0
 # but rendered off-screen. The simulation in the H3 diagnosis shows the
 # peak already lands on the onset at 1x lta_s; 2x is a safe margin.
 _ARCHIVE_RATIO_WARMUP_LTA_MULT = 2.0
-# Detection.kind for the STA/LTA detector (the only kind whose detail-pane
-# ratio is RECOMPUTED from the waveform; AI kinds carry a stored curve).
+# Detection.kind for the STA/LTA detector, whose detail-pane ratio is
+# RECOMPUTED from the waveform.
 _STA_LTA_DETECTION_KIND = "sta_lta"
 
 # Provisional plot sample-rate used when a stream is first announced before
@@ -159,38 +156,12 @@ _DOCK_SPECTROGRAM = "Spectrogram"
 _DOCK_LOG = "Log"
 
 
-def _engage_thresholds(
-    agent_kwargs: dict[str, object],
-) -> tuple[float | None, float | None]:
-    """Derive ``(threshold_p, threshold_s)`` for the engine from agent kwargs.
-
-    The two SeisBench agents expose their primary threshold under different
-    names (``threshold_p`` for the picker, ``detection_threshold`` for the
-    detector); learning agents expose none. We map the primary threshold to
-    ``threshold_p`` (the engine's primary), prefer the picker's explicit
-    ``threshold_s`` when present, and return ``None`` for anything absent so
-    the engine falls back to its config defaults (learning agents ignore the
-    thresholds entirely).
-    """
-
-    def _as_float(value: object) -> float | None:
-        if isinstance(value, int | float):
-            return float(value)
-        return None
-
-    tp = _as_float(agent_kwargs.get("threshold_p"))
-    if tp is None:
-        tp = _as_float(agent_kwargs.get("detection_threshold"))
-    ts = _as_float(agent_kwargs.get("threshold_s"))
-    return tp, ts
-
-
 class MainWindow(QMainWindow):
     """Top-level window.
 
     The primary view is a central :class:`QTabWidget`
     (``self._central_tabs``) set via :meth:`setCentralWidget`, holding
-    **Detections | Live | PSD | AI | HVSR** (Detections is a
+    **Detections | Live | PSD | HVSR | Archive** (Detections is a
     master-detail :class:`QSplitter` — table left, detail pane right).
     The central tabs are not detachable; a solid central widget is the
     robust anchor :class:`QMainWindow` expects.
@@ -253,15 +224,6 @@ class MainWindow(QMainWindow):
         # before the engine so the engine can pick it up at start.
         self._store = ConfigStore(config, config_path)
         self._engine = StreamingEngine(config, parent=self, store=self._store)
-        # AI engagement engine (M9): a GUI-thread-owned peer of the
-        # streaming engine. It pulls recent windows from the ring buffer on
-        # its own thread and never back-pressures the data path (rule 11).
-        self._ai_engine = AIEngine(
-            self._engine,
-            self._config.ai,
-            parent=self,
-            data_dir=self._config.app.data_dir,
-        )
         self._device_panel: DevicePanel | None = None
         # ``_live_tabs`` (M7 Stage B) is the facade all live data routes
         # through. ``_live_stack`` is kept pointing at its "All" overview
@@ -411,8 +373,8 @@ class MainWindow(QMainWindow):
         self._archive_window_traces: dict[str, ComponentTrace] = {}
 
         # HVSR analysis engine (best-effort consumer, rule 11). Owns its own
-        # dedicated compute thread internally (like AIEngine); shares the
-        # response provider so it can surface the same-response assumption.
+        # dedicated compute thread internally; shares the response
+        # provider so it can surface the same-response assumption.
         # Constructed AFTER ``_response_provider`` exists.
         self._hvsr_engine = HvsrEngine(self._engine, self._response_provider, parent=self)
 
@@ -450,17 +412,17 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _build_central(self) -> None:
         """Build the central :class:`QTabWidget` (Detections | Live | PSD |
-        AI | HVSR) and set it as the window's central widget.
+        HVSR | Archive) and set it as the window's central widget.
 
         A solid central widget is the robust anchor :class:`QMainWindow`
         expects — it fixes the squeeze/freeze class of bug that the old
-        weak/empty central placeholder produced. The five analysis views
+        weak/empty central placeholder produced. The analysis views
         (DetectionTable + DetectionDetailPane as a master-detail splitter,
-        LiveTabs, PsdWidget, AiPanel, HvsrWidget) are constructed here —
-        their engine dependencies (``self._engine`` / ``self._ai_engine``
-        / ``self._hvsr_engine``) all exist by the time this runs. The
-        central tabs are intentionally not detachable (detach remains for
-        the surviving docks).
+        LiveTabs, PsdWidget, HvsrWidget) are constructed here — their
+        engine dependencies (``self._engine`` / ``self._hvsr_engine``)
+        all exist by the time this runs. The central tabs are
+        intentionally not detachable (detach remains for the surviving
+        docks).
         """
         self._live_tabs = LiveTabs(
             window_seconds=float(self._config.ui.default_window_seconds),
@@ -479,19 +441,15 @@ class MainWindow(QMainWindow):
         # widgets, not dock objects, so this move preserves connections.
         self._detection_table = DetectionTable(self)
         self._psd_widget = PsdWidget(engine=self._engine, parent=self)
-        self._ai_panel = AiPanel(self._engine, self._ai_engine, parent=self)
-        self._ai_panel.set_engage_request_handler(self._open_engage_agent_dialog)
-        self._ai_panel.set_archive_request_handler(self._open_archive_agent_dialog)
         self._hvsr_widget = HvsrWidget(self._engine, self._hvsr_engine, parent=self)
         self._hvsr_widget.set_archive_request_handler(self._run_hvsr_archive)
         # The Archive tab: browse the SDS archive, view a window statically,
-        # measure on it, and hand the interval to HVSR/AI. The DAO is read
+        # measure on it, and hand the interval to HVSR. The DAO is read
         # once here on the GUI thread (thread-safe, read-only — rule 8).
         self._archive_tab = ArchiveTab(self._engine, self._engine.archive_dao(), parent=self)
         self._archive_tab.loadRequested.connect(self._on_archive_window_load_requested)
         self._archive_tab.unitChangeRequested.connect(self._on_archive_window_unit_change)
         self._archive_tab.hvsrRequested.connect(self._handoff_archive_to_hvsr)
-        self._archive_tab.aiRequested.connect(self._handoff_archive_to_ai)
 
         # Detections is a master-detail splitter: the table on the left,
         # the "why did this fire?" detail pane on the right. The table's
@@ -522,7 +480,6 @@ class MainWindow(QMainWindow):
         self._central_tabs.addTab(self._detections_splitter, "Detections")
         self._central_tabs.addTab(self._live_tabs, "Live")
         self._central_tabs.addTab(self._psd_widget, "PSD")
-        self._central_tabs.addTab(self._ai_panel, "AI")
         self._central_tabs.addTab(self._hvsr_widget, "HVSR")
         self._central_tabs.addTab(self._archive_tab, "Archive")
         self._central_tabs.setCurrentWidget(self._detections_splitter)
@@ -1230,12 +1187,6 @@ class MainWindow(QMainWindow):
         self._detail_pane.unitChangeRequested.connect(self._on_unit_change_requested)
         self._detail_pane.componentLayoutChanged.connect(self._on_component_layout_changed)
         self._detection_table.inspectInUnitRequested.connect(self._on_inspect_in_unit)
-        # M9: AI annotations feed the same table as STA/LTA (so AI picks
-        # appear there) AND the marker path (so they get P/S coloured
-        # markers). AI picks are instantaneous (t_off=None), so there is no
-        # update-marker wiring — only the recorded path.
-        self._ai_engine.aiAnnotation.connect(self._detection_table.on_detection_recorded)
-        self._ai_engine.aiAnnotation.connect(self._on_detection_markers)
         self._engine.errorOccurred.connect(self._on_engine_error)
         # M6 stage 1: spectrogram fan-out. The engine emits one column
         # per stream per STFT step; both the inline LiveStack pane and
@@ -1378,8 +1329,8 @@ class MainWindow(QMainWindow):
         view_end = float(t_ref + _ARCHIVE_INSPECT_POST_S)
         # Read extra pre-roll ahead of the inspect window so a recomputed
         # recursive STA/LTA has a converged LTA by the onset (H3 — see
-        # _archive_ratio_warmup_s). For AI/stored-curve kinds this is 0, so
-        # the read and view windows coincide (display unchanged).
+        # _archive_ratio_warmup_s). For other kinds this is 0, so the read
+        # and view windows coincide (display unchanged).
         warmup_s = self._archive_ratio_warmup_s(detection)
         t_start = float(t_on - _ARCHIVE_INSPECT_PRE_S - warmup_s)
         t_end = view_end
@@ -1448,10 +1399,9 @@ class MainWindow(QMainWindow):
         ``LTA_MULT * lta_s`` of extra pre-roll lets the LTA converge before
         the onset; the warm-up region is rendered off-screen.
 
-        Returns ``0.0`` for non-STA/LTA kinds (their detail curve is a
-        stored, decimated probability series — not recomputed — so it needs
-        no warm-up) and for STA/LTA detections that recorded no usable
-        ``lta_s`` in meta.
+        Returns ``0.0`` for non-STA/LTA kinds (nothing is recomputed for
+        them, so they need no warm-up) and for STA/LTA detections that
+        recorded no usable ``lta_s`` in meta.
         """
         if detection.kind != _STA_LTA_DETECTION_KIND:
             return 0.0
@@ -1650,20 +1600,6 @@ class MainWindow(QMainWindow):
             self._central_tabs.setCurrentWidget(self._hvsr_widget)
         self._hvsr_widget.prefill_archive(device, grp, float(t_start_epoch), float(t_end_epoch))
 
-    def _handoff_archive_to_ai(
-        self, device: object, group: object, t_start_epoch: float, t_end_epoch: float
-    ) -> None:
-        """Switch to the AI tab and open the engage dialog prefilled with the
-        Archive selection; the user picks an agent and clicks Run."""
-        if not isinstance(device, str) or not isinstance(group, dict):
-            return
-        grp = {str(k): str(v) for k, v in group.items()}
-        if self._central_tabs is not None:
-            self._central_tabs.setCurrentWidget(self._ai_panel)
-        self._open_archive_agent_dialog(
-            prefill=(device, grp, float(t_start_epoch), float(t_end_epoch))
-        )
-
     def _on_component_layout_changed(self, layout: object) -> None:
         """User toggled Stacked/Overlaid for the 3C archive view."""
         self._detail_pane.set_component_layout(str(layout))
@@ -1828,163 +1764,6 @@ class MainWindow(QMainWindow):
         assert self._central_tabs is not None
         self._central_tabs.setCurrentWidget(self._live_tabs)
 
-    def _open_engage_agent_dialog(self) -> None:
-        """Open the Engage-AI-agent dialog and, on accept, engage the agent.
-
-        The dialog is fed plain data (``live_streams`` + an fs lambda) so it
-        never reaches into the engine itself. On accept we construct the
-        chosen agent via the registry and hand it to :class:`AIEngine`.
-        """
-        from seedlink_dashboard.ai.agents import AGENTS, available_agents
-        from seedlink_dashboard.gui.dialogs.engage_agent_dialog import EngageAgentDialog
-
-        streams_by_device = self._engine.live_streams()
-
-        def stream_fs(device: str, nslc: str) -> float:
-            return float(self._engine.read_recent(device, nslc, 1.0)[1])
-
-        dialog = EngageAgentDialog(streams_by_device, stream_fs, parent=self)
-        if dialog.exec() != int(QDialog.DialogCode.Accepted):
-            return
-        params = dialog.result_params()
-        group = params["group"]
-        if not isinstance(group, dict) or not group:
-            QMessageBox.warning(
-                self,
-                "Engage agent",
-                "No Z/N/E component group was selected for the chosen device/station.",
-            )
-            return
-        agent_id = str(params["agent_id"])
-        factory = AGENTS.get(agent_id)
-        if factory is None:
-            QMessageBox.critical(self, "Engage agent", f"Unknown agent {agent_id!r}.")
-            return
-        # Symmetric with the archive requires_fit refusal below: the dialog
-        # disables an agent whose runtime extra is missing, but guard here too
-        # so a future selection-logic change can't reach warm_up with no torch.
-        if not available_agents().get(agent_id, True):
-            QMessageBox.warning(
-                self,
-                "Engage agent",
-                f"{agent_id} needs the 'ai' extra — run: uv sync --extra ai",
-            )
-            return
-        # The selected agent's own engage_params drive these kwargs; the
-        # factory filters to the constructor signature (so a heuristic agent
-        # that takes no ``device`` ignores it).
-        agent_kwargs = params["agent_kwargs"]
-        if not isinstance(agent_kwargs, dict):
-            return
-        agent = factory(**agent_kwargs, device=self._config.ai.device)
-        tp, ts = _engage_thresholds(agent_kwargs)
-        self._ai_engine.engage(
-            agent,
-            str(params["device"]),
-            group,
-            threshold_p=tp,
-            threshold_s=ts,
-        )
-
-    def _open_archive_agent_dialog(
-        self, prefill: tuple[str, dict[str, str], float, float] | None = None
-    ) -> None:
-        """Open the "run on past data" dialog and replay the agent over a
-        user-chosen archive range (M9 Stage C).
-
-        ``prefill`` (Archive tab hand-off) pre-selects the device/station +
-        interval; the user still picks the agent and clicks Run.
-
-        The reader read + window build is a deliberate one-shot inline read:
-        this is a modal action over a user-chosen bounded range, not the live
-        data path, so rule 11 (render must not back-pressure science) does
-        not apply. The build is still bounded by the reader's internal
-        day-scan cap, so an absurdly long range cannot run unbounded.
-
-        ``ArchiveReader`` / ``build_archive_windows`` are imported lazily to
-        avoid a module-level storage import cycle.
-        """
-        from obspy import UTCDateTime
-
-        from seedlink_dashboard.ai.agents import AGENTS
-        from seedlink_dashboard.core.ai_engine import build_archive_windows
-        from seedlink_dashboard.gui.dialogs.engage_agent_dialog import EngageAgentDialog
-        from seedlink_dashboard.storage.archive_reader import ArchiveReader
-
-        streams_by_device = self._engine.live_streams()
-
-        def stream_fs(device: str, nslc: str) -> float:
-            return float(self._engine.read_recent(device, nslc, 1.0)[1])
-
-        dialog = EngageAgentDialog(streams_by_device, stream_fs, archive=True, parent=self)
-        if prefill is not None:
-            dialog.apply_prefill(*prefill)
-        if dialog.exec() != int(QDialog.DialogCode.Accepted):
-            return
-        params = dialog.result_params()
-        group = params["group"]
-        if not isinstance(group, dict) or not group:
-            QMessageBox.warning(
-                self,
-                "Run on past data",
-                "No Z/N/E component group was selected for the chosen device/station.",
-            )
-            return
-        agent_id = str(params["agent_id"])
-        factory = AGENTS.get(agent_id)
-        if factory is None:
-            QMessageBox.critical(self, "Run on past data", f"Unknown agent {agent_id!r}.")
-            return
-        agent_kwargs = params["agent_kwargs"]
-        if not isinstance(agent_kwargs, dict):
-            return
-        agent = factory(**agent_kwargs, device=self._config.ai.device)
-        # Belt-and-suspenders: the dialog disables requires_fit agents in
-        # archive mode, but guard here too — the engine has no archive-fit
-        # path (warm_up would raise unfitted), so refuse rather than crash.
-        if agent.requires_fit:
-            QMessageBox.warning(
-                self,
-                "Run on past data",
-                "Learning agents are not yet supported on past data.",
-            )
-            return
-        tp, ts = _engage_thresholds(agent_kwargs)
-        device = str(params["device"])
-        t_start = UTCDateTime(str(params["t_start"]))
-        t_end = UTCDateTime(str(params["t_end"]))
-        reader = ArchiveReader(self._engine.archive_root(device), self._engine.archive_dao())
-        # Deliberate one-shot inline read (bounded by the reader's day-scan
-        # cap): build the window list over the chosen archive range. The two
-        # SeisBench agents are the only ones reaching here (learning agents
-        # were refused above), so a threshold is always derivable.
-        windows = build_archive_windows(
-            reader,
-            device,
-            group,
-            t_start,
-            t_end,
-            float(self._config.ai.window_seconds),
-            float(self._config.ai.step_seconds),
-            threshold_p=tp if tp is not None else 0.3,
-            threshold_s=ts if ts is not None else 0.3,
-        )
-        if not windows:
-            QMessageBox.information(
-                self,
-                "No data",
-                "No archived data with full component coverage in that range.",
-            )
-            return
-        self._ai_engine.engage_archive(
-            agent,
-            device,
-            group,
-            windows,
-            threshold_p=tp,
-            threshold_s=ts,
-        )
-
     def _run_hvsr_archive(
         self,
         device: str,
@@ -1995,8 +1774,7 @@ class MainWindow(QMainWindow):
     ) -> str:
         """Run HVSR over an archived range (the HVSR widget's archive handler).
 
-        Mirrors :meth:`_open_archive_agent_dialog`'s storage construction: a
-        deliberate one-shot inline read bounded by the reader's day-scan cap
+        A deliberate one-shot inline read bounded by the reader's day-scan cap
         (not the live data path). Builds the ``ArchiveReader`` for the device
         and hands it to the HVSR engine, which slices the windows and runs one
         off-thread compute. Returns the measurement id, or ``""`` when the
@@ -2029,13 +1807,11 @@ class MainWindow(QMainWindow):
             return
         t_on = float(detection.t_on)
         t_off = float(detection.t_off) if detection.t_off is not None else None
-        phase = detection.meta.get("phase") if isinstance(detection.meta, dict) else None
-        phase_str = phase if isinstance(phase, str) else None
         self._live_tabs.add_detection_marker(
-            detection.device, detection.nslc, detection.id, t_on, t_off, detection.score, phase_str
+            detection.device, detection.nslc, detection.id, t_on, t_off, detection.score
         )
         self._spectrogram_widget.add_detection_marker(
-            detection.device, detection.nslc, detection.id, t_on, phase_str
+            detection.device, detection.nslc, detection.id, t_on
         )
 
     def _on_detection_update_markers(self, detection: object) -> None:
@@ -2145,12 +1921,9 @@ class MainWindow(QMainWindow):
         self._decon_thread.quit()
         if not self._decon_thread.wait(_DECON_THREAD_JOIN_MS):
             _log.warning("decon_thread_join_timeout")
-        # Shut the AI engine down BEFORE the streaming engine: the AI worker
-        # thread reads the engine's ring buffers, so it must be joined before
-        # the engine it reads from goes away (M9).
-        self._ai_engine.shutdown()
-        # Same ordering rationale as the AI engine: the HVSR worker thread
-        # reads the engine's ring buffers, so join it before the engine goes.
+        # Shut the HVSR engine down BEFORE the streaming engine: its worker
+        # thread reads the engine's ring buffers, so it must be joined
+        # before the engine it reads from goes away.
         self._hvsr_engine.shutdown()
         # Archive detail loader: its worker consults the engine's DAO
         # (thread-safe, read-only), so join it before the engine tears down.

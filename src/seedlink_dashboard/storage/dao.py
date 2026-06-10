@@ -32,7 +32,6 @@ import json
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -44,29 +43,6 @@ from seedlink_dashboard.storage.db import connect
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-
-@dataclass(slots=True)
-class Event:
-    """A curated persist-on-detection event row (M10 Stage D).
-
-    Mirrors the ``events`` table. ``mode`` is one of the two elementary
-    modes (``'dedicated_window'`` / ``'tag_in_sds'``); the config's
-    ``'both'`` is stored as two rows. ``file_path`` is set only for
-    ``'dedicated_window'`` rows (the trimmed MiniSEED window) and ``None``
-    for ``'tag_in_sds'``. Timestamps are :class:`UTCDateTime`.
-    """
-
-    id: int
-    detection_id: int | None
-    stream_id: int
-    mode: str
-    t_start: UTCDateTime
-    t_end: UTCDateTime
-    score: float
-    file_path: str | None
-    created_at: UTCDateTime
-    meta: dict[str, object]
 
 
 _T = TypeVar("_T")
@@ -497,114 +473,6 @@ class ArchiveDao:
         else:
             cur = self._conn().execute("SELECT COUNT(*) AS n FROM detections")
         return int(cur.fetchone()["n"])
-
-    # ------------------------------------------------------------------
-    # Events (M10 Stage D — persist-on-detection)
-    # ------------------------------------------------------------------
-
-    def record_event(
-        self,
-        *,
-        detection_id: int | None,
-        stream_id: int,
-        mode: str,
-        t_start: UTCDateTime,
-        t_end: UTCDateTime,
-        score: float,
-        file_path: str | None,
-        meta: dict[str, object],
-    ) -> int:
-        """Insert one ``events`` row; return its new id.
-
-        Mirrors :meth:`record_detection`: commits immediately
-        (``flush_now``) rather than batching, since an event is rare and
-        the persister announces it (``persisted``) only after this returns
-        — the row must be durable before the signal fires (CLAUDE.md rule
-        8 — persisted before announced).
-
-        Rule 9 (DAO field provenance): ``file_path``, ``t_start`` and
-        ``t_end`` are the *actual* values produced by the write at the call
-        site (the file the persister just fsynced+renamed, the trimmed
-        trace's real span), never accumulated deltas. ``stream_id`` is
-        resolved by the caller via ``find_stream_id`` / ``upsert_stream``;
-        the FK guarantees the parent stream exists.
-        """
-        meta_json = json.dumps(meta, sort_keys=True, default=str)
-
-        def _insert(cur: sqlite3.Cursor) -> int | None:
-            cur.execute(
-                "INSERT INTO events(detection_id, stream_id, mode, t_start, t_end,"
-                "                   score, file_path, created_at, meta_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    detection_id,
-                    stream_id,
-                    mode,
-                    str(t_start),
-                    str(t_end),
-                    float(score),
-                    file_path,
-                    _now_iso(),
-                    meta_json,
-                ),
-            )
-            return cur.lastrowid
-
-        event_id = self.transactional(_insert)
-        self.flush_now()
-        if event_id is None:  # pragma: no cover - insert guarantees a rowid
-            raise RuntimeError("record_event: lastrowid was None")
-        return int(event_id)
-
-    def events_for_detection(self, detection_id: int) -> list[Event]:
-        """Return the events linked to one detection, newest first. Read-only."""
-        rows = (
-            self._conn()
-            .execute(
-                "SELECT id, detection_id, stream_id, mode, t_start, t_end, score,"
-                "       file_path, created_at, meta_json"
-                " FROM events WHERE detection_id=? ORDER BY id DESC",
-                (detection_id,),
-            )
-            .fetchall()
-        )
-        return [self._row_to_event(row) for row in rows]
-
-    def recent_events(self, limit: int) -> list[Event]:
-        """Return the most-recent events, newest first. Read-only.
-
-        Index-backed bound for tests + a future curated-events UI; it never
-        touches waveform data (the ``file_path`` is just a string here).
-        """
-        rows = (
-            self._conn()
-            .execute(
-                "SELECT id, detection_id, stream_id, mode, t_start, t_end, score,"
-                "       file_path, created_at, meta_json"
-                " FROM events ORDER BY id DESC LIMIT ?",
-                (int(limit),),
-            )
-            .fetchall()
-        )
-        return [self._row_to_event(row) for row in rows]
-
-    @staticmethod
-    def _row_to_event(row: sqlite3.Row) -> Event:
-        meta_raw = row["meta_json"]
-        meta = json.loads(meta_raw) if meta_raw else {}
-        det_id = row["detection_id"]
-        return Event(
-            id=int(row["id"]),
-            detection_id=int(det_id) if det_id is not None else None,
-            stream_id=int(row["stream_id"]),
-            mode=row["mode"],
-            t_start=UTCDateTime(row["t_start"]),
-            t_end=UTCDateTime(row["t_end"]),
-            score=float(row["score"]),
-            file_path=row["file_path"],
-            created_at=UTCDateTime(row["created_at"]),
-            meta=meta,
-        )
 
     def find_stream_id(self, device_name: str, nslc: str) -> int | None:
         """Resolve ``streams.id`` for ``(device_name, nslc)`` — read-only.

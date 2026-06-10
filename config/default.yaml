@@ -47,27 +47,6 @@ devices: []
 #       - { type: bandpass, freqmin: 0.5, freqmax: 8.0, corners: 4, zerophase: false }
 #       - { type: sta_lta, sta: 1.0, lta: 30.0, on_threshold: 3.5, off_threshold: 1.5 }
 
-ai:
-  enabled: false
-  model: phasenet
-  device: cpu
-  window_seconds: 60
-  step_seconds: 10
-  threshold_p: 0.3
-  threshold_s: 0.3
-  # M10 fit-then-infer baseline window length (s) for learning agents.
-  baseline_seconds: 300
-  # M10 Stage D — persist-on-detection engagement policy (off by default).
-  # An agent annotation with score >= min_score triggers a curated event:
-  # mode dedicated_window writes a trimmed MiniSEED file under events/,
-  # tag_in_sds only records an index row, both does both (two rows).
-  persist_on_detection:
-    enabled: false
-    mode: dedicated_window
-    pre_seconds: 10.0
-    post_seconds: 30.0
-    min_score: 0.5
-
 hvsr:
   # HVSR (Nakamura H/V spectral ratio) analysis tab. Starting values the UI
   # seeds its controls from; the user changes them per measurement.

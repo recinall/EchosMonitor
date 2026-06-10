@@ -5,8 +5,8 @@ streaming_engine.StreamingEngine`, owned by the main window and living on
 the GUI thread. It drives an HVSR measurement over a chosen device's 3
 components and runs the (heavy, numba-JIT-bearing) ``hvsrpy`` re-compute
 **off** the GUI thread *and* **off** the data-path threads, on a dedicated
-``_hvsr_thread`` — mirroring :class:`~seedlink_dashboard.core.ai_engine.
-AIEngine`.
+``_hvsr_thread`` (the standard parentless-worker + ``moveToThread``
+pattern, rule 1).
 
 Best-effort consumer (CLAUDE.md rule 11). The engine *pulls* successive
 non-overlapping windows from the ring buffers via
@@ -64,8 +64,8 @@ _THREAD_JOIN_MS = 8000
 _SKIP_LOG_INTERVAL_S = 5.0
 
 # Each present component must hold at least this fraction of the requested
-# window before we capture it (mirrors AIEngine — the 3 components' tails
-# differ by a sample or two).
+# window before we capture it (the 3 components' tails differ by a sample
+# or two).
 _MIN_WINDOW_FILL = 0.9
 
 # Start computing (and showing a curve) once this many windows exist; the
