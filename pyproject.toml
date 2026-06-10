@@ -35,7 +35,10 @@ dependencies = [
     "ipython>=8.0",
 ]
 
-[project.optional-dependencies]
+# Dev tooling lives in a dependency-group (PEP 735), not an optional extra:
+# `uv sync` installs the `dev` group by default, so the CLAUDE.md gate
+# commands work after a plain sync with no extra flags.
+[dependency-groups]
 dev = [
     "ruff>=0.4",
     "mypy>=1.10",

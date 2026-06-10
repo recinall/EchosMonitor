@@ -89,18 +89,29 @@ decision log).
         `uv run echosmonitor --version` works; offscreen smoke passed with
         both one-time notices observed (`legacy_config_ignored`,
         `qsettings_reset_after_rename`). Reviewed: code-reviewer approve.
-- [ ] **C. Gate green + scaffold** (re-scoped: there are no tests to prune):
-  - [ ] create `tests/` scaffold: conftest, import smoke test, config
-        round-trip test, offscreen MainWindow construct/teardown smoke
-        (`QT_QPA_PLATFORM=offscreen`); full gate passes without torch
-        installed.
-  - [ ] make the gate runnable: dev tools are an optional extra, so plain
-        `uv sync` does not install ruff/mypy/pytest — either move them to
-        `[dependency-groups]` or document `uv sync --extra dev` in
-        CLAUDE.md.
-  - [ ] create `docs/POSTMORTEMS.md` (carry over from the source repo if
-        available; else seed from CLAUDE.md rule 10's four landmines) —
-        blocker for `qt-concurrency-auditor` and rule 10.
+- [x] **C. Gate green + tests** (re-scoped twice: the original project at
+      `~/Dati/Sources/SeedTiLa` still had the FULL suite — 116 files /
+      24k lines — so it was carried over instead of writing a scaffold):
+  - [x] carry over `tests/` from SeedTiLa: package renamed, 5 wholly-AI
+        test files + `tests/ai/` deleted, ~30 files adapted (AiConfig
+        fixtures, phase-less marker APIs, kind-filter removal, events
+        table) with non-AI assertions kept at full strength; final gate
+        **737 passed, 5 perf-deselected**, ruff src+tests clean,
+        mypy --strict clean — all without torch.
+  - [x] new regression tests for the M0 decisions: loader legacy `ai:`
+        strip (×3), `legacy_config_ignored` (×2), v2→v3 no-op migration
+        incl. detections survival, fresh-DB-has-no-events,
+        `qsettings_reset_after_rename` (×3), no-kind-filter contract (×2),
+        amber-marker/no-phase contract (×2).
+  - [x] test-guardian found+fixed a suite isolation bug: conftest
+        redirected only IniFormat QSettings — NativeFormat (the default)
+        was writing to the REAL `~/.config/EchosMonitor` during tests.
+  - [x] gate runnable via plain `uv sync`: dev tools moved from the
+        optional extra to PEP-735 `[dependency-groups]` (uv installs the
+        `dev` group by default).
+  - [x] `docs/POSTMORTEMS.md` carried over verbatim (776 lines) with a
+        provenance header; `docs/MANUAL_TESTS.md` carried over with AI
+        sections removed + renamed (a `utils/docs.py` test depends on it).
 
 Acceptance: `grep -ri "seisbench\|torch\|phasenet\|ai_engine\|AiConfig" src tests` → empty.
 
@@ -290,6 +301,8 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-10 | M0-B legacy `ai:` key in user configs: **loader strips + warns once** | Schema is `extra="forbid"` (`config/schema.py:26`); without stripping, every pre-existing user config fails validation after `AiConfig` is removed. |
 | 2026-06-10 | M0-B events schema: keep `SCHEMA_VERSION = 3`, v2→v3 migration becomes a **no-op stub**; drop `_EVENTS_DDL` body | Keeps old DBs' schema_version history linear (`storage/db.py:31,141–178,239–252`); `detections` DDL stays (STA/LTA writes it). |
 | 2026-06-10 | M2-B: **extend** the existing `sessions` table (project_name + device membership, schema v4) instead of creating one | `sessions` already exists at `storage/db.py:52–58`. |
+| 2026-06-10 | M0-C: **carry over** the SeedTiLa test suite + POSTMORTEMS.md + MANUAL_TESTS.md instead of writing a scaffold | The audit's "tests not carried over" finding was about THIS repo; the originals exist at `~/Dati/Sources/SeedTiLa` (116 test files, 776-line postmortems). Real regression coverage beats a 4-file scaffold. |
+| 2026-06-10 | Dev tools live in PEP-735 `[dependency-groups]`, not an extra | Plain `uv sync` installs the `dev` group by default, making CLAUDE.md's gate commands literally correct. |
 
 ## Open questions (resolve before the milestone that needs them)
 
