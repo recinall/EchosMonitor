@@ -120,13 +120,29 @@ Acceptance: `grep -ri "seisbench\|torch\|phasenet\|ai_engine\|AiConfig" src test
 Goal: list Echos devices and configure them completely — client side (how the
 app connects) AND server side (the firmware's own config) — from one dialog.
 
-- [ ] **A. REST client** `core/echos_api.py` (skill: `echos-rest-api`).
+- [x] **A. REST client** `core/echos_api.py` (skill: `echos-rest-api`).
       Typed async httpx client: status, config get/post, network config,
       seedlink status/clients/config (hot-reload 202 + `restart-status`
       poll), disconnect client, calibration (full sweep + status poll),
       stationxml, OTA status, auth password change, reboot. Basic Auth,
       timeout-bounded, 429/Retry-After backoff, never logs credentials.
       Unit tests against an `httpx.MockTransport` fake of the firmware.
+      Landed 2026-06-10 (34 tests, gate 771 green, code-reviewer approve):
+  - [x] frozen pydantic models (`extra="ignore"`), closed error set
+        `EchosErrorKind` in `core/models.py` + `EchosApiError` hierarchy in
+        `core/exceptions.py` (auth_failed / locked_out / unreachable /
+        timeout / protocol) — dialog branches on type/kind, never text.
+  - [x] lockout: 429 stores a monotonic `Retry-After` deadline; every
+        authenticated request fast-fails client-side until expiry (proved
+        by a zero-device-traffic test). GETs ≤2 transport retries; writes
+        zero. Hot-reload poll tolerates the mid-restart HTTP drop and is
+        deadline-bounded (worst case `timeout_s` + one in-flight poll).
+  - [x] fake firmware lives in `tests/core/echos_fake.py` for M1-D reuse
+        (auth/lockout ladder, 7-step restart sim with fail/hang/drop knobs,
+        3-phase calibration, fault injection, per-path request log).
+  - [x] deferred to M1-C/D (reviewer notes): consider `retries=0` +
+        tolerating transient 5xx for restart-status polls once the wire
+        contract is pinned against real firmware.
 - [ ] **B. Credentials store** (keyring with file fallback, rule 15) +
       device schema extension: `echos: {http_port: 80, position_override,
       poll_interval_s}`.
@@ -303,6 +319,8 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-10 | M2-B: **extend** the existing `sessions` table (project_name + device membership, schema v4) instead of creating one | `sessions` already exists at `storage/db.py:52–58`. |
 | 2026-06-10 | M0-C: **carry over** the SeedTiLa test suite + POSTMORTEMS.md + MANUAL_TESTS.md instead of writing a scaffold | The audit's "tests not carried over" finding was about THIS repo; the originals exist at `~/Dati/Sources/SeedTiLa` (116 test files, 776-line postmortems). Real regression coverage beats a 4-file scaffold. |
 | 2026-06-10 | Dev tools live in PEP-735 `[dependency-groups]`, not an extra | Plain `uv sync` installs the `dev` group by default, making CLAUDE.md's gate commands literally correct. |
+| 2026-06-10 | M1-A: the firmware JSON field names are **defined by the test fake** (`tests/core/echos_fake.py`), derived from the skill; models use `extra="ignore"` | The skill pins endpoints/semantics but not exact JSON bodies, and the real devices must not be probed casually (lockout). Verify field names against real firmware before M1-C relies on them — both `echos_api.py` and the fake carry this caveat in their docstrings. |
+| 2026-06-10 | M1-A: a device-reported restart **failure returns** a terminal `RestartStatus(state="failed")` instead of raising | It is domain state the dialog must render step-by-step, not a transport error; the closed `EchosErrorKind` set stays transport-only. |
 
 ## Open questions (resolve before the milestone that needs them)
 

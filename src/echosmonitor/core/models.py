@@ -49,6 +49,32 @@ FailureKind = Literal[
 ]
 
 
+# Closed set of failure causes the Echos REST client (core/echos_api.py)
+# classifies a request into (skill: echos-rest-api). The device dialog and
+# status poller branch on this — never on message text. Carried by the
+# ``EchosApiError`` hierarchy in core/exceptions.py.
+#
+# Values:
+#   auth_failed — the device rejected the admin credentials (HTTP 401),
+#                 or a write was attempted with no password configured.
+#   locked_out  — the device's auth lockout is active (HTTP 429); the
+#                 exception carries ``retry_after_s``. Also raised by the
+#                 client-side guard that refuses to hammer the device
+#                 before the window expires (rule 15).
+#   unreachable — network-level failure (DNS, refused, reset) before a
+#                 response arrived.
+#   timeout     — connect/read deadline elapsed (rule 7 bound).
+#   protocol    — the device answered, but not in the expected shape
+#                 (unexpected status code, non-JSON body, schema mismatch).
+EchosErrorKind = Literal[
+    "auth_failed",
+    "locked_out",
+    "unreachable",
+    "timeout",
+    "protocol",
+]
+
+
 # Separator used to namespace per-stream engine state by device. The same
 # NSLC arriving from two different SeedLink servers must not share a ring
 # buffer, coalescer, or chain — keying by ``f"{device}{DEVICE_KEY_SEP}{nslc}"``

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from echosmonitor.core.models import FailureKind
+    from echosmonitor.core.models import EchosErrorKind, FailureKind
 
 
 class EchosMonitorError(Exception):
@@ -104,3 +104,89 @@ class InfoProtocolError(SeedLinkProtocolError):
     Surfaces malformed XML, unexpected document roots, or missing elements
     that prevent constructing the typed dataclasses returned to the caller.
     """
+
+
+# ----------------------------------------------------------------------
+# Echos REST API (M1 stage A) — core/echos_api.py.
+# ----------------------------------------------------------------------
+
+
+class EchosApiError(EchosMonitorError):
+    """Base class for Echos REST client failures.
+
+    Carries a closed-set ``kind`` (``core.models.EchosErrorKind``) so the
+    device dialog and the status poller branch deterministically without
+    inspecting message text (skill: echos-rest-api). Messages never
+    contain credentials (rule 15).
+
+    Attributes:
+        kind: One of ``"auth_failed" | "locked_out" | "unreachable" |
+            "timeout" | "protocol"``.
+    """
+
+    __slots__ = ("kind",)
+
+    def __init__(self, kind: EchosErrorKind, message: str) -> None:
+        super().__init__(message)
+        self.kind: EchosErrorKind = kind
+
+
+# Names below intentionally omit the ``Error`` suffix, matching the Info*
+# family above; N818 suppressed locally for the same reason.
+class EchosAuthFailed(EchosApiError):  # noqa: N818
+    """The device rejected the admin credentials (HTTP 401), or a write
+    was attempted with no password configured. Always ``kind == "auth_failed"``.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("auth_failed", message)
+
+
+class EchosLockedOut(EchosApiError):  # noqa: N818
+    """The device's auth lockout is active (HTTP 429 + ``Retry-After``).
+
+    Also raised by the client-side guard that fast-fails authenticated
+    requests before the known lockout window has expired, so the app
+    never hammers a locked device (rule 15).
+
+    Attributes:
+        retry_after_s: Seconds remaining until the device accepts
+            authenticated requests again (from the ``Retry-After`` header,
+            or the remaining client-side window on a guard fast-fail).
+    """
+
+    __slots__ = ("retry_after_s",)
+
+    def __init__(self, retry_after_s: float, message: str) -> None:
+        super().__init__("locked_out", message)
+        self.retry_after_s: float = retry_after_s
+
+
+class EchosUnreachable(EchosApiError):  # noqa: N818
+    """Network-level failure (DNS, refused, reset) before any HTTP response.
+
+    Always ``kind == "unreachable"``.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("unreachable", message)
+
+
+class EchosTimeout(EchosApiError):  # noqa: N818
+    """A connect/read deadline elapsed (rule 7 bound), including the bounded
+    wait for the seedlink hot-reload restart poll. Always ``kind == "timeout"``.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("timeout", message)
+
+
+class EchosApiProtocolError(EchosApiError):
+    """The device answered, but not in the expected shape.
+
+    Unexpected status code, non-JSON body, or a payload that fails pydantic
+    validation. Always ``kind == "protocol"``.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("protocol", message)
