@@ -179,6 +179,19 @@ class EchosStatusWorker(QObject):
             # device must not accumulate a poll backlog against itself.
             self._next_due[target.name] = time.monotonic() + target.poll_interval_s
 
+    @Slot()
+    def release(self) -> None:
+        """Stop the poll timer on ITS OWN thread (skill §3 barrier slot).
+
+        Invoke via ``BlockingQueuedConnection`` after :meth:`stop` and
+        before ``thread.quit()``: an active QTimer destroyed later from
+        the GUI thread (when Python collects the worker) triggers Qt's
+        "Timers cannot be stopped from another thread" — stopping it
+        here, on the worker thread, prevents that. Idempotent.
+        """
+        if self._timer is not None:
+            self._timer.stop()
+
     # ------------------------------------------------------------------
     # Plain method (NOT a Slot). Callable from any thread.
     # ------------------------------------------------------------------

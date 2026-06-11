@@ -2001,8 +2001,19 @@ class MainWindow(QMainWindow):
             _log.warning("info_thread_join_timeout")
         # M1-C: stop the Echos status poller. stop() is a plain method
         # (not a queued slot) so it interrupts an in-flight poll via the
-        # asyncio task-cancel path before the bounded join.
+        # asyncio task-cancel path; the blocking-queued release() is the
+        # skill §3 barrier that stops the worker-thread QTimer on its own
+        # thread before quit (safe: emitter thread ≠ receiver thread).
+        # The isRunning() guard matters: closeEvent can run TWICE (an
+        # explicit close + the test-harness teardown close), and a
+        # BlockingQueuedConnection into an already-finished thread never
+        # dispatches — it would hang the GUI forever. Nothing else quits
+        # this thread, so "running here" ⇒ the barrier will dispatch.
         self._echos_worker.stop()
+        if self._echos_thread.isRunning():
+            QMetaObject.invokeMethod(
+                self._echos_worker, "release", Qt.ConnectionType.BlockingQueuedConnection
+            )
         self._echos_thread.quit()
         if not self._echos_thread.wait(_ECHOS_THREAD_JOIN_MS):
             _log.warning("echos_thread_join_timeout")

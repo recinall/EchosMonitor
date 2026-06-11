@@ -93,6 +93,9 @@ def _spawn(qtbot: Any, factory: Any) -> tuple[EchosStatusWorker, QThread, _Trigg
 
 def _shutdown(worker: EchosStatusWorker, thread: QThread) -> None:
     worker.stop()
+    # Skill §3 barrier: stop the worker-thread QTimer on its own thread
+    # before quit, exactly as MainWindow.closeEvent does.
+    QMetaObject.invokeMethod(worker, "release", Qt.ConnectionType.BlockingQueuedConnection)
     thread.quit()
     assert thread.wait(_THREAD_JOIN_MS), "echos-status thread did not join in time"
 
@@ -194,6 +197,29 @@ def test_stop_interrupts_in_flight_poll(qtbot: Any) -> None:
     # an installed task, not win a race against poll start.
     qtbot.waitUntil(lambda: worker._in_flight is not None, timeout=3000)
     _shutdown(worker, thread)  # asserts the bounded join
+
+
+def test_shutdown_stops_worker_timer_via_release_barrier(qtbot: Any) -> None:
+    """Regression for the release() barrier (M1-D hygiene fix).
+
+    Without the BlockingQueuedConnection release() in ``_shutdown``, the
+    worker's QTimer is still ACTIVE after the join; whenever Python later
+    collects the worker, the timer is destroyed from a foreign thread and
+    Qt warns "Timers cannot be stopped from another thread". Asserting
+    the timer is inactive right after shutdown pins the barrier
+    deterministically. (A qtlog-based pin is impossible: pytest-qt's own
+    waitSignal cleanup emits the same warning text benignly whenever a
+    cross-thread signal ends its blocker, so the message is not ours to
+    assert on.)
+    """
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+        trigger.configureRequested.emit((_target(),))
+    assert worker._timer is not None and worker._timer.isActive()
+    _shutdown(worker, thread)
+    assert worker._timer is not None
+    assert not worker._timer.isActive()
 
 
 def test_stopped_worker_emits_nothing(qtbot: Any) -> None:

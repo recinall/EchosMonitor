@@ -259,3 +259,19 @@ def test_status_bar_no_note_when_all_devices_have_chains(qtbot: QtBot) -> None:
         assert label.toolTip() == ""
     finally:
         window.close()
+
+
+def test_close_event_is_reentrant(qtbot: QtBot) -> None:
+    """Regression (M1-D): closeEvent runs TWICE in practice — an explicit
+    ``window.close()`` plus the pytest-qt teardown close. The Echos
+    poller shutdown uses a BlockingQueuedConnection barrier that would
+    block forever if invoked into the already-finished worker thread on
+    the second pass; the isRunning() guard makes the second close a
+    no-op instead of a deadlock (which froze the whole suite at ~45%).
+    """
+    cfg, _ = load_config(None)
+    window = MainWindow(cfg, Path("/tmp/cfg.yaml"))
+    qtbot.addWidget(window)
+    window.close()
+    assert not window._echos_thread.isRunning()
+    window.close()  # must return, not hang

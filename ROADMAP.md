@@ -194,23 +194,61 @@ app connects) AND server side (the firmware's own config) — from one dialog.
   - [x] review finding fixed + regression-tested: a poll in flight when
         its device is removed used to resurrect the row as a ghost —
         late payloads for unknown rows are now dropped at the receiver.
-  - [ ] **CARRY-FORWARD (blocks M1-D sign-off):** the wire contract
-        (JSON field names) is still pinned only by the test fake — M1-C
-        now consumes `firmware_version/uptime_s/gnss.*/client_count/
-        ring_used_pct/state` and this has NOT been verified against
-        echos.local/pihw.local (devices not to be probed without the
-        user). Do a real-device smoke check before/with M1-D.
-- [ ] **D. Device dialog**: tabs *Connection* (client-side: name, host,
+  - [x] carry-forward re-scoped 2026-06-11 (decision log): the wire
+        contract remains fake-pinned; the real-device smoke check is now
+        the explicit **M1 closure gate** item at the end of this
+        milestone (M1-D's own acceptance is fake-based by design).
+- [x] **D. Device dialog**: tabs *Connection* (client-side: name, host,
       SeedLink port, selectors auto-derived from StationXML channels),
-      *Acquisition* (server-side: OSR, per-channel gains, emit_hn1),
-      *SeedLink server* (port, ring size, auth gate, record size, StationXML
-      profile — writes via hot-reload with progress UI), *Network* (WiFi
-      STA/AP), *Maintenance* (calibration trigger + progress, OTA status,
-      password rotation, reboot). Every server write = read-modify-write with
-      confirmation; surface lockout state honestly.
+      *Acquisition* (server-side: OSR, per-channel gains; emit_hn1 moved
+      to the SeedLink tab — decision log), *SeedLink server* (port, ring
+      size, auth gate, record size, StationXML profile — writes via
+      hot-reload with progress UI), *Network* (WiFi STA/AP), *Maintenance*
+      (calibration trigger + progress, OTA status, password rotation,
+      reboot). Every server write = read-modify-write with confirmation;
+      surface lockout state honestly. Landed 2026-06-11 (35 new tests;
+      gate green; code-reviewer + qt-concurrency-auditor findings all
+      fixed with regression tests):
+  - [x] `core/echos_device_worker.py`: per-dialog request engine on a
+        QThread (M1-C pattern: asyncio.run per queued slot, plain-method
+        stop() with task-cancel). Aggregate load (configs + OTA + cal +
+        StationXML channels via obspy ON the worker); keyring access only
+        on the worker thread; password rotation updates the store only
+        after the device's 200 (skill ordering, pinned by test).
+  - [x] `gui/dialogs/echos_tabs.py`: four tabs, one write endpoint each;
+        edits are `model_copy` of the last-loaded baseline; SeedLink
+        apply captures the POSTed config for rebaseline/port-sync (live
+        widgets can be edited mid-restart — review finding), shows the
+        7-step progress bar, and a server port change syncs the
+        Connection tab so OK saves the right endpoint. 429 → all server
+        writes disabled with a countdown banner.
+  - [x] audit findings fixed: teardown latch (late queued calibration
+        status can no longer resurrect a worker thread on a closed
+        dialog), calibration poll is ping-pong-gated and stops on poll
+        failure, join-timeout keeps worker refs (deliberate leak, no
+        use-after-free), host/http-port edits drop loaded baselines,
+        first-run wizard's credential row hidden (no silent dead-end
+        Store button), password constraints mirrored at the button.
+  - [x] acceptance met against the fake firmware (per this milestone's
+        acceptance line): `test_acquisition_roundtrip_acceptance` +
+        `test_seedlink_roundtrip_with_seven_step_restart_acceptance`
+        drive the real widgets through the real worker into the fake,
+        including the simulated 7-step restart.
+  - [ ] known minor gap (M6 wizard/polish): renaming a device orphans
+        its stored credential under the old key (writes then fail
+        auth_failed until the password is re-stored).
 
 Acceptance: against a fake firmware server, a full round-trip edit of
 acquisition + seedlink config works, including the simulated 7-step restart.
+**Met 2026-06-11** (see M1-D notes). M1 CLOSURE additionally gates on the
+real-device wire-contract smoke check below.
+
+- [ ] **M1 closure gate — real-device smoke check** (re-scoped from the
+      M1-C carry-forward; decision log 2026-06-11): the JSON field names
+      are pinned only by the test fake. Before M1 is declared closed (and
+      before any feature is trusted against real hardware), run a
+      read-only smoke against echos.local/pihw.local — user-mediated, the
+      devices must not be probed without the user (lockout risk).
 
 ## M2 — Session control (no autostart)
 
@@ -372,6 +410,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-10 | Dev tools live in PEP-735 `[dependency-groups]`, not an extra | Plain `uv sync` installs the `dev` group by default, making CLAUDE.md's gate commands literally correct. |
 | 2026-06-10 | M1-A: the firmware JSON field names are **defined by the test fake** (`tests/core/echos_fake.py`), derived from the skill; models use `extra="ignore"` | The skill pins endpoints/semantics but not exact JSON bodies, and the real devices must not be probed casually (lockout). Verify field names against real firmware before M1-C relies on them — both `echos_api.py` and the fake carry this caveat in their docstrings. |
 | 2026-06-10 | M1-A: a device-reported restart **failure returns** a terminal `RestartStatus(state="failed")` instead of raising | It is domain state the dialog must render step-by-step, not a transport error; the closed `EchosErrorKind` set stays transport-only. |
+| 2026-06-11 | M1-D: `emit_hn1` lives on the **SeedLink tab**, not Acquisition as sketched | It is a `/api/seedlink/config` field; tabs group by write endpoint so one Apply = exactly one confirmed read-modify-write (and only the SeedLink Apply triggers the hot-reload restart). |
+| 2026-06-11 | M1-D accepted **against the fake firmware**; the real-device wire-contract check is re-scoped to an explicit **M1 closure gate** | The milestone's acceptance line is literally "against a fake firmware server"; the field-name pin against echos.local/pihw.local needs the user (lockout risk — never probe unsolicited) and now has its own unchecked item under M1. |
+| 2026-06-11 | M1-D: pytest-qt's `waitSignal` cleanup benignly emits "Timers cannot be stopped from another thread" on cross-thread signals | Do NOT chase this warning text in tests/logs; the real hazard (worker QTimer active at GC) is pinned by `test_shutdown_stops_worker_timer_via_release_barrier` instead. |
 
 ## Open questions (resolve before the milestone that needs them)
 

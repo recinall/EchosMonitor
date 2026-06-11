@@ -15,6 +15,7 @@ the future enhancements land without UI re-shuffling.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,7 +24,10 @@ import structlog
 from PySide6.QtCore import (
     QRegularExpression,
     Qt,
+    QThread,
+    QTimer,
     Signal,
+    SignalInstance,
     Slot,
 )
 from PySide6.QtGui import QRegularExpressionValidator
@@ -36,6 +40,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -43,23 +48,36 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from echosmonitor.config.credentials import CredentialsStore
 from echosmonitor.config.schema import (
     DeviceConfig,
+    EchosDeviceConfig,
+    PositionOverride,
     ReconnectConfig,
     ResponseMetadataConfig,
     StreamSelectorConfig,
 )
 from echosmonitor.core.collisions import NslcCollision, find_nslc_collisions
+from echosmonitor.core.echos_device_worker import EchosDeviceState, EchosDeviceWorker
 from echosmonitor.core.exceptions import ConfigError, ResponseError
+from echosmonitor.core.models import EchosPollTarget
+from echosmonitor.gui.dialogs.echos_tabs import (
+    AcquisitionTab,
+    MaintenanceTab,
+    NetworkTab,
+    SeedlinkTab,
+)
 
 if TYPE_CHECKING:
     from echosmonitor.core.config_store import ConfigStore
+    from echosmonitor.core.echos_api import EchosApiClient
     from echosmonitor.core.streaming_engine import StreamingEngine
 
 _log = structlog.get_logger(__name__)
@@ -141,6 +159,19 @@ _COLLISION_BANNER_STYLE = (
     "border: 1px solid #e0a85c; border-radius: 3px; padding: 4px 6px; }"
 )
 
+# M1-D: bounded join for the per-dialog Echos REST worker thread on
+# dialog close (rule 7; matches the app-wide 2 s worker budgets).
+_ECHOS_WORKER_JOIN_MS = 2000
+
+# Lockout banner (rule 15: surface the 429 window honestly, never hammer).
+_LOCKOUT_BANNER_STYLE = (
+    "QLabel { color: #8a1f11; background: #fdecea; "
+    "border: 1px solid #e0a8a0; border-radius: 3px; padding: 4px 6px; }"
+)
+
+# Index of the Connection tab (the client-side form). Server tabs follow.
+_TAB_CONNECTION = 0
+
 
 def _selector_summary(stages: Iterable[object]) -> str:
     """Render a human-readable one-liner for the DSP chain summary label.
@@ -181,6 +212,17 @@ class DeviceForm(QWidget):
     # transitions) makes the wiring trivial: the dialog never has to
     # query ``is_valid()`` before doing anything.
     isValid = Signal(bool)  # noqa: N815
+    # M1-D: the Echos group checkbox toggled — the dialog enables /
+    # disables the server-side tabs accordingly.
+    echosEnabledChanged = Signal(bool)  # noqa: N815
+    # M1-D: "Store password" clicked — (device_key, password). Routed to
+    # the worker because keyring access can block (rule 1 / rule 15);
+    # the password never lands in the config.
+    credentialStoreRequested = Signal(str, str)  # noqa: N815
+    # M1-D: host or HTTP port edited — any loaded server-side state now
+    # belongs to a DIFFERENT device; the dialog drops the read-modify-
+    # write baselines on this signal (review finding).
+    connectionTargetChanged = Signal()  # noqa: N815
 
     def __init__(
         self,
@@ -292,6 +334,16 @@ class DeviceForm(QWidget):
         self._remove_row_button = QPushButton("- Remove selected", selector_box)
         sel_buttons.addWidget(self._add_row_button)
         sel_buttons.addWidget(self._remove_row_button)
+        # M1-D: replace the selector rows with the exact NSLCs the device
+        # advertises in its StationXML. Enabled once a device load has
+        # delivered channels (``set_device_channels``).
+        self._use_channels_button = QPushButton("Use device channels", selector_box)
+        self._use_channels_button.setEnabled(False)
+        self._use_channels_button.setToolTip(
+            "Load the device (Echos tabs) to derive selectors from its StationXML."
+        )
+        self._device_channels: tuple[str, ...] = ()
+        sel_buttons.addWidget(self._use_channels_button)
         sel_buttons.addStretch(1)
         selector_layout.addLayout(sel_buttons)
         form.addRow("Selectors:", selector_box)
@@ -333,6 +385,74 @@ class DeviceForm(QWidget):
         response_layout.addWidget(self._response_browse_button)
         form.addRow("Response metadata:", response_box)
 
+        # Echos client-side settings (M1-D; rule 15: only what the app
+        # needs to REACH the device — server-side config lives on the
+        # device, edited via the server tabs; the admin password lives
+        # in the credentials store, never in this form's config).
+        self._echos_group = QGroupBox("Echos device (REST management)", self)
+        self._echos_group.setCheckable(True)
+        self._echos_group.setChecked(False)
+        echos_form = QFormLayout(self._echos_group)
+        self._http_port_spin = QSpinBox(self._echos_group)
+        self._http_port_spin.setRange(1, 65535)
+        self._http_port_spin.setValue(80)
+        echos_form.addRow("HTTP port:", self._http_port_spin)
+        self._poll_interval_spin = QDoubleSpinBox(self._echos_group)
+        self._poll_interval_spin.setRange(1.0, 3600.0)
+        self._poll_interval_spin.setDecimals(1)
+        self._poll_interval_spin.setValue(5.0)
+        self._poll_interval_spin.setSuffix(" s")
+        echos_form.addRow("Status poll interval:", self._poll_interval_spin)
+        # Manual position override (rule 16): wins over StationXML.
+        self._pos_check = QCheckBox("Manual position override", self._echos_group)
+        echos_form.addRow("", self._pos_check)
+        pos_box = QWidget(self._echos_group)
+        pos_layout = QHBoxLayout(pos_box)
+        pos_layout.setContentsMargins(0, 0, 0, 0)
+        self._lat_spin = QDoubleSpinBox(pos_box)
+        self._lat_spin.setRange(-90.0, 90.0)
+        self._lat_spin.setDecimals(6)
+        self._lat_spin.setPrefix("lat ")
+        self._lon_spin = QDoubleSpinBox(pos_box)
+        self._lon_spin.setRange(-180.0, 180.0)
+        self._lon_spin.setDecimals(6)
+        self._lon_spin.setPrefix("lon ")
+        self._elev_spin = QDoubleSpinBox(pos_box)
+        self._elev_spin.setRange(-500.0, 9000.0)
+        self._elev_spin.setDecimals(1)
+        self._elev_spin.setPrefix("elev ")
+        self._elev_spin.setSuffix(" m")
+        for spin in (self._lat_spin, self._lon_spin, self._elev_spin):
+            pos_layout.addWidget(spin)
+        echos_form.addRow("Position:", pos_box)
+        # Admin password: stored via the CredentialsStore (keyring/file),
+        # NEVER serialised with the config (rule 15). The field is
+        # write-only; presence is reported via the status label. The whole
+        # row is HIDDEN until a host wires ``credentialStoreRequested`` to
+        # a real sink and calls :meth:`enable_credential_store` — the
+        # first-run wizard embeds this form without a worker, and a Store
+        # button that silently does nothing would be a rule-15 honesty
+        # failure (review finding).
+        self._credential_box = QWidget(self._echos_group)
+        cred_form = QFormLayout(self._credential_box)
+        cred_form.setContentsMargins(0, 0, 0, 0)
+        pw_box = QWidget(self._credential_box)
+        pw_layout = QHBoxLayout(pw_box)
+        pw_layout.setContentsMargins(0, 0, 0, 0)
+        self._admin_password_edit = QLineEdit(pw_box)
+        self._admin_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._admin_password_edit.setPlaceholderText("(stored in keyring — never in the YAML)")
+        self._store_password_button = QPushButton("Store", pw_box)
+        pw_layout.addWidget(self._admin_password_edit, 1)
+        pw_layout.addWidget(self._store_password_button)
+        cred_form.addRow("Admin password:", pw_box)
+        self._credential_status_label = QLabel("", self._credential_box)
+        self._credential_status_label.setStyleSheet("QLabel { color: #888; }")
+        cred_form.addRow("", self._credential_status_label)
+        self._credential_box.setVisible(False)
+        echos_form.addRow(self._credential_box)
+        form.addRow(self._echos_group)
+
         # Internal state for the chain. Stage B reads it back unchanged
         # from `to_config`; M5 will make this list mutable through the
         # (currently disabled) editor button.
@@ -348,6 +468,19 @@ class DeviceForm(QWidget):
         self._response_path_edit.textChanged.connect(self._on_field_changed)
         self._add_row_button.clicked.connect(self._on_add_row)
         self._remove_row_button.clicked.connect(self._on_remove_row)
+        self._use_channels_button.clicked.connect(self._on_use_device_channels)
+        self._echos_group.toggled.connect(self._on_echos_toggled)
+        self._pos_check.toggled.connect(self._on_pos_override_toggled)
+        self._http_port_spin.valueChanged.connect(self._on_field_changed)
+        self._poll_interval_spin.valueChanged.connect(self._on_field_changed)
+        self._host_edit.textChanged.connect(lambda _text: self.connectionTargetChanged.emit())
+        self._http_port_spin.valueChanged.connect(
+            lambda _value: self.connectionTargetChanged.emit()
+        )
+        for spin in (self._lat_spin, self._lon_spin, self._elev_spin):
+            spin.valueChanged.connect(self._on_field_changed)
+        self._store_password_button.clicked.connect(self._on_store_password)
+        self._on_pos_override_toggled(self._pos_check.isChecked())
 
         # Prefill -----------------------------------------------------
         if initial is not None:
@@ -406,7 +539,74 @@ class DeviceForm(QWidget):
             selectors=self._read_selectors(),
             dsp_chain=list(self._chain_stages),
             response_metadata=self._read_response_metadata(),
+            echos=self._read_echos(),
         )
+
+    def _read_echos(self) -> EchosDeviceConfig | None:
+        """Build the client-side ``echos:`` section (rule 15: no secrets)."""
+        if not self._echos_group.isChecked():
+            return None
+        override = None
+        if self._pos_check.isChecked():
+            override = PositionOverride(
+                lat=float(self._lat_spin.value()),
+                lon=float(self._lon_spin.value()),
+                elev_m=float(self._elev_spin.value()),
+            )
+        return EchosDeviceConfig(
+            http_port=int(self._http_port_spin.value()),
+            poll_interval_s=float(self._poll_interval_spin.value()),
+            position_override=override,
+        )
+
+    def echos_enabled(self) -> bool:
+        return self._echos_group.isChecked()
+
+    def echos_target(self) -> EchosPollTarget | None:
+        """Current REST target, or ``None`` when not an Echos device / no host.
+
+        The target ``name`` doubles as the credentials-store key, so the
+        device's CURRENT config name wins over an in-progress rename.
+        """
+        if not self._echos_group.isChecked():
+            return None
+        host = self._host_edit.text().strip()
+        if not host:
+            return None
+        name = self._editing_name or self._name_edit.text().strip() or host
+        return EchosPollTarget(
+            name=name,
+            host=host,
+            http_port=int(self._http_port_spin.value()),
+            poll_interval_s=float(self._poll_interval_spin.value()),
+        )
+
+    def set_device_channels(self, channels: tuple[str, ...]) -> None:
+        """Enable selector derivation from the device's StationXML NSLCs."""
+        self._device_channels = channels
+        self._use_channels_button.setEnabled(bool(channels))
+        if channels:
+            self._use_channels_button.setText(f"Use device channels ({len(channels)})")
+
+    def set_credential_status(self, text: str) -> None:
+        self._credential_status_label.setText(text)
+
+    def enable_credential_store(self) -> None:
+        """Show the admin-password row.
+
+        Called by hosts that actually wire ``credentialStoreRequested``
+        to a sink (the DeviceDialog's worker). Embedders that don't
+        (the first-run wizard) keep the row hidden so the Store button
+        can never silently drop a password.
+        """
+        self._credential_box.setVisible(True)
+
+    def clear_password_field(self) -> None:
+        self._admin_password_edit.clear()
+
+    def set_seedlink_port(self, port: int) -> None:
+        """Sync the client-side SeedLink port after a server-side change."""
+        self._port_spin.setValue(int(port))
 
     def _read_response_metadata(self) -> ResponseMetadataConfig:
         """Build the response-metadata config from the path + format fields.
@@ -475,6 +675,17 @@ class DeviceForm(QWidget):
                 # so the user can see / change it. Validation later
                 # will accept the empty list since the schema does.
                 self._append_selector_row(*_DEFAULT_SELECTOR_CELLS)
+            # Echos client-side section (M1-D).
+            if cfg.echos is not None:
+                self._echos_group.setChecked(True)
+                self._http_port_spin.setValue(int(cfg.echos.http_port))
+                self._poll_interval_spin.setValue(float(cfg.echos.poll_interval_s))
+                override = cfg.echos.position_override
+                if override is not None:
+                    self._pos_check.setChecked(True)
+                    self._lat_spin.setValue(float(override.lat))
+                    self._lon_spin.setValue(float(override.lon))
+                    self._elev_spin.setValue(float(override.elev_m))
         finally:
             self._name_edit.blockSignals(False)
             self._host_edit.blockSignals(False)
@@ -527,6 +738,43 @@ class DeviceForm(QWidget):
         if path:
             self._response_path_edit.setText(path)
             self._revalidate()
+
+    @Slot(bool)
+    def _on_echos_toggled(self, checked: bool) -> None:
+        self.echosEnabledChanged.emit(checked)
+        self._revalidate()
+
+    @Slot(bool)
+    def _on_pos_override_toggled(self, checked: bool) -> None:
+        for spin in (self._lat_spin, self._lon_spin, self._elev_spin):
+            spin.setEnabled(checked)
+        self._revalidate()
+
+    @Slot()
+    def _on_use_device_channels(self) -> None:
+        """Replace the selector rows with the device's exact NSLCs."""
+        if not self._device_channels:
+            return
+        self._selector_tree.clear()
+        for nslc in self._device_channels:
+            parts = nslc.split(".")
+            if len(parts) != 4:
+                continue
+            self._append_selector_row(*parts)
+        self._revalidate()
+
+    @Slot()
+    def _on_store_password(self) -> None:
+        password = self._admin_password_edit.text()
+        name = self._editing_name or self._name_edit.text().strip()
+        if not name:
+            self.set_credential_status("Set a device name before storing the password.")
+            return
+        if not password:
+            self.set_credential_status("Enter the device's admin password first.")
+            return
+        self.credentialStoreRequested.emit(name, password)
+        self.set_credential_status("Storing…")
 
     @Slot()
     def _on_add_row(self) -> None:
@@ -766,7 +1014,27 @@ class DeviceDialog(QDialog):
     dialog calls the matching ConfigStore mutation, catches
     :class:`ConfigError`, surfaces it via ``QMessageBox.critical``,
     and KEEPS the dialog open so the user can correct the issue.
+
+    M1-D adds the tabbed Echos surface: tab 0 ("Connection") is the
+    client-side :class:`DeviceForm` saved through OK as before; tabs
+    1-4 (Acquisition / SeedLink server / Network / Maintenance) edit
+    the DEVICE's own config through an :class:`EchosDeviceWorker` on a
+    per-dialog QThread, applied immediately per tab (read-modify-write
+    with confirmation, rule 15) — independent of OK/Cancel. A 429
+    lockout disables every server write with a countdown banner.
     """
+
+    # Worker request signals — emitted on the GUI thread, delivered to
+    # the per-dialog EchosDeviceWorker via QueuedConnection.
+    _loadRequested = Signal(object)  # noqa: N815
+    _acqApplyRequested = Signal(object, object)  # noqa: N815
+    _slApplyRequested = Signal(object, object)  # noqa: N815
+    _netApplyRequested = Signal(object, object, str)  # noqa: N815
+    _calStartRequested = Signal(object)  # noqa: N815
+    _calPollRequested = Signal(object)  # noqa: N815
+    _pwChangeRequested = Signal(object, str)  # noqa: N815
+    _credStoreRequested = Signal(str, str)  # noqa: N815
+    _rebootRequested = Signal(object)  # noqa: N815
 
     def __init__(
         self,
@@ -776,6 +1044,9 @@ class DeviceDialog(QDialog):
         form: DeviceForm,
         on_accept: Callable[[DeviceConfig], None],
         parent: QWidget | None = None,
+        credentials: CredentialsStore | None = None,
+        client_factory: Callable[[EchosPollTarget, str | None], EchosApiClient] | None = None,
+        restart_poll_interval_s: float = 0.5,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -783,9 +1054,44 @@ class DeviceDialog(QDialog):
         self._store = store
         self._form = form
         self._on_accept = on_accept
+        self._credentials = credentials if credentials is not None else CredentialsStore()
+        self._client_factory = client_factory
+        self._restart_poll_interval_s = restart_poll_interval_s
+        self._worker: EchosDeviceWorker | None = None
+        self._worker_thread: QThread | None = None
+        # Teardown latch: once done() ran, late queued worker results
+        # (e.g. a calibrationStatus posted before teardown) must never
+        # resurrect a worker thread on a closed dialog (audit finding).
+        self._torn_down = False
+        self._state_loaded = False
+        self._lockout_until = 0.0
 
         layout = QVBoxLayout(self)
-        layout.addWidget(form)
+        self._tabs = QTabWidget(self)
+        self._tabs.addTab(form, "Connection")
+        self._acq_tab = AcquisitionTab(self)
+        self._sl_tab = SeedlinkTab(self)
+        self._net_tab = NetworkTab(self)
+        self._maint_tab = MaintenanceTab(self)
+        self._server_tabs: tuple[AcquisitionTab | SeedlinkTab | NetworkTab | MaintenanceTab, ...]
+        self._server_tabs = (self._acq_tab, self._sl_tab, self._net_tab, self._maint_tab)
+        for tab, label in zip(
+            self._server_tabs,
+            ("Acquisition", "SeedLink server", "Network", "Maintenance"),
+            strict=True,
+        ):
+            self._tabs.addTab(tab, label)
+        layout.addWidget(self._tabs)
+
+        # rule 15: surface a device lockout honestly across every tab.
+        self._lockout_label = QLabel("", self)
+        self._lockout_label.setWordWrap(True)
+        self._lockout_label.setStyleSheet(_LOCKOUT_BANNER_STYLE)
+        self._lockout_label.setVisible(False)
+        layout.addWidget(self._lockout_label)
+        self._lockout_timer = QTimer(self)
+        self._lockout_timer.setInterval(1000)
+        self._lockout_timer.timeout.connect(self._tick_lockout)
 
         # Standard OK/Cancel button row.
         self._buttons = QDialogButtonBox(
@@ -800,6 +1106,40 @@ class DeviceDialog(QDialog):
         form.isValid.connect(self._on_form_validity)
         self._on_form_validity(form.is_valid())
 
+        # Echos wiring: tabs ↔ worker routing (all worker traffic goes
+        # through _emit_to_worker so the thread spins up lazily).
+        form.echosEnabledChanged.connect(self._update_server_tabs_enabled)
+        form.credentialStoreRequested.connect(self._on_store_credential)
+        form.connectionTargetChanged.connect(self._invalidate_device_state)
+        # This dialog wires the credential sink, so the password row is live.
+        form.enable_credential_store()
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        for tab in self._server_tabs:
+            tab.reloadRequested.connect(self._request_load)
+        self._acq_tab.applyRequested.connect(
+            lambda cfg: self._emit_to_worker(self._acqApplyRequested, cfg)
+        )
+        self._sl_tab.applyRequested.connect(
+            lambda cfg: self._emit_to_worker(self._slApplyRequested, cfg)
+        )
+        self._sl_tab.portChanged.connect(self._on_server_port_changed)
+        self._net_tab.applyRequested.connect(
+            lambda cfg, pw: self._emit_to_worker(self._netApplyRequested, cfg, pw)
+        )
+        self._maint_tab.calibrateRequested.connect(
+            lambda: self._emit_to_worker(self._calStartRequested)
+        )
+        self._maint_tab.calibrationPollRequested.connect(
+            lambda: self._emit_to_worker(self._calPollRequested)
+        )
+        self._maint_tab.passwordChangeRequested.connect(
+            lambda pw: self._emit_to_worker(self._pwChangeRequested, pw)
+        )
+        self._maint_tab.rebootRequested.connect(
+            lambda: self._emit_to_worker(self._rebootRequested)
+        )
+        self._update_server_tabs_enabled(form.echos_enabled())
+
     # ------------------------------------------------------------------
     # Factory class methods
     # ------------------------------------------------------------------
@@ -811,6 +1151,7 @@ class DeviceDialog(QDialog):
         *,
         prefill: DeviceConfig | None = None,
         engine: StreamingEngine | None = None,
+        credentials: CredentialsStore | None = None,
     ) -> int:
         """Run the modal "Add device" dialog. Returns the dialog code.
 
@@ -843,6 +1184,7 @@ class DeviceDialog(QDialog):
             form=form,
             on_accept=store.add_device,
             parent=parent,
+            credentials=credentials,
         )
         return dialog.exec()
 
@@ -854,6 +1196,7 @@ class DeviceDialog(QDialog):
         device_name: str,
         *,
         engine: StreamingEngine | None = None,
+        credentials: CredentialsStore | None = None,
     ) -> int:
         """Run the modal "Edit device" dialog for an existing device.
 
@@ -893,8 +1236,209 @@ class DeviceDialog(QDialog):
             form=form,
             on_accept=lambda cfg: store.update_device(device_name, cfg),
             parent=parent,
+            credentials=credentials,
         )
         return dialog.exec()
+
+    # ------------------------------------------------------------------
+    # Echos worker plumbing (M1-D)
+    # ------------------------------------------------------------------
+    def _ensure_worker(self) -> EchosDeviceWorker | None:
+        """Lazily spin up the per-dialog REST worker thread.
+
+        Lazy because generic SeedLink devices never need it. All eight
+        request signals and all result signals are wired QueuedConnection
+        (cross-thread both ways); teardown happens in :meth:`done`.
+        Returns ``None`` after teardown — a late queued event must never
+        resurrect a thread on a closed dialog.
+        """
+        if self._torn_down:
+            return None
+        if self._worker is not None:
+            return self._worker
+        self._worker_thread = QThread(self)
+        self._worker_thread.setObjectName("echos-device-dialog")
+        self._worker = EchosDeviceWorker(
+            self._credentials,
+            client_factory=self._client_factory,
+            restart_poll_interval_s=self._restart_poll_interval_s,
+        )
+        self._worker.moveToThread(self._worker_thread)
+        queued = Qt.ConnectionType.QueuedConnection
+        self._loadRequested.connect(self._worker.requestLoad, type=queued)
+        self._acqApplyRequested.connect(self._worker.applyAcquisition, type=queued)
+        self._slApplyRequested.connect(self._worker.applySeedlink, type=queued)
+        self._netApplyRequested.connect(self._worker.applyNetwork, type=queued)
+        self._calStartRequested.connect(self._worker.startCalibration, type=queued)
+        self._calPollRequested.connect(self._worker.pollCalibration, type=queued)
+        self._pwChangeRequested.connect(self._worker.changePassword, type=queued)
+        self._credStoreRequested.connect(self._worker.storeCredential, type=queued)
+        self._rebootRequested.connect(self._worker.requestReboot, type=queued)
+        self._worker.loaded.connect(self._on_loaded, type=queued)
+        self._worker.applied.connect(self._on_applied, type=queued)
+        self._worker.restartProgress.connect(self._sl_tab.on_restart_progress, type=queued)
+        self._worker.seedlinkApplied.connect(self._sl_tab.on_seedlink_applied, type=queued)
+        self._worker.calibrationStatus.connect(
+            self._maint_tab.on_calibration_status, type=queued
+        )
+        self._worker.credentialStored.connect(self._on_credential_stored, type=queued)
+        self._worker.passwordChanged.connect(self._maint_tab.on_password_changed, type=queued)
+        self._worker.failed.connect(self._on_worker_failed, type=queued)
+        self._worker_thread.start()
+        return self._worker
+
+    def _emit_to_worker(self, signal: SignalInstance, *args: object) -> None:
+        """Attach the current target and route one request to the worker."""
+        target = self._form.echos_target()
+        if target is None or self._ensure_worker() is None:
+            return
+        signal.emit(target, *args)
+
+    @Slot()
+    def _request_load(self) -> None:
+        target = self._form.echos_target()
+        if target is None or self._ensure_worker() is None:
+            return
+        self._loadRequested.emit(target)
+
+    @Slot()
+    def _invalidate_device_state(self) -> None:
+        """Host/HTTP-port changed: drop every server-side baseline.
+
+        The loaded configs belong to the previous endpoint; applying
+        them to a new host would write another device's settings.
+        """
+        if not self._state_loaded:
+            return
+        self._state_loaded = False
+        for tab in self._server_tabs:
+            tab.reset_loaded()
+        self._form.set_device_channels(())
+
+    @Slot(int)
+    def _on_tab_changed(self, index: int) -> None:
+        # First visit to any server tab triggers the initial device load.
+        if index != _TAB_CONNECTION and not self._state_loaded:
+            self._request_load()
+
+    @Slot(bool)
+    def _update_server_tabs_enabled(self, enabled: bool) -> None:
+        for offset in range(len(self._server_tabs)):
+            self._tabs.setTabEnabled(_TAB_CONNECTION + 1 + offset, enabled)
+
+    @Slot(str, str)
+    def _on_store_credential(self, device_key: str, password: str) -> None:
+        if self._ensure_worker() is None:
+            return
+        self._credStoreRequested.emit(device_key, password)
+
+    @Slot(object)
+    def _on_loaded(self, state: object) -> None:
+        if not isinstance(state, EchosDeviceState):
+            return
+        self._state_loaded = True
+        for tab in self._server_tabs:
+            tab.apply_state(state)
+        self._form.set_device_channels(state.channels)
+        self._form.set_credential_status(
+            "An admin password is stored for this device."
+            if state.has_credentials
+            else "No admin password stored — server writes will fail until one is set."
+        )
+
+    @Slot(str)
+    def _on_applied(self, op: str) -> None:
+        if op == "acquisition":
+            self._acq_tab.on_applied()
+        elif op == "network":
+            self._net_tab.on_applied()
+        elif op == "calibrate_start":
+            self._maint_tab.on_calibration_started()
+        elif op == "reboot":
+            self._maint_tab.on_reboot_requested()
+
+    @Slot(str)
+    def _on_credential_stored(self, device_key: str) -> None:
+        self._form.clear_password_field()
+        self._form.set_credential_status(f"Password stored for {device_key!r}.")
+
+    @Slot(int)
+    def _on_server_port_changed(self, port: int) -> None:
+        # Skill: a SeedLink port change must reach the client config so
+        # the worker reconnects on the right endpoint — sync the
+        # Connection tab; OK saves it through the normal store path.
+        self._form.set_seedlink_port(port)
+
+    @Slot(str, str, str, float)
+    def _on_worker_failed(self, op: str, kind: str, message: str, retry_after_s: float) -> None:
+        if self._torn_down:
+            return  # late queued delivery on a closed dialog
+        if kind == "locked_out":
+            self._enter_lockout(retry_after_s)
+        owner: dict[str, tuple[AcquisitionTab | SeedlinkTab | NetworkTab | MaintenanceTab, ...]]
+        owner = {
+            "acquisition": (self._acq_tab,),
+            "seedlink": (self._sl_tab,),
+            "network": (self._net_tab,),
+            "calibrate_start": (self._maint_tab,),
+            "calibrate_poll": (self._maint_tab,),
+            "password": (self._maint_tab,),
+            "reboot": (self._maint_tab,),
+            "load": self._server_tabs,
+        }
+        for tab in owner.get(op, ()):
+            tab.on_failed(op, kind, message)
+
+    def _enter_lockout(self, retry_after_s: float) -> None:
+        self._lockout_until = time.monotonic() + max(1.0, retry_after_s)
+        for tab in self._server_tabs:
+            tab.set_write_enabled(False, reason="Device auth lockout active.")
+        self._lockout_timer.start()
+        self._tick_lockout()
+
+    @Slot()
+    def _tick_lockout(self) -> None:
+        remaining = self._lockout_until - time.monotonic()
+        if remaining > 0:
+            self._lockout_label.setText(
+                f"Device auth lockout active — too many failed logins. Server writes "
+                f"re-enable in {remaining:.0f} s (the app will not retry before then)."
+            )
+            self._lockout_label.setVisible(True)
+            return
+        self._lockout_timer.stop()
+        self._lockout_label.setVisible(False)
+        for tab in self._server_tabs:
+            tab.set_write_enabled(True)
+
+    def _teardown_worker(self) -> None:
+        """Stop the REST worker before the dialog dies (bounded, rule 7).
+
+        Idempotent. References are dropped only AFTER a successful join:
+        deleting a worker whose thread is still inside a slot (e.g. a
+        keyring D-Bus call the task-cancel cannot interrupt) would be a
+        use-after-free — on timeout we warn and deliberately leak, the
+        same policy MainWindow applies to its worker threads.
+        """
+        self._torn_down = True
+        self._maint_tab.stop_polling()
+        self._lockout_timer.stop()
+        worker, thread = self._worker, self._worker_thread
+        if worker is None or thread is None:
+            return
+        worker.stop()
+        thread.quit()
+        if not thread.wait(_ECHOS_WORKER_JOIN_MS):
+            _log.warning("echos_device_worker_join_timeout")
+            return
+        self._worker = None
+        self._worker_thread = None
+
+    def done(self, result: int) -> None:
+        # Single teardown point: accept(), reject() and window-close all
+        # funnel through QDialog.done().
+        self._teardown_worker()
+        super().done(result)
 
     # ------------------------------------------------------------------
     # Slots

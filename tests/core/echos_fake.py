@@ -66,13 +66,40 @@ _SEEDLINK_KEYS = frozenset(
     }
 )
 
+# Minimal-but-valid FDSN StationXML 1.2: 3 velocimeter channels, the
+# shape the firmware's /api/stationxml serves. Parsed by obspy in
+# core/echos_device_worker._parse_channels for selector derivation.
 _STATIONXML = """<?xml version="1.0" encoding="UTF-8"?>
 <FDSNStationXML xmlns="http://www.fdsn.org/xml/station/1" schemaVersion="1.2">
+  <Source>Echos firmware_seedlink</Source>
+  <Created>2026-01-01T00:00:00Z</Created>
   <Network code="XX">
     <Station code="ECH01">
       <Latitude>45.4</Latitude>
       <Longitude>11.9</Longitude>
       <Elevation>20.0</Elevation>
+      <Site><Name>Echos field node</Name></Site>
+      <Channel code="HHZ" locationCode="">
+        <Latitude>45.4</Latitude>
+        <Longitude>11.9</Longitude>
+        <Elevation>20.0</Elevation>
+        <Depth>0.0</Depth>
+        <SampleRate>500.0</SampleRate>
+      </Channel>
+      <Channel code="HHN" locationCode="">
+        <Latitude>45.4</Latitude>
+        <Longitude>11.9</Longitude>
+        <Elevation>20.0</Elevation>
+        <Depth>0.0</Depth>
+        <SampleRate>500.0</SampleRate>
+      </Channel>
+      <Channel code="HHE" locationCode="">
+        <Latitude>45.4</Latitude>
+        <Longitude>11.9</Longitude>
+        <Elevation>20.0</Elevation>
+        <Depth>0.0</Depth>
+        <SampleRate>500.0</SampleRate>
+      </Channel>
     </Station>
   </Network>
 </FDSNStationXML>
