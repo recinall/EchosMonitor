@@ -145,6 +145,14 @@ class HvsrWidget(QWidget):
         # range: (device, group, t_start, t_end, settings) -> measurement_id
         # ("" if the range holds no gap-free 3C window).
         self._archive_handler: ArchiveHandler | None = None
+        # The last Archive-tab hand-off (device, station_key, group): merged
+        # into the live groups so the handed-off station is selectable even
+        # when the device has no live buffers — a CLOSED session with the
+        # engine idle (rule 13) exists only in the archive (M3-E). Archive-
+        # only entries are tagged in the combos and can never start a LIVE
+        # measurement (no buffers → it would wait forever).
+        self._handoff_group: tuple[str, str, dict[str, str]] | None = None
+        self._live_groups: dict[str, dict[str, dict[str, str]]] = {}
 
         self._build_ui()
         self._wire()
@@ -448,12 +456,17 @@ class HvsrWidget(QWidget):
 
     @Slot()
     def _refresh_devices(self) -> None:
-        self._groups = three_component_groups(self._engine)
+        self._live_groups = three_component_groups(self._engine)
+        self._groups = {dev: dict(stations) for dev, stations in self._live_groups.items()}
+        if self._handoff_group is not None:
+            device, station, group = self._handoff_group
+            self._groups.setdefault(device, {}).setdefault(station, dict(group))
         prior = self._device_combo.currentData()
         self._device_combo.blockSignals(True)
         self._device_combo.clear()
         for device in sorted(self._groups):
-            self._device_combo.addItem(device, device)
+            label = device if device in self._live_groups else f"{device} (archive)"
+            self._device_combo.addItem(label, device)
         if isinstance(prior, str):
             idx = self._device_combo.findData(prior)
             if idx >= 0:
@@ -467,8 +480,10 @@ class HvsrWidget(QWidget):
         self._station_combo.blockSignals(True)
         self._station_combo.clear()
         if isinstance(device, str):
+            live_stations = self._live_groups.get(device, {})
             for station in sorted(self._groups.get(device, {})):
-                self._station_combo.addItem(station, station)
+                label = station if station in live_stations else f"{station} (archive)"
+                self._station_combo.addItem(label, station)
         if isinstance(prior, str):
             idx = self._station_combo.findData(prior)
             if idx >= 0:
@@ -493,15 +508,33 @@ class HvsrWidget(QWidget):
                 "  ".join(f"{c}={group[c].split('.')[-1]}" for c in ("Z", "N", "E"))
             )
 
+    def _selected_group_is_live(self) -> bool:
+        """Whether the selected station has LIVE ring buffers.
+
+        An archive-only (hand-off-merged) station can run "Run on archive"
+        but never a live measurement: with no buffers the engine would wait
+        for windows that can never arrive.
+        """
+        device = self._device_combo.currentData()
+        station = self._station_combo.currentData()
+        if not isinstance(device, str) or not isinstance(station, str):
+            return False
+        return station in self._live_groups.get(device, {})
+
     def _update_start_enabled(self) -> None:
         if self._measurement_id is not None:
             self._start_button.setEnabled(True)  # always allow Stop
             return
-        ok = self.selected_group() is not None
-        self._start_button.setEnabled(ok)
-        if not ok:
+        group = self.selected_group()
+        live = self._selected_group_is_live()
+        self._start_button.setEnabled(group is not None and live)
+        if group is None:
             self._start_button.setToolTip(
                 "Select a device + station with 3 components (Z + 2 horizontals)."
+            )
+        elif not live:
+            self._start_button.setToolTip(
+                "Archive-only station (no live data) — use Run on archive."
             )
         else:
             self._start_button.setToolTip("")
@@ -523,7 +556,7 @@ class HvsrWidget(QWidget):
             return
         group = self.selected_group()
         device = self._device_combo.currentData()
-        if group is None or not isinstance(device, str):
+        if group is None or not isinstance(device, str) or not self._selected_group_is_live():
             return
         self._clear_plots()
         self._active_group = dict(group)
@@ -554,11 +587,20 @@ class HvsrWidget(QWidget):
         clicks "Run on archive". The interval round-trips exactly: the fields
         are set as UTC wall-clock, the same convention ``_on_archive_clicked``
         reads back.
+
+        The handed-off station may exist only in the browsed archive (a
+        CLOSED session with the engine idle has no live buffers — rule 13):
+        the group is remembered and merged into the combos by
+        ``_refresh_devices``, with live entries winning, so it stays
+        selectable across later live-device refreshes (M3-E).
         """
+        z_nslc = group.get("Z")
+        if z_nslc is not None:
+            self._handoff_group = (device, _station_key(z_nslc), dict(group))
+        self._refresh_devices()  # merge the hand-off into the combos
         idx = self._device_combo.findData(device)
         if idx >= 0:
             self._device_combo.setCurrentIndex(idx)  # cascades _refresh_stations
-        z_nslc = group.get("Z")
         if z_nslc is not None:
             sidx = self._station_combo.findData(_station_key(z_nslc))
             if sidx >= 0:

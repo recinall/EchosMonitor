@@ -465,8 +465,33 @@ at `storage/sds.py:130–168` has zero callers).
         leaves no artifact and restarts, mixed-rate CSV refusal).
 - [ ] **D. Re-indexer**: rebuild the DB from the SDS tree
       (`parse_sds_path` exists) for archives copied from another machine.
-- [ ] **E. Hand-offs**: Archive → HVSR keeps working with the session-rooted
+- [x] **E. Hand-offs**: Archive → HVSR keeps working with the session-rooted
       reader.
+      *Done 2026-06-11.* The seam itself landed in M3-A
+      (`test_hvsr_handoff_carries_session_root` pins root selection keyed
+      on device AND interval ±1 s, fallback on any re-target; the slice
+      read stays the documented one-shot INLINE read on the calling
+      thread — verified, unchanged). Closing the box:
+  - [x] end-to-end acceptance `test_closed_session_hvsr_end_to_end`
+        (tests/gui/test_archive_hvsr_e2e.py): browse a CLOSED session →
+        hand off → click "Run on archive" → a REAL
+        `HvsrEngine.start_archive_measurement` (no monkeypatch) recovers
+        the injected f0 from the session-rooted archive with the engine
+        fully idle throughout (rule 13).
+  - [x] gap found+fixed by that test: with the engine idle the HVSR
+        widget's combos (populated from LIVE buffers) were empty, so the
+        prefill could not select the handed-off station and "Run on
+        archive" silently no-opped. `prefill_archive` now remembers the
+        handed-off group and `_refresh_devices` merges it into the live
+        groups (live entries win), so an archive-only station stays
+        selectable across later live refreshes.
+  - [x] code-reviewer findings on that fix, both regression-tested: an
+        archive-only (merged) station must never enable a LIVE start —
+        no buffers means the measurement would wait forever with no
+        diagnostic — so Start is gated on live-buffer membership with an
+        honest tooltip; and the merged entry is tagged "(archive)" in
+        both combos so the persistent hand-off row is distinguishable
+        from genuinely live devices.
 
 ## M4 — Map tab
 

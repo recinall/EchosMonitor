@@ -147,6 +147,58 @@ def test_hvsr_prefill_sets_fields_without_running(qtbot) -> None:
 
 
 # --------------------------------------------------------------------------
+# 2b. Archive-only stations (engine idle — the M3-E closed-session case):
+#     selectable for "Run on archive", tagged honestly, NEVER live-startable.
+# --------------------------------------------------------------------------
+def test_handoff_archive_only_station_cannot_start_live(qtbot) -> None:
+    """Review finding (M3-E): a hand-off-merged station with NO live buffers
+    must not enable a LIVE start — with no buffers the engine would wait for
+    windows that can never arrive, silently and forever. The archive run
+    stays available and the combos tag the entry as archive-only."""
+    engine = _FakeEngine()  # no live buffers at all (engine idle, rule 13)
+    hv = _FakeHvsrEngine()
+    widget = HvsrWidget(engine, hv)  # type: ignore[arg-type]
+    qtbot.addWidget(widget)
+
+    widget.prefill_archive("dev", _GROUP, _T0, _T1)
+
+    assert widget._device_combo.currentData() == "dev"
+    assert widget.selected_group() is not None  # the archive run resolves it
+    assert "(archive)" in widget._device_combo.currentText()
+    assert "(archive)" in widget._station_combo.currentText()
+    assert not widget.start_enabled()
+    assert "archive" in widget._start_button.toolTip().lower()
+    # The live path is guarded even when invoked directly.
+    widget._on_start_clicked()
+    assert hv.start_calls == []
+    # ...while "Run on archive" still dispatches to the handler.
+    calls: list[tuple] = []
+    widget.set_archive_request_handler(
+        lambda *a: (calls.append(a), "m-1")[1]  # type: ignore[arg-type,return-value]
+    )
+    widget._archive_button.click()
+    assert len(calls) == 1
+
+
+def test_handoff_station_with_live_buffers_keeps_live_start(qtbot) -> None:
+    """A hand-off for a station that IS live merges nothing: live entries
+    win, no archive tag, live start stays enabled."""
+    engine = _FakeEngine()
+    engine.add_3c("dev")
+    hv = _FakeHvsrEngine()
+    widget = HvsrWidget(engine, hv)  # type: ignore[arg-type]
+    qtbot.addWidget(widget)
+    engine.devicesChanged.emit()
+
+    widget.prefill_archive("dev", _GROUP, _T0, _T1)
+
+    assert widget._device_combo.currentData() == "dev"
+    assert "(archive)" not in widget._device_combo.currentText()
+    assert "(archive)" not in widget._station_combo.currentText()
+    assert widget.start_enabled()
+
+
+# --------------------------------------------------------------------------
 # 3. The main-window router switches tabs + calls the existing entry point
 #    with the exact selection.
 # --------------------------------------------------------------------------
