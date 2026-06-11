@@ -83,7 +83,7 @@ def archive_engine(
     )
     engine = StreamingEngine(cfg)
     # M2-A: archive writers exist only in the RECORDING state (rule 13).
-    engine.start_recording("fake")
+    engine.start_session("e2e", ["fake"])
     try:
         yield engine, archive_root
     finally:
@@ -97,7 +97,7 @@ def archive_engine(
 
 def test_session_row_created_on_start(qtbot, archive_engine: tuple[StreamingEngine, Path]) -> None:
     _engine, archive_root = archive_engine
-    db_path = archive_root / "archive.db"
+    db_path = archive_root / "e2e" / "archive.db"
 
     # Wait briefly for the DB to be opened (lazy on first archive-enabled
     # device's start).
@@ -149,11 +149,11 @@ def test_session_row_finalized_on_stop(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start_recording("fake")
+    engine.start_session("e2e", ["fake"])
     qtbot.wait(500)
     engine.stop()
 
-    db_path = archive_root / "archive.db"
+    db_path = archive_root / "e2e" / "archive.db"
     conn = connect(db_path)
     try:
         row = conn.execute("SELECT ended_at FROM sessions").fetchone()
@@ -172,7 +172,7 @@ def test_device_stream_file_rows_appear_after_first_fsync(
     qtbot, archive_engine: tuple[StreamingEngine, Path]
 ) -> None:
     _engine, archive_root = archive_engine
-    db_path = archive_root / "archive.db"
+    db_path = archive_root / "e2e" / "archive.db"
 
     def _has_file_row() -> bool:
         if not db_path.exists():
@@ -228,7 +228,7 @@ def test_total_bytes_matches_file_size_on_disk(
 ) -> None:
     """``streams.total_bytes`` must agree with the on-disk file size."""
     _engine, archive_root = archive_engine
-    db_path = archive_root / "archive.db"
+    db_path = archive_root / "e2e" / "archive.db"
 
     def _stream_has_bytes() -> bool:
         if not db_path.exists():
@@ -303,11 +303,11 @@ def test_restart_resumption_reuses_existing_db(
 
     # First session.
     engine1 = _build_engine()
-    engine1.start_recording("fake")
+    engine1.start_session("e2e", ["fake"])
     qtbot.wait(1500)  # let some packets land
     engine1.stop()
 
-    db_path = archive_root / "archive.db"
+    db_path = archive_root / "e2e" / "archive.db"
     assert db_path.exists()
     conn = connect(db_path)
     try:
@@ -322,7 +322,7 @@ def test_restart_resumption_reuses_existing_db(
 
     # Second session — same archive root, same device, same NSLC.
     engine2 = _build_engine()
-    engine2.start_recording("fake")
+    engine2.start_session("e2e", ["fake"])
     qtbot.wait(1500)
     engine2.stop()
 
@@ -393,12 +393,11 @@ def test_two_devices_share_db_without_constraint_violation(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start_recording("fake-a")
-    engine.start_recording("fake-b")
+    engine.start_session("e2e", ["fake-a", "fake-b"])
     qtbot.wait(2000)
     engine.stop()
 
-    db_path = archive_root / "archive.db"
+    db_path = archive_root / "e2e" / "archive.db"
     conn = connect(db_path)
     try:
         # Two devices, two streams, > 0 files. No IntegrityError seen.

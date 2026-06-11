@@ -28,7 +28,7 @@ from pathlib import Path
 
 import structlog
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Connection-level PRAGMAs. ``WAL`` lets readers and writers proceed
 # without blocking each other. ``synchronous=NORMAL`` is the standard
@@ -55,7 +55,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at     TEXT,
     host         TEXT NOT NULL,
     version      TEXT NOT NULL,
-    config_hash  TEXT NOT NULL
+    config_hash  TEXT NOT NULL,
+    -- v4 (M2-B, rule 14): the user-chosen RAW project name (the
+    -- sanitized form is the directory this DB sits in; the raw name
+    -- survives only here). NULL = sessionless monitoring index
+    -- (detection-only DB at the base archive root).
+    project_name TEXT,
+    -- v4 (M2-C crash recovery): 1 when the session was found still
+    -- open on a later launch and closed administratively rather than
+    -- by the user. ended_at then records the close time, not the
+    -- real end of recording.
+    closed_dirty INTEGER NOT NULL DEFAULT 0
+);
+
+-- v4 (M2-B): which devices recorded into a session. Membership only
+-- grows (a device stopped mid-session stays a member — its files are
+-- part of the session's archive).
+CREATE TABLE IF NOT EXISTS session_devices (
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    device_name TEXT NOT NULL,
+    UNIQUE(session_id, device_name)
 );
 
 CREATE TABLE IF NOT EXISTS devices (
@@ -106,6 +125,23 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS idx_streams_device ON streams(device_id);
 CREATE INDEX IF NOT EXISTS idx_gaps_stream    ON gaps(stream_id);
 CREATE INDEX IF NOT EXISTS idx_files_stream   ON files(stream_id);
+CREATE INDEX IF NOT EXISTS idx_session_devices_session
+    ON session_devices(session_id);
+"""
+
+# v3 → v4 (M2-B, rule 14): sessions gain project_name + closed_dirty;
+# the session_devices membership table appears. The DDL is shared by
+# the migration step; the ALTERs are guarded by a column-existence
+# check (SQLite has no ADD COLUMN IF NOT EXISTS) so an interrupted
+# upgrade re-runs cleanly, matching the ladder's idempotency contract.
+_SESSION_DEVICES_DDL = """
+CREATE TABLE IF NOT EXISTS session_devices (
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    device_name TEXT NOT NULL,
+    UNIQUE(session_id, device_name)
+);
+CREATE INDEX IF NOT EXISTS idx_session_devices_session
+    ON session_devices(session_id);
 """
 
 # Detection rows (schema v2). A ``detections`` row is the persisted,
@@ -183,6 +219,24 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    decl: str,
+) -> None:
+    """``ALTER TABLE ... ADD COLUMN`` guarded by ``pragma table_info``.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``; this keeps migration
+    steps idempotent so an interrupted upgrade re-runs cleanly (the
+    ladder's documented contract). ``table``/``column``/``decl`` come
+    from migration code, never user input — no quoting concerns.
+    """
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
     """Apply schema migrations from ``from_version`` up to ``SCHEMA_VERSION``.
 
@@ -206,6 +260,11 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
     persist-on-detection feature (rule 12). Now a no-op stub — only the
     version bump remains, so v2 databases still step to v3 and the
     ladder stays linear.
+
+    v3 → v4 (M2-B, rule 14): ``sessions`` gains ``project_name`` (raw
+    user-chosen name; NULL for the sessionless monitoring index) and
+    ``closed_dirty`` (crash-recovery flag); ``session_devices`` records
+    which devices recorded into each session.
     """
     if from_version == SCHEMA_VERSION:
         return
@@ -215,6 +274,13 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
         version = 2
     if version == 2:
         version = 3
+    if version == 3:
+        _add_column_if_missing(conn, "sessions", "project_name", "TEXT")
+        _add_column_if_missing(
+            conn, "sessions", "closed_dirty", "INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.executescript(_SESSION_DEVICES_DDL)
+        version = 4
     if version != SCHEMA_VERSION:
         # Unknown / future version we don't know how to migrate. Leave
         # the DB untouched and surface it loudly rather than silently

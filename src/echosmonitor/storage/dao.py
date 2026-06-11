@@ -38,11 +38,11 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import structlog
 from obspy import UTCDateTime
 
-from echosmonitor.core.models import Detection
+from echosmonitor.core.models import Detection, SessionRecord
 from echosmonitor.storage.db import connect
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 _T = TypeVar("_T")
@@ -173,15 +173,38 @@ class ArchiveDao:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def start_session(self, host: str, version: str, config_hash: str) -> int:
-        """Insert a session row and commit immediately. Returns the new id."""
+    def start_session(
+        self,
+        host: str,
+        version: str,
+        config_hash: str,
+        project_name: str | None = None,
+        devices: Sequence[str] = (),
+    ) -> int:
+        """Insert a session row and commit immediately. Returns the new id.
+
+        ``project_name`` is the RAW user-chosen name (rule 14 — the
+        sanitized form is the directory this DB lives in; the raw name
+        survives only here). ``None`` marks the sessionless monitoring
+        index. ``devices`` seeds the membership table; later joiners go
+        through :meth:`add_session_device`.
+        """
 
         def _insert(cur: sqlite3.Cursor) -> int | None:
             cur.execute(
-                "INSERT INTO sessions(started_at, host, version, config_hash) VALUES (?, ?, ?, ?)",
-                (_now_iso(), host, version, config_hash),
+                "INSERT INTO sessions(started_at, host, version, config_hash,"
+                "                     project_name)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (_now_iso(), host, version, config_hash, project_name),
             )
-            return cur.lastrowid
+            session_id = cur.lastrowid
+            for device_name in devices:
+                cur.execute(
+                    "INSERT OR IGNORE INTO session_devices(session_id, device_name)"
+                    " VALUES (?, ?)",
+                    (session_id, device_name),
+                )
+            return session_id
 
         session_id = self.transactional(_insert)
         self.flush_now()
@@ -189,15 +212,115 @@ class ArchiveDao:
             raise RuntimeError("start_session: lastrowid was None")
         return int(session_id)
 
-    def end_session(self, session_id: int) -> None:
+    def add_session_device(self, session_id: int, device_name: str) -> None:
+        """Record that ``device_name`` recorded into the session.
+
+        Idempotent (``INSERT OR IGNORE`` on the UNIQUE pair): a device
+        that stops and rejoins the same session stays a single member.
+        """
+
+        def _insert(cur: sqlite3.Cursor) -> None:
+            cur.execute(
+                "INSERT OR IGNORE INTO session_devices(session_id, device_name)"
+                " VALUES (?, ?)",
+                (session_id, device_name),
+            )
+
+        self.transactional(_insert)
+        self.flush_now()
+
+    def end_session(self, session_id: int, *, dirty: bool = False) -> None:
+        """Close a session row. ``dirty`` marks an administrative close
+        (crash recovery), not a user-driven stop."""
+
         def _update(cur: sqlite3.Cursor) -> None:
             cur.execute(
-                "UPDATE sessions SET ended_at=? WHERE id=?",
-                (_now_iso(), session_id),
+                "UPDATE sessions SET ended_at=?, closed_dirty=? WHERE id=?",
+                (_now_iso(), 1 if dirty else 0, session_id),
             )
 
         self.transactional(_update)
         self.flush_now()
+
+    def session_started_at(self, session_id: int) -> str:
+        """``started_at`` of exactly the given row (rule 9 provenance).
+
+        Fetched by id — never by recency ordering, which a crash-dirty
+        row with a skewed future timestamp could fool.
+        """
+
+        def _select(cur: sqlite3.Cursor) -> str:
+            row = cur.execute(
+                "SELECT started_at FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no session row with id {session_id}")
+            return str(row["started_at"])
+
+        return self.transactional(_select)
+
+    def close_dirty_sessions(self) -> int:
+        """Close every still-open session as dirty; return how many.
+
+        Crash recovery (rule 14 / ROADMAP M2-C): a session left open by
+        a crash is closed administratively on the next open of this DB,
+        with ``closed_dirty=1`` and ``ended_at`` = now (the close time,
+        NOT the real end of recording — the files carry the true
+        extent, rule 8). Call BEFORE :meth:`start_session` so the new
+        session can never be swept up by its own recovery pass.
+        """
+
+        def _update(cur: sqlite3.Cursor) -> int:
+            cur.execute(
+                "UPDATE sessions SET ended_at=?, closed_dirty=1 WHERE ended_at IS NULL",
+                (_now_iso(),),
+            )
+            return cur.rowcount
+
+        count = self.transactional(_update)
+        self.flush_now()
+        if count:
+            _log.warning(
+                "sessions_closed_dirty",
+                db=str(self._db_path),
+                count=count,
+            )
+        return int(count)
+
+    def list_sessions(self, limit: int = 200) -> list[SessionRecord]:
+        """Most-recent-first session rows with device membership.
+
+        Bounded read for the Archive tab's session browser (M3-A) and
+        tests; every field comes straight from the rows (rule 9).
+        """
+
+        def _select(cur: sqlite3.Cursor) -> list[SessionRecord]:
+            rows = cur.execute(
+                "SELECT id, project_name, started_at, ended_at, closed_dirty, host"
+                " FROM sessions ORDER BY started_at DESC, id DESC LIMIT ?",
+                (max(0, limit),),
+            ).fetchall()
+            records: list[SessionRecord] = []
+            for row in rows:
+                device_rows = cur.execute(
+                    "SELECT device_name FROM session_devices"
+                    " WHERE session_id=? ORDER BY device_name",
+                    (row["id"],),
+                ).fetchall()
+                records.append(
+                    SessionRecord(
+                        id=int(row["id"]),
+                        project_name=row["project_name"],
+                        started_at=row["started_at"],
+                        ended_at=row["ended_at"],
+                        closed_dirty=bool(row["closed_dirty"]),
+                        host=row["host"],
+                        devices=tuple(r["device_name"] for r in device_rows),
+                    )
+                )
+            return records
+
+        return self.transactional(_select)
 
     # ------------------------------------------------------------------
     # Devices / streams (UPSERT)

@@ -262,3 +262,67 @@ def test_close_flushes_pending_writes(tmp_path: Path) -> None:
         assert row["total_packets"] == 1
     finally:
         other_conn.close()
+
+
+# ---------------------------------------------------------------------------
+# M2-B sessions: project name, membership, dirty close, listing
+# ---------------------------------------------------------------------------
+
+
+def test_start_session_records_project_and_devices(dao: ArchiveDao) -> None:
+    sid = dao.start_session("h", "0.0.0", "c", project_name="Survey 2026", devices=("a", "b"))
+    sessions = dao.list_sessions()
+    assert len(sessions) == 1
+    rec = sessions[0]
+    assert rec.id == sid
+    assert rec.project_name == "Survey 2026"
+    assert rec.devices == ("a", "b")
+    assert rec.ended_at is None
+    assert rec.closed_dirty is False
+
+
+def test_add_session_device_is_idempotent(dao: ArchiveDao) -> None:
+    sid = dao.start_session("h", "v", "c", project_name="p")
+    dao.add_session_device(sid, "dev")
+    dao.add_session_device(sid, "dev")  # rejoin: still one member
+    assert dao.list_sessions()[0].devices == ("dev",)
+
+
+def test_end_session_dirty_flag(dao: ArchiveDao) -> None:
+    sid = dao.start_session("h", "v", "c", project_name="p")
+    dao.end_session(sid, dirty=True)
+    rec = dao.list_sessions()[0]
+    assert rec.ended_at is not None
+    assert rec.closed_dirty is True
+
+
+def test_close_dirty_sessions_sweeps_only_open_rows(dao: ArchiveDao) -> None:
+    closed = dao.start_session("h", "v", "c", project_name="p")
+    dao.end_session(closed)
+    dao.start_session("h", "v", "c", project_name="p")  # left open (crash)
+    swept = dao.close_dirty_sessions()
+    assert swept == 1
+    by_id = {rec.id: rec for rec in dao.list_sessions()}
+    assert by_id[closed].closed_dirty is False  # clean close untouched
+    open_recs = [r for r in by_id.values() if r.id != closed]
+    assert all(r.closed_dirty and r.ended_at is not None for r in open_recs)
+
+
+def test_sessionless_row_has_null_project(dao: ArchiveDao) -> None:
+    """The monitoring index path (no project) stays representable."""
+    dao.start_session("h", "v", "c")
+    rec = dao.list_sessions()[0]
+    assert rec.project_name is None
+    assert rec.devices == ()
+
+
+def test_session_started_at_fetches_by_id(dao: ArchiveDao) -> None:
+    """Provenance by row id (rule 9): a later row — or a future-dated
+    crash row — must not be able to answer for the one we hold."""
+    first = dao.start_session("h", "v", "c", project_name="p")
+    second = dao.start_session("h", "v", "c", project_name="p")
+    recs = {r.id: r for r in dao.list_sessions()}
+    assert dao.session_started_at(first) == recs[first].started_at
+    assert dao.session_started_at(second) == recs[second].started_at
+    with pytest.raises(KeyError):
+        dao.session_started_at(99999)

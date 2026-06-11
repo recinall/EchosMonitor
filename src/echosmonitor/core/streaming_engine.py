@@ -26,6 +26,7 @@ change confined to one PR: there is no compatibility shim.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import socket
 import threading
@@ -67,13 +68,17 @@ from echosmonitor.core.models import (
 from echosmonitor.core.psd_worker import PsdWorker
 from echosmonitor.core.ring_buffer import RingBuffer
 from echosmonitor.core.seedlink_worker import SeedLinkWorker
+from echosmonitor.core.session import SessionInfo, sanitize_project_name
 from echosmonitor.core.spectrogram_router import _SpectrogramRouter
 from echosmonitor.dsp.factory import build_chain
 from echosmonitor.storage.dao import ArchiveDao
 from echosmonitor.storage.gap_detector import GapDetector
 from echosmonitor.storage.mseed_writer import MseedWriter
+from echosmonitor.storage.sessions import ensure_project_root
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from obspy.core.trace import Trace
     from obspy.core.utcdatetime import UTCDateTime
 
@@ -242,6 +247,12 @@ class StreamingEngine(QObject):
     # goes Idle). Mirrors the ``deviceStateChanged`` int-payload pattern;
     # receivers reconstruct via ``AcquisitionState(value)``.
     acquisitionStateChanged = Signal(str, int)  # noqa: N815
+    # ``sessionChanged(SessionInfo | None)`` — fired when a recording
+    # session starts (payload: frozen SessionInfo), when its membership
+    # grows, and when it ends (payload: None). Type-erased object
+    # payload; receivers ``isinstance``-guard per rule 4. M2-C's
+    # Session toolbar is the intended consumer.
+    sessionChanged = Signal(object)  # noqa: N815
     errorOccurred = Signal(str, str)  # device_name, message  # noqa: N815
     # Zero-payload notification: the configured device list mutated; readers
     # re-query ``devices()``. Introduced in M4 stage A so the StationBrowser
@@ -383,6 +394,18 @@ class StreamingEngine(QObject):
         # diff path; the internal _start_device/_stop_device helpers never
         # touch it (they implement mechanics, not user intent).
         self._acq_state: dict[str, AcquisitionState] = {}
+        # ----- M2-B recording session (rule 14) -------------------------
+        # The active session, or None. Frozen snapshot — replaced (never
+        # mutated) when membership grows; published via active_session()
+        # and the sessionChanged signal.
+        self._session: SessionInfo | None = None
+        # True while start_session/end_session runs its DAO swap. The
+        # swap absorbs queued events via processEvents(), which can
+        # dispatch reentrant lifecycle calls on this same thread; the
+        # flag turns those into a loud SessionError (or a deferred
+        # config diff) instead of letting them corrupt the swap
+        # (qt-concurrency-auditor F1 on the M2-B diff).
+        self._session_transition = False
         # ----- DSP plumbing ----------------------------------------------
         # Set of streams that have a chain installed (built on first packet
         # if the device has a non-empty dsp_chain). Composite keys.
@@ -666,21 +689,251 @@ class StreamingEngine(QObject):
         self._set_acq_state(name, AcquisitionState.MONITORING)
         _log.info("device_monitoring_started", device=name)
 
-    def start_recording(self, name: str) -> None:
-        """Monitoring (or Idle) → Recording: monitoring + SDS writes.
+    def start_session(
+        self,
+        project_name: str,
+        device_names: Sequence[str] = (),
+    ) -> SessionInfo:
+        """Open a recording session for ``project_name`` (rule 14).
 
-        The archive writer is created HERE and only here — recording is
-        an explicit user action, never a config side effect (rule 13).
-        From MONITORING the live socket is untouched (the writer simply
-        attaches); from IDLE the device starts streaming and archiving
-        in one step. Already-RECORDING is a no-op.
+        Sessions are THE archive unit: every archive write lands under
+        ``<archive_root>/<sanitized_project>/<device>/<SDS…>`` with one
+        ``archive.db`` at the session root. This method validates the
+        project name against existing project dirs (injectivity guard —
+        a name that sanitises onto a DIFFERENT existing project is
+        rejected loudly), swaps the engine's metadata DAO to the session
+        DB (closing any sessionless monitoring index first; crash-dirty
+        rows in the session DB are closed-as-dirty on open), starts the
+        session row, then starts recording on every listed device.
+
+        One session at a time. Devices not listed can join later via
+        :meth:`start_recording`.
 
         Raises:
+            SessionError: a session is already active, or the project
+                name is blank.
+            ProjectNameCollisionError: the sanitized name belongs to a
+                different existing project.
+            KeyError: a listed device name is unknown.
+        """
+        from PySide6.QtCore import QCoreApplication, QEventLoop
+
+        from echosmonitor.core.exceptions import SessionError
+
+        if self._session_transition:
+            raise SessionError("a session transition is already in progress")
+        if self._session is not None:
+            raise SessionError(
+                f"a session is already active: {self._session.project_name!r}; "
+                f"end it before starting another"
+            )
+        if not project_name.strip():
+            raise SessionError("project name must not be empty")
+        # Validate everything BEFORE mutating engine state: unknown
+        # device → KeyError here, with no half-started session behind it.
+        cfgs = [self._device_cfg_or_raise(n) for n in device_names]
+        self._ensure_started()
+        base_root = self._resolve_db_root()
+        session_root = ensure_project_root(base_root, project_name)
+        self._session_transition = True
+        try:
+            # Absorb queued cross-thread events that target the OLD DAO
+            # before swapping it out. Detections are NOT engine-thread-
+            # synchronous: ``triggerFired`` arrives queued from the DSP
+            # thread, so a trigger posted under the sessionless
+            # monitoring index must be recorded THERE, not in the new
+            # session DB. User-input events are excluded so a queued
+            # click cannot reenter the lifecycle inside this barrier.
+            QCoreApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+            )
+            # Swap the metadata DAO: the sessionless monitoring index
+            # (if one is open for detections) closes cleanly; rows
+            # produced during the session — including detections —
+            # belong to the session DB at the session root (one
+            # archive.db per session root, skill miniseed-sds).
+            self._close_archive_dao()
+            try:
+                # The first DAO call below is what actually opens the
+                # connection (mkdir + DDL) — disk-full/permissions
+                # surface HERE, after the monitoring index was closed.
+                dao = ArchiveDao(session_root / "archive.db")
+                recovered = dao.close_dirty_sessions()
+                session_id = dao.start_session(
+                    host=socket.gethostname(),
+                    version=self._version_string(),
+                    config_hash=self._compute_config_hash(),
+                    project_name=project_name,
+                )
+            except Exception as exc:
+                _log.error(
+                    "session_start_failed",
+                    project=project_name,
+                    root=str(session_root),
+                    error=str(exc),
+                )
+                # Detections must not silently stop persisting (rule 8):
+                # restore the sessionless monitoring index before
+                # surfacing the failure.
+                for dev_cfg in self._engine_devices:
+                    if dev_cfg.name in self._workers and self._device_has_detection(dev_cfg):
+                        self._ensure_archive_dao(self._resolve_db_root())
+                        break
+                raise
+            self._archive_dao = dao
+            self._archive_db_path = session_root / "archive.db"
+            self._archive_session_id = session_id
+            # started_at comes from the row the DAO just wrote, fetched
+            # by its id (rule 9 — no parallel in-memory clock, and no
+            # ordering heuristic a crash-dirty future-dated row could
+            # fool).
+            started_at = dao.session_started_at(session_id)
+            self._session = SessionInfo(
+                session_id=session_id,
+                project_name=project_name,
+                sanitized_name=sanitize_project_name(project_name),
+                started_at=started_at,
+                devices=(),
+                db_root=session_root,
+            )
+        finally:
+            self._session_transition = False
+        _log.info(
+            "session_started",
+            project=project_name,
+            root=str(session_root),
+            session_id=session_id,
+            devices=list(device_names),
+            recovered_dirty=recovered,
+        )
+        self.sessionChanged.emit(self._session)
+        for dev_cfg in cfgs:
+            self.start_recording(dev_cfg.name)
+        return self._session
+
+    def end_session(self) -> None:
+        """Close the active session; no-op when none is active.
+
+        Every still-recording member downgrades to MONITORING (writer
+        teardown drains + flushes, rule-7 bounded; live sockets stay
+        up), the queued durability claims are absorbed, the session row
+        is closed clean, and the DAO reverts to the sessionless
+        monitoring index if a running device still produces detections.
+        """
+        from echosmonitor.core.exceptions import SessionError
+
+        if self._session_transition:
+            raise SessionError("a session transition is already in progress")
+        session = self._session
+        if session is None:
+            return
+        t0 = time.monotonic()
+        self._session_transition = True
+        try:
+            for dev_name, state in list(self._acq_state.items()):
+                if state is AcquisitionState.RECORDING:
+                    self.start_monitoring(dev_name)
+            self._finalize_session(reensure_detection_dao=True)
+        finally:
+            self._session_transition = False
+        _log.info(
+            "session_ended",
+            project=session.project_name,
+            session_id=session.session_id,
+            elapsed_s=round(time.monotonic() - t0, 3),
+        )
+
+    def active_session(self) -> SessionInfo | None:
+        """The active session's frozen snapshot, or ``None``."""
+        return self._session
+
+    def _finalize_session(self, *, reensure_detection_dao: bool) -> None:
+        """Close the session row + DAO and announce the session's end.
+
+        ``reensure_detection_dao`` is False on the engine-stop path: the
+        engine is going down, so re-opening the sessionless detection DB
+        would only create a row that immediately closes again.
+        """
+        # Absorb queued ``flushedFile`` events so the final fsync's
+        # metadata lands in the session DB before its row closes
+        # (mirrors the engine-stop sequence; rule 8). User-input events
+        # are excluded: a queued click dispatched here could reenter the
+        # session lifecycle mid-swap (the ``_session_transition`` guard
+        # backstops anything else that slips through).
+        from PySide6.QtCore import QCoreApplication, QEventLoop
+
+        QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self._close_archive_dao()
+        self._session = None
+        self.sessionChanged.emit(None)
+        if reensure_detection_dao:
+            # Open question 3 interim: detections keep persisting while
+            # monitoring. Any still-running detection-capable device
+            # gets the sessionless base-root index back.
+            for dev_cfg in self._engine_devices:
+                if dev_cfg.name in self._workers and self._device_has_detection(dev_cfg):
+                    self._ensure_archive_dao(self._resolve_db_root())
+                    break
+
+    def _close_archive_dao(self) -> None:
+        """End the current DAO's session row, close it, drop the caches.
+
+        Shared by the session swap (:meth:`start_session`), the session
+        close (:meth:`_finalize_session`) and engine :meth:`stop`.
+        """
+        if self._archive_dao is None:
+            return
+        if self._archive_session_id is not None:
+            self._archive_dao.end_session(self._archive_session_id)
+        self._archive_dao.close()
+        self._archive_dao = None
+        self._archive_db_path = None
+        self._archive_session_id = None
+        self._archive_device_ids.clear()
+        self._archive_stream_ids.clear()
+        self._gap_detectors.clear()
+        self._pending_gaps.clear()
+        # A detection open across a DAO swap stays an open row in the
+        # closing DB (crash-equivalent semantics) and its later close
+        # lands as a separate closed row in the next DB. Rare (STA/LTA
+        # triggers are short relative to session transitions) but worth
+        # an audit trail when it happens.
+        if self._open_detection_ids:
+            _log.info(
+                "archive_dao_closed_with_open_detections",
+                count=len(self._open_detection_ids),
+                streams=sorted(self._open_detection_ids),
+            )
+        self._open_detection_ids.clear()
+
+    def start_recording(self, name: str) -> None:
+        """Monitoring (or Idle) → Recording into the ACTIVE session.
+
+        The archive writer is created HERE and only here — recording is
+        an explicit user action, never a config side effect (rule 13) —
+        and it records into the active session's root (rule 14: no
+        session, no archive writes). From MONITORING the live socket is
+        untouched (the writer simply attaches); from IDLE the device
+        starts streaming and archiving in one step. Already-RECORDING
+        is a no-op. The device joins the session's membership row
+        before the state is announced (persisted-before-announced,
+        rule 8).
+
+        Raises:
+            SessionError: no active session — call :meth:`start_session`
+                first.
             KeyError: ``name`` does not match any configured device.
         """
+        from echosmonitor.core.exceptions import SessionError
+
         # Validate first — see start_monitoring for why.
         dev_cfg = self._device_cfg_or_raise(name)
-        self._ensure_started()
+        session = self._session
+        if session is None:
+            raise SessionError(
+                f"cannot record {name!r}: no active session — "
+                f"start_session(project, devices) first (rule 14)"
+            )
         state = self.acquisition_state(name)
         if state is AcquisitionState.RECORDING:
             return
@@ -688,8 +941,25 @@ class StreamingEngine(QObject):
             self._setup_archive_writer(dev_cfg)
         else:
             self._start_device(dev_cfg, with_archive=True)
+        membership_grew = False
+        if name not in session.devices and self._archive_dao is not None:
+            # Persisted before announced (rule 8): the membership row
+            # commits here; the emit waits until the acquisition state
+            # is settled so a direct receiver never sees a member whose
+            # state still reads MONITORING/IDLE.
+            self._archive_dao.add_session_device(session.session_id, name)
+            self._session = dataclasses.replace(
+                session, devices=(*session.devices, name)
+            )
+            membership_grew = True
         self._set_acq_state(name, AcquisitionState.RECORDING)
-        _log.info("device_recording_started", device=name)
+        if membership_grew:
+            self.sessionChanged.emit(self._session)
+        _log.info(
+            "device_recording_started",
+            device=name,
+            project=session.project_name,
+        )
 
     def acquisition_state(self, name: str) -> AcquisitionState:
         """Current user acquisition state for ``name``; IDLE if unknown."""
@@ -754,6 +1024,14 @@ class StreamingEngine(QObject):
                 device=name,
                 elapsed_s=round(time.monotonic() - t0, 3),
             )
+            return
+        if self._session_transition:
+            # Reentrant global stop from inside a session transition's
+            # processEvents barrier: skipping is correct — the outer
+            # transition (and whatever invoked it) resumes when the
+            # barrier returns; tearing the engine down underneath it
+            # would corrupt the swap.
+            _log.warning("streaming_engine_stop_skipped_during_session_transition")
             return
         if not self._started:
             return
@@ -860,20 +1138,23 @@ class StreamingEngine(QObject):
         # round of pending events absorbs them so the corresponding
         # ``record_file``/``record_packet``/``record_gap`` rows make
         # it into the DB before ``end_session`` finalises.
-        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtCore import QCoreApplication, QEventLoop
 
-        QCoreApplication.processEvents()
-        if self._archive_dao is not None:
-            if self._archive_session_id is not None:
-                self._archive_dao.end_session(self._archive_session_id)
-            self._archive_dao.close()
-            self._archive_dao = None
-            self._archive_session_id = None
-            self._archive_device_ids.clear()
-            self._archive_stream_ids.clear()
-            self._gap_detectors.clear()
-            self._pending_gaps.clear()
-            self._open_detection_ids.clear()
+        QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self._close_archive_dao()
+        # An active session ends cleanly with the engine: the row above
+        # was closed by _close_archive_dao. State clears NOW; the
+        # sessionChanged emit waits until after ``_started`` flips (same
+        # reentrancy rule as the IDLE announcements below).
+        session_was_active = self._session is not None
+        if self._session is not None:
+            _log.info(
+                "session_ended",
+                project=self._session.project_name,
+                session_id=self._session.session_id,
+                reason="engine_stop",
+            )
+            self._session = None
 
         # Drop all signal connections from the bridges before the bridges
         # themselves are released. Without this, a queued cross-thread
@@ -909,14 +1190,17 @@ class StreamingEngine(QObject):
             self._chain_max_q_by_key.clear()
             self._chain_drops_pending.clear()
             self._chain_drops_last_log.clear()
-        # Flip _started BEFORE announcing IDLE: the emits are direct
-        # same-thread calls, and a receiver that re-entrantly invokes
-        # start_monitoring() from its IDLE handler must hit a fully
-        # stopped engine (_ensure_started reboots the infrastructure)
-        # rather than a half-torn-down one that still claims _started.
+        # Flip _started BEFORE announcing IDLE / session end: the emits
+        # are direct same-thread calls, and a receiver that re-entrantly
+        # invokes start_monitoring() (or start_session()) from its
+        # handler must hit a fully stopped engine (_ensure_started
+        # reboots the infrastructure) rather than a half-torn-down one
+        # that still claims _started.
         self._started = False
         for dev_name in list(self._acq_state):
             self._set_acq_state(dev_name, AcquisitionState.IDLE)
+        if session_was_active:
+            self.sessionChanged.emit(None)
 
     def devices(self) -> tuple[DeviceConfig, ...]:
         """Snapshot of the engine's currently-running device list.
@@ -1037,20 +1321,50 @@ class StreamingEngine(QObject):
 
         For a known device, returns its effective root (per-device
         ``archive.root_dir`` override, else the app default); otherwise
-        the app-level default. Used by the archive reader for historical
-        data -- pure path resolution, no I/O.
+        the app-level default — in both cases session-rooted while a
+        session is active (rule 14; same :meth:`_session_rooted` funnel
+        the writers use, so readers and writers can never disagree on
+        the layout). Used by the archive reader for historical data --
+        pure path resolution, no I/O.
         """
         if device_name is not None:
             dev_cfg = next((d for d in self._engine_devices if d.name == device_name), None)
             if dev_cfg is not None:
-                return self._resolve_archive_root(dev_cfg)
-        return self._resolve_db_root()
+                return self._session_rooted(self._resolve_archive_root(dev_cfg))
+        return self._session_rooted(self._resolve_db_root())
+
+    def _session_rooted(self, base: Path) -> Path:
+        """THE session-aware root resolver (rule 14).
+
+        Every archive-path site — writer construction, the public
+        reading accessor, the DB location — funnels through here:
+        ``<base>/<sanitized_project>`` while a session is active, the
+        bare base otherwise (the sessionless monitoring index). NOTE:
+        between sessions the bare base does NOT reach data recorded in
+        closed sessions (those live under their project dirs) —
+        session-aware historical reading is M3-A's session browser; the
+        live readers only need the ACTIVE context to agree with the
+        writers, which this funnel guarantees.
+        """
+        if self._session is not None:
+            return base / self._session.sanitized_name
+        return base
 
     def archive_dao(self) -> ArchiveDao | None:
-        """The metadata DAO if one exists this session, else ``None``.
+        """The CURRENT metadata DAO, else ``None``.
 
         Read-only use by the archive reader to consult the ``files``
-        index. ``None`` when no archiving/detection device created a DAO.
+        index. ``None`` when no recording session is active and no
+        detection-capable device is running.
+
+        LIFETIME (M2-B): the DAO is per-context, not per-engine — it is
+        REPLACED on every ``start_session``/``end_session`` swap.
+        Consumers must re-resolve per request (never cache the return
+        across requests) or subscribe to ``sessionChanged`` (queued) to
+        refresh; a cached reference goes stale on the first swap and a
+        worker-thread connection opened on it leaks (``ArchiveDao.close``
+        only closes the calling thread's connection). Every current
+        call site re-resolves.
         """
         return self._archive_dao
 
@@ -1680,40 +1994,48 @@ class StreamingEngine(QObject):
     # M5 — archive plumbing
     # ------------------------------------------------------------------
     def _ensure_archive_dao(self, root: Path) -> None:
-        """Lazy-create the per-engine DAO + start a session.
+        """Lazy-open the SESSIONLESS monitoring index (detections only).
 
-        The DAO is keyed off the FIRST resolved archive root. Devices
-        whose ``archive.root_dir`` overrides to a different directory
-        still write into the same SQLite index — files have absolute
-        paths, so the index can describe a multi-root archive even
-        though the DB itself lives at a single location.
+        Since M2-B this serves exactly one purpose: persisting STA/LTA
+        detections while NO recording session is active (open question 3
+        interim). Its row carries ``project_name=NULL``. During a
+        session it is a no-op (the session DAO is installed by
+        ``start_session``); recording-session DBs are opened there, one
+        per session root (rule 14), never here. Like the session path,
+        opening sweeps crash-dirty rows first.
         """
         if self._archive_dao is not None:
             return
         db_path = root / "archive.db"
-        self._archive_dao = ArchiveDao(db_path)
-        self._archive_db_path = db_path
-        config_hash = self._compute_config_hash()
-        self._archive_session_id = self._archive_dao.start_session(
+        # Install only after the open + sweep + row insert all succeed,
+        # so a failure can never leave a half-initialised DAO (open
+        # connection, no session row) behind on the engine.
+        dao = ArchiveDao(db_path)
+        recovered = dao.close_dirty_sessions()
+        session_id = dao.start_session(
             host=socket.gethostname(),
             version=self._version_string(),
-            config_hash=config_hash,
+            config_hash=self._compute_config_hash(),
         )
+        self._archive_dao = dao
+        self._archive_db_path = db_path
+        self._archive_session_id = session_id
         _log.info(
             "streaming_engine_archive_session_started",
             db=str(db_path),
-            session_id=self._archive_session_id,
+            session_id=session_id,
+            recovered_dirty=recovered,
         )
 
     def _resolve_db_root(self) -> Path:
-        """Root for the metadata DB when no archive writer resolved one.
+        """The app-level BASE archive root (no device, no session).
 
         Mirrors the no-per-device tail of :meth:`_resolve_archive_root`:
         the top-level ``app.archive_root`` if set, else the platformdirs
-        default. Used only for the detection-only path (a device runs
-        STA/LTA but archives nothing); when any device archives,
-        :meth:`_setup_archive_writer` resolves the root first and this
-        is never reached.
+        default. Three callers since M2-B: the sessionless monitoring
+        index (:meth:`_ensure_archive_dao`), the base ``start_session``
+        roots projects under (``ensure_project_root``), and the
+        device-less branch of the public :meth:`archive_root` accessor.
         """
         if self._cfg.app.archive_root is not None:
             return Path(self._cfg.app.archive_root)
@@ -1940,7 +2262,11 @@ class StreamingEngine(QObject):
             # Idempotent: a config-changed cycle may re-enable an already-
             # configured archive; nothing to do.
             return
-        root = self._resolve_archive_root(dev_cfg)
+        # Session-rooted (rule 14): the writer's tree lands under
+        # ``<base>/<project>/<device>/<SDS…>``. Writers only exist
+        # while a session is active, so the funnel always adds the
+        # project segment here; the bare-base branch serves readers.
+        root = self._session_rooted(self._resolve_archive_root(dev_cfg))
         self._ensure_archive_dao(root)
         writer = MseedWriter(name, root, dev_cfg.archive)
         writer.moveToThread(self._archive_thread)
@@ -2263,6 +2589,14 @@ class StreamingEngine(QObject):
             # ``_started`` — applying a diff to a torn-down engine would
             # queue router work onto the dead DSP thread, to replay
             # stale on the next lazy boot.
+            return
+        if self._session_transition:
+            # We are inside a session transition's processEvents
+            # barrier on this same thread. Re-queue the diff for after
+            # the transition — the slot re-reads the store, so nothing
+            # is lost; applying it mid-swap could restart a recording
+            # device against a half-swapped DAO.
+            QTimer.singleShot(0, self._on_config_changed)
             return
         new_devices = tuple(self._store.root.devices)
         diff = diff_devices(self._engine_devices, new_devices)

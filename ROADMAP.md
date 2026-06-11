@@ -284,7 +284,7 @@ Goal: rules 13–14 implemented end to end.
       Monitoring↔Recording transitions attach/detach the writer without
       socket churn; hot-reload buckets are state-aware (see decision log);
       tests in `tests/core/test_engine_session_lifecycle.py`.
-- [ ] **B. Session model** `core/session.py` + `storage` sessions index:
+- [x] **B. Session model** `core/session.py` + `storage` sessions index:
       project name (sanitised, injectivity-checked), started/ended, devices,
       archive path `<root>/<project>/<device>/<SDS…>`. New-session dialog
       (name + which devices record). Audit: a `sessions` table **already
@@ -296,6 +296,18 @@ Goal: rules 13–14 implemented end to end.
       (`_resolve_archive_root` `:1888–1900`, `_resolve_db_root` `:1680–1689`,
       reader snapshot `core/archive_detail_loader.py:322`) through one
       session-rooted resolver.
+      *Done 2026-06-11* (dialog deferred to M2-C — it is pure UI and lands
+      with the toolbar): `core/session.py` (SessionInfo, sanitiser alias,
+      path grammar) + `storage/sessions.py` (injectivity guard against
+      existing project dirs; raw name read from the project's own
+      archive.db); schema v4 (project_name, closed_dirty, session_devices)
+      with idempotent v3→v4 step; engine `start_session`/`end_session`/
+      `active_session` + `sessionChanged` signal; `start_recording`
+      requires the active session and joins membership; all archive paths
+      funnel through `_session_rooted()`; crash-dirty rows swept on
+      session-DB open (`close_dirty_sessions` — M2-C wires the launch
+      sweep); tests in `tests/core/test_session.py` +
+      `tests/core/test_engine_sessions.py`.
 - [ ] **C. UI**: global Session toolbar (project name, ▶ Monitor, ⏺ Record,
       ⏹ Stop, elapsed, bytes written) + per-device state badges
       Idle/Monitoring/Recording. Crash-recovery: an unclosed session is
@@ -320,7 +332,13 @@ at `storage/sds.py:130–168` has zero callers).
 - [ ] **A. Session browser**: list sessions by name/date (search + date
       filter), per-session device/stream tree with coverage strips
       (extent/coverage DAO + strip widget already exist — re-scope them
-      per-session).
+      per-session). NOTE (M2-B consequence): between sessions
+      `engine.archive_root()`/`archive_dao()` expose only the bare base
+      root — data recorded in CLOSED sessions lives under
+      `<base>/<project>/` and is unreachable by the live readers until
+      this browser opens project DBs explicitly (scan project dirs'
+      `archive.db`s + the base monitoring index). Detection replay /
+      Archive→HVSR hand-offs for closed sessions depend on this.
 - [ ] **B. Window viewing**: verify + polish the static 3C view +
       spectrogram for any session/interval (mostly implemented; remaining:
       zoom/pan ergonomics, unit switching with gaps, export PNG).
@@ -442,6 +460,12 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M2-A: hot-reload `added` bucket registers the device **IDLE** (no autostart); `restart` bucket only recycles devices the user has running (Recording survives with a fresh writer); `reconnect_device` is a no-op on idle devices | Rule 13 applies to runtime adds too. `test_add_device_via_store_starts_worker` consciously rewritten to `…_registers_idle_until_user_starts`. Idle devices still get `_reinstall_chain` so preserved router chains track config. |
 | 2026-06-11 | M2-A: detection DAO creation moved from global `start()` to per-device `_start_device` (first detection-capable device to start) | Keeps open question 3's current answer (Monitoring persists detections, rule 8) under the per-device API; on launch with everything idle there is NO archive.db and no recent-detections prefill — M2-B's sessions index restores history. |
 | 2026-06-11 | M2-A reviews: `_teardown_archive_writer` drains the device's archive inbox to the writer (FIFO before the blocking `close_all`) and logs residual drops | qt-concurrency-auditor F1 / code-reviewer major 1: the per-device paths (downgrade, `stop(name)`, hot-reload restart) bypassed `stop()`'s global drain and silently lost up to one flush-tick of recorded tail. Regression test `test_downgrade_flushes_inflight_archive_inbox`. Also from review: `_started=False` precedes the IDLE emits (reentrancy), `_on_config_changed` guards on `_started` (stale queued diff), name validation precedes infra boot, Archive-tab empty state points at Recording instead of the vestigial `archive.enabled`. |
+| 2026-06-11 | M2-B: **one `archive.db` per session root** (`<base>/<project>/archive.db`); the base-root DB survives as the sessionless monitoring index (detections while no session) | Skill `miniseed-sds` mandates per-session-root DBs; the monitoring index keeps open question 3's interim answer working between sessions. M3-A's session browser scans project dirs' DBs (or the base index) rather than one global DB. |
+| 2026-06-11 | M2-B: `start_recording` **requires** an active session and joins it; detections during a session land in the session DB | Rule 14: sessions are the archive unit — no session, no archive writes. The engine swaps its single DAO between contexts (close-then-open, never two live); membership rows are written before the state is announced (rule 8). |
+| 2026-06-11 | M2-B: project-name injectivity is checked against **disk** (raw name read from the existing project dir's own archive.db); unverifiable dirs (no DB) are allowed with a loud log | Unlike device names (collision domain = one config, checked at load), project names accumulate over time; the project's DB is the only durable home of the raw name. Files win over the index (rule 8) so an unprovable collision must not block recording. |
+| 2026-06-11 | M2-B: New-session dialog deferred to **M2-C** | It is pure UI and shares the toolbar's wiring; B's engine API (`start_session(project, devices)`) is exactly the dialog's contract. |
+| 2026-06-11 | M2-B: per-device `archive.root_dir` overrides keep working (`<override>/<project>/<device>/…`) but the project injectivity guard runs only against the **app base root** | The session's `archive.db` (the only durable home of the raw name) lives at the app-base session root; an override dir has no DB to check against, so a guard there could only ever warn-unverified. Multi-root sessions are an edge config; revisit if the field uses them. |
+| 2026-06-11 | M2-B reviews: session transitions are guarded (`_session_transition` flag + `ExcludeUserInputEvents` on every absorb barrier; config diffs re-queue past the swap); `start_session` absorbs queued DSP-thread detections BEFORE the DAO swap; a failed swap restores the sessionless detection index; `started_at` fetched by row id; base index sweeps crash-dirty rows on open | qt-concurrency-auditor F1/F2/F4/F5 + code-reviewer majors 1–2, minors 4–5 on the M2-B diff: `processEvents()` inside the swap could dispatch a reentrant `start_session`/click and route the old session's queued `flushedFile`/detection events into the NEW project's DB; `list_sessions(limit=1)` provenance could be fooled by a crash-dirty future-dated row. DAO lifetime is now documented as per-context on `archive_dao()`; consumer re-resolution is the contract (stale-reference rewiring lands with M2-C/M3-A). |
 
 ## Open questions (resolve before the milestone that needs them)
 

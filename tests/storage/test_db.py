@@ -192,17 +192,18 @@ def _make_v2_db(path: Path) -> int:
 
 def test_v2_to_v3_migration_is_pure_version_bump(tmp_path: Path) -> None:
     """M0 regression: with the AI events subsystem removed (rule 12), the
-    v2 → v3 step is a pure no-op version bump — the version becomes 3,
-    NO ``events`` table is created, and detections rows survive."""
+    v2 → v3 step is a pure no-op bump — NO ``events`` table is created
+    and detections rows survive. The ladder then continues to the
+    current version (v4 added the session columns, M2-B)."""
     p = tmp_path / "archive.db"
     stream_id = _make_v2_db(p)
 
-    conn = connect(p)  # triggers the v2 → v3 upgrade
+    conn = connect(p)  # triggers the v2 → v3 (→ current) upgrade
     try:
         version = conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()[
             "value"
         ]
-        assert version == "3"
+        assert int(version) == SCHEMA_VERSION
 
         events_tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
@@ -370,5 +371,75 @@ def test_unique_files_path_constraint(tmp_path: Path) -> None:
                 (stream_id,),
             )
             conn.commit()
+    finally:
+        conn.close()
+
+
+def _make_v3_db(path: Path) -> int:
+    """Materialise a schema-v3 DB with one open session row. Returns its id."""
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.executescript(_V1_SCHEMA_SQL)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stream_id INTEGER NOT NULL,
+                kind TEXT NOT NULL, t_on TEXT NOT NULL, t_off TEXT,
+                score REAL NOT NULL, detected_at TEXT NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT '{}'
+            );
+            """
+        )
+        conn.execute("INSERT INTO _meta(key, value) VALUES ('schema_version', '3')")
+        conn.execute(
+            "INSERT INTO sessions(started_at, host, version, config_hash)"
+            " VALUES ('2026-06-01T00:00:00Z', 'h', '0.0.0', 'c')"
+        )
+        sid = conn.execute("SELECT id FROM sessions").fetchone()["id"]
+        conn.commit()
+        return int(sid)
+    finally:
+        conn.close()
+
+
+def test_v3_to_v4_migration_adds_session_columns_and_membership(tmp_path: Path) -> None:
+    """v3 → v4 (M2-B, rule 14): sessions gain project_name + closed_dirty,
+    session_devices appears, pre-existing rows survive with NULL project
+    and a clean dirty flag."""
+    db_path = tmp_path / "archive.db"
+    old_id = _make_v3_db(db_path)
+
+    conn = connect(db_path)
+    try:
+        version = conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()[
+            "value"
+        ]
+        assert int(version) == db_mod.SCHEMA_VERSION
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        assert {"project_name", "closed_dirty"} <= cols
+        tables = {
+            row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "session_devices" in tables
+        row = conn.execute(
+            "SELECT project_name, closed_dirty FROM sessions WHERE id=?", (old_id,)
+        ).fetchone()
+        assert row["project_name"] is None
+        assert row["closed_dirty"] == 0
+    finally:
+        conn.close()
+
+
+def test_v4_columns_present_on_fresh_db(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "archive.db")
+    try:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        assert {"project_name", "closed_dirty"} <= cols
+        sd_cols = {row["name"] for row in conn.execute("PRAGMA table_info(session_devices)")}
+        assert sd_cols == {"session_id", "device_name"}
     finally:
         conn.close()

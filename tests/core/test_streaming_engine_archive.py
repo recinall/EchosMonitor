@@ -86,9 +86,10 @@ def archive_engine(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    # M2-A: writers are created by the RECORDING path only, never by
-    # ``archive.enabled`` config (rule 13). One call covers Idle→Recording.
-    engine.start_recording("fake")
+    # M2-A/B: writers exist only in the RECORDING state (rule 13) and
+    # recording happens inside a named session (rule 14). One call
+    # covers session + Idle→Recording.
+    engine.start_session("proj", ["fake"])
     try:
         yield engine, archive_root, nslc
     finally:

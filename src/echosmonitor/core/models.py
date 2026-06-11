@@ -196,6 +196,27 @@ class ConnState(IntEnum):
     STOPPED = 5
 
 
+@dataclass(frozen=True, slots=True)
+class SessionRecord:
+    """One row of the ``sessions`` index, as read back by the DAO.
+
+    ``project_name`` is the raw user-chosen name (rule 14); ``None``
+    identifies the sessionless monitoring index (detection-only rows).
+    ``closed_dirty`` marks a session that was found still open on a
+    later launch and closed administratively — its ``ended_at`` is the
+    close time, not the real end of recording. Timestamps are ISO-8601
+    UTC strings (lexicographic == chronological).
+    """
+
+    id: int
+    project_name: str | None
+    started_at: str
+    ended_at: str | None
+    closed_dirty: bool
+    host: str
+    devices: tuple[str, ...]
+
+
 class AcquisitionState(IntEnum):
     """Per-device user acquisition state (CLAUDE.md rule 13).
 

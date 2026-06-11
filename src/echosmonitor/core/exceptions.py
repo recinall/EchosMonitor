@@ -28,6 +28,16 @@ class ConfigError(EchosMonitorError):
     """Malformed or inconsistent configuration."""
 
 
+class SessionError(EchosMonitorError):
+    """Invalid recording-session lifecycle operation (rule 14).
+
+    Raised when recording is requested with no active session, when a
+    second session is started over a live one, or when a project name
+    is unusable. Project-name *collisions* raise the more specific
+    :class:`echosmonitor.storage.sessions.ProjectNameCollisionError`.
+    """
+
+
 class HvsrError(EchosMonitorError):
     """HVSR (H/V spectral ratio) analysis failure.
 

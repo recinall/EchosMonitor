@@ -266,13 +266,18 @@ def test_start_recording_from_idle_creates_sds_tree(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start_recording("dev")
+    engine.start_session("proj", ["dev"])
     try:
         assert engine.acquisition_state("dev") is AcquisitionState.RECORDING
         assert "dev" in engine._archive_writers
         assert _wait_until(
             lambda: _has_archive_file(archive_root), timeout_s=10.0, qtbot=qtbot
         ), f"no archive file under {archive_root}"
+        # Rule 14 layout: everything lands under the session root.
+        assert (archive_root / "proj").is_dir()
+        assert all(
+            p.is_relative_to(archive_root / "proj") for p in archive_root.rglob("*.D.*")
+        )
     finally:
         engine.stop()
 
@@ -293,6 +298,7 @@ def test_monitor_to_record_attaches_writer_without_socket_churn(
     try:
         assert _wait_until(lambda: _connected(engine, "dev"), timeout_s=5.0, qtbot=qtbot)
         worker_before = engine._workers["dev"]
+        engine.start_session("proj", [])  # open session; device joins below
         engine.start_recording("dev")
         # Same worker object: the live socket was not recycled.
         assert engine._workers["dev"] is worker_before
@@ -318,7 +324,7 @@ def test_record_to_monitor_tears_down_writer_keeps_streaming(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start_recording("dev")
+    engine.start_session("proj", ["dev"])
     try:
         assert _wait_until(
             lambda: _has_archive_file(archive_root), timeout_s=10.0, qtbot=qtbot
@@ -403,6 +409,7 @@ def test_state_signal_full_cycle(qtbot, tmp_path: Path, make_fake_server) -> Non
     spy = _StateSpy(engine)
     try:
         engine.start_monitoring("dev")
+        engine.start_session("proj", [])
         engine.start_recording("dev")
         engine.start_monitoring("dev")
         engine.stop("dev")
@@ -454,7 +461,7 @@ def test_downgrade_flushes_inflight_archive_inbox(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start_recording("dev")
+    engine.start_session("proj", ["dev"])
     try:
         # Writer warm: at least one live file on disk.
         assert _wait_until(
