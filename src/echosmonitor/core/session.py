@@ -23,12 +23,27 @@ colliding names loudly), exactly as the config schema does for devices.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import platformdirs
 
 from echosmonitor.storage.sds import sanitize_device_name
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from echosmonitor.config import RootConfig
+
+
+def resolve_base_archive_root(cfg: RootConfig) -> Path:
+    """The app-level BASE archive root: config override else platformdirs.
+
+    One definition shared by the engine (``_resolve_db_root``) and the
+    launch-time crash-recovery sweep, so they can never disagree about
+    where sessions live. Pure path computation; no I/O.
+    """
+    if cfg.app.archive_root is not None:
+        return Path(cfg.app.archive_root)
+    return Path(platformdirs.user_data_dir("echosmonitor", "EchosMonitor")) / "archive"
 
 
 def sanitize_project_name(name: str) -> str:

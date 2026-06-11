@@ -71,6 +71,78 @@ def stored_project_name(session_root: Path) -> str | None:
     return str(row[0]) if row is not None else None
 
 
+def sweep_dirty_sessions(base_root: Path) -> dict[str, int]:
+    """Close-as-dirty every unclosed session under ``base_root``.
+
+    Launch-time crash recovery (ROADMAP M2-C): visits the base
+    monitoring index (``base_root/archive.db``) and every immediate
+    project dir's ``archive.db``, runs the DAO's ``close_dirty_sessions``
+    on each, and returns ``{db_path: swept_count}`` for the DBs where
+    anything was swept. Opening through the DAO also brings each DB to
+    the current schema, so old project DBs migrate at launch rather
+    than on first recording.
+
+    Per-DB errors are logged and skipped — a corrupt or foreign file
+    must not block launch (the engine's own per-DB sweep on open is the
+    second line of defence).
+    """
+    import time
+
+    from echosmonitor.storage.dao import ArchiveDao
+
+    try:
+        if not base_root.is_dir():
+            return {}
+        candidates = [base_root / _DB_FILENAME]
+        candidates.extend(
+            sorted(
+                child / _DB_FILENAME
+                for child in base_root.iterdir()
+                if child.is_dir()
+            )
+        )
+    except OSError as exc:
+        # An unreadable archive root (permissions, stale network mount)
+        # must not block launch — the engine's per-DB sweep on open is
+        # the second line of defence.
+        _log.warning(
+            "session_sweep_root_unreadable",
+            root=str(base_root),
+            error=str(exc),
+        )
+        return {}
+    swept: dict[str, int] = {}
+    for db_path in candidates:
+        try:
+            if not db_path.is_file():
+                continue
+            t0 = time.monotonic()
+            dao = ArchiveDao(db_path)
+            try:
+                count = dao.close_dirty_sessions()
+            finally:
+                dao.close()
+        except (sqlite3.Error, OSError) as exc:
+            _log.warning(
+                "session_sweep_db_failed",
+                db=str(db_path),
+                error=str(exc),
+            )
+            continue
+        # Per-DB observability (rule 7): each open runs migration + an
+        # UPDATE + fsync, and sqlite's busy_timeout means a locked DB
+        # can cost seconds — make the per-DB cost attributable.
+        _log.debug(
+            "session_sweep_db_done",
+            db=str(db_path),
+            swept=count,
+            elapsed_s=round(time.monotonic() - t0, 3),
+        )
+        if count:
+            swept[str(db_path)] = count
+    return swept
+
+
 def ensure_project_root(base_root: Path, project_name: str) -> Path:
     """Validate ``project_name`` against disk; return its session root.
 

@@ -7,6 +7,7 @@ the project-name injectivity guard against existing session roots.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -124,3 +125,63 @@ def test_stored_project_name_none_for_corrupt_db(
     assert any(
         r.get("event") == "session_project_name_unreadable" for r in capture_structlog
     )
+
+
+# ---------------------------------------------------------------------------
+# Launch crash-recovery sweep (M2-C)
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_dirty_sessions_covers_base_and_projects(tmp_path: Path) -> None:
+    """The launch sweep closes-as-dirty unclosed rows in BOTH the base
+    monitoring index and every project dir's archive.db, and reports
+    per-DB counts for exactly the DBs it swept."""
+    base = tmp_path / "archive"
+    base.mkdir()
+    # Base index: one crashed (open) row.
+    dao = ArchiveDao(base / "archive.db")
+    dao.start_session("h", "v", "c")
+    dao.close()
+    # Project A: one crashed row; project B: cleanly closed.
+    _make_project_db(base / "proj_b", "proj b")
+    a = base / "proj_a"
+    a.mkdir()
+    dao = ArchiveDao(a / "archive.db")
+    dao.start_session("h", "v", "c", project_name="proj a")
+    dao.close()
+
+    from echosmonitor.storage.sessions import sweep_dirty_sessions
+
+    swept = sweep_dirty_sessions(base)
+    assert swept == {
+        str(base / "archive.db"): 1,
+        str(a / "archive.db"): 1,
+    }
+    for db in (base / "archive.db", a / "archive.db"):
+        conn = sqlite3.connect(db)
+        try:
+            rows = conn.execute("SELECT ended_at, closed_dirty FROM sessions").fetchall()
+        finally:
+            conn.close()
+        assert all(r[0] is not None and r[1] == 1 for r in rows)
+    # Re-running sweeps nothing (idempotent).
+    assert sweep_dirty_sessions(base) == {}
+
+
+def test_sweep_missing_root_is_noop(tmp_path: Path) -> None:
+    from echosmonitor.storage.sessions import sweep_dirty_sessions
+
+    assert sweep_dirty_sessions(tmp_path / "nope") == {}
+
+
+def test_sweep_skips_corrupt_db(tmp_path: Path, capture_structlog) -> None:
+    base = tmp_path / "archive"
+    bad = base / "bad"
+    bad.mkdir(parents=True)
+    (bad / "archive.db").write_bytes(b"garbage, not sqlite")
+    _make_project_db(base / "ok", "ok")  # clean neighbour still visited
+
+    from echosmonitor.storage.sessions import sweep_dirty_sessions
+
+    assert sweep_dirty_sessions(base) == {}
+    assert any(r.get("event") == "session_sweep_db_failed" for r in capture_structlog)

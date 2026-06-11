@@ -22,6 +22,29 @@ def qapp_args() -> list[str]:
 
 
 @pytest.fixture(autouse=True)
+def _redirect_platformdirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route platformdirs' user_data_dir into the per-test directory.
+
+    Production code resolves the default archive root via
+    ``platformdirs.user_data_dir("echosmonitor", "EchosMonitor")``
+    (``core/session.resolve_base_archive_root``, the credentials file
+    fallback). Without this redirect, any test that constructs
+    ``MainWindow`` with a default config runs the M2-C launch
+    crash-recovery sweep against the USER'S REAL archive — opening,
+    migrating and mutating real session rows (the M0-C QSettings bug
+    class, code-reviewer blocker on the M2-C diff).
+    """
+    import platformdirs
+
+    fake_data_dir = tmp_path / "platformdirs-data"
+
+    def _fake_user_data_dir(*_args: object, **_kwargs: object) -> str:
+        return str(fake_data_dir)
+
+    monkeypatch.setattr(platformdirs, "user_data_dir", _fake_user_data_dir)
+
+
+@pytest.fixture(autouse=True)
 def _redirect_qsettings(tmp_path: Path) -> None:
     """Route QSettings to a per-test directory so tests never touch the user's
     real settings store.

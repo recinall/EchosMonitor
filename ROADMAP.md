@@ -308,13 +308,25 @@ Goal: rules 13–14 implemented end to end.
       session-DB open (`close_dirty_sessions` — M2-C wires the launch
       sweep); tests in `tests/core/test_session.py` +
       `tests/core/test_engine_sessions.py`.
-- [ ] **C. UI**: global Session toolbar (project name, ▶ Monitor, ⏺ Record,
+- [x] **C. UI**: global Session toolbar (project name, ▶ Monitor, ⏺ Record,
       ⏹ Stop, elapsed, bytes written) + per-device state badges
       Idle/Monitoring/Recording. Crash-recovery: an unclosed session is
       closed-as-dirty on next launch (log + DB flag).
+      *Done 2026-06-11:* `gui/widgets/session_toolbar.py` (Monitor =
+      per-device `start_monitoring` over idle devices; Record… = the
+      M2-B-deferred `NewSessionDialog` → `start_session`; Stop = global
+      `engine.stop()`; status label shows project · elapsed ·
+      bytes-this-session via per-member baselines); DevicePanel gained
+      the Acq badge column (Idle/Monitoring/● REC); launch sweep
+      `sweep_dirty_sessions(resolve_base_archive_root(cfg))` runs
+      synchronously in `MainWindow.__init__` before the engine exists.
+      Tests: `tests/gui/test_session_toolbar.py` (full acceptance cycle
+      end-to-end against a fake server) + panel/MainWindow additions.
 
 Acceptance: launch → nothing connects; Monitor shows live traces with zero
 disk writes; Record creates `<project>/` SDS tree; Stop closes session row.
+**Met 2026-06-11** — pinned end-to-end by
+`test_toolbar_monitor_record_stop_cycle` (+ the M2-A/B engine suites).
 
 ## M3 — Archive: sessions browser + missing features
 
@@ -465,6 +477,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M2-B: project-name injectivity is checked against **disk** (raw name read from the existing project dir's own archive.db); unverifiable dirs (no DB) are allowed with a loud log | Unlike device names (collision domain = one config, checked at load), project names accumulate over time; the project's DB is the only durable home of the raw name. Files win over the index (rule 8) so an unprovable collision must not block recording. |
 | 2026-06-11 | M2-B: New-session dialog deferred to **M2-C** | It is pure UI and shares the toolbar's wiring; B's engine API (`start_session(project, devices)`) is exactly the dialog's contract. |
 | 2026-06-11 | M2-B: per-device `archive.root_dir` overrides keep working (`<override>/<project>/<device>/…`) but the project injectivity guard runs only against the **app base root** | The session's `archive.db` (the only durable home of the raw name) lives at the app-base session root; an override dir has no DB to check against, so a guard there could only ever warn-unverified. Multi-root sessions are an edge config; revisit if the field uses them. |
+| 2026-06-11 | M2-C: toolbar **Stop = global `engine.stop()`** (session closes + every device Idle), not per-device stops or end_session-only | One bounded parallelised call (rule 7), one unmistakable end state (rule 13). Per-device control stays available via future panel actions; the engine API already supports it. |
+| 2026-06-11 | M2-C: crash-recovery sweep runs **synchronously in `MainWindow.__init__`** before the engine exists, gated by a **QLockFile** on the base root | Rule 13 guarantees nothing in THIS process touches the DBs at launch; the lock closes the cross-process hole (a second instance must not dirty-close a session another instance is recording — qt-concurrency-auditor F4). A crashed holder's lock is stale (dead pid) and reclaimed, so the sweep still runs after real crashes. Pre-event-loop bootstrap I/O, per-DB elapsed-logged, OSError-contained. |
+| 2026-06-11 | M2-C reviews: tests redirect `platformdirs.user_data_dir` into the per-test tmp (autouse conftest fixture + pin) | Code-reviewer BLOCKER: default-config MainWindow tests ran the launch sweep against the user's REAL `~/.local/share/echosmonitor/archive` (the M0-C QSettings bug class — no damage occurred only because the dir didn't exist yet). Also from review: panel badge slot no longer resurrects removed-device rows (ghost class); toolbar bytes baselines snapshot on first sight in `_refresh` (no lifetime-counter flash); engine `stop()` flips `_started` before its event barrier so a pre-posted config diff can't spawn an orphaned worker mid-teardown (regression-tested). |
 | 2026-06-11 | M2-B reviews: session transitions are guarded (`_session_transition` flag + `ExcludeUserInputEvents` on every absorb barrier; config diffs re-queue past the swap); `start_session` absorbs queued DSP-thread detections BEFORE the DAO swap; a failed swap restores the sessionless detection index; `started_at` fetched by row id; base index sweeps crash-dirty rows on open | qt-concurrency-auditor F1/F2/F4/F5 + code-reviewer majors 1–2, minors 4–5 on the M2-B diff: `processEvents()` inside the swap could dispatch a reentrant `start_session`/click and route the old session's queued `flushedFile`/detection events into the NEW project's DB; `list_sessions(limit=1)` provenance could be fooled by a crash-dirty future-dated row. DAO lifetime is now documented as per-context on `archive_dao()`; consumer re-resolution is the contract (stale-reference rewiring lands with M2-C/M3-A). |
 
 ## Open questions (resolve before the milestone that needs them)

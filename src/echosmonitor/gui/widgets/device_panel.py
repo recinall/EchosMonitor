@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from echosmonitor.core.exceptions import ConfigError
-from echosmonitor.core.models import ConnState, EchosDeviceSnapshot
+from echosmonitor.core.models import AcquisitionState, ConnState, EchosDeviceSnapshot
 
 if TYPE_CHECKING:
     from echosmonitor.core.config_store import ConfigStore
@@ -91,13 +91,27 @@ _FAILURE_KIND_HUMANIZED: dict[str, str] = {
 _MISCONFIG_BADGE_SUFFIX = " (!)"
 
 _COL_NAME = 0
-_COL_STATE = 1
-_COL_DIAG = 2
-_COL_STATS = 3
+# M2-C: per-device acquisition badge (rule 13 — the user state must be
+# unmistakable). Idle / Monitoring / ● REC, driven by the engine's
+# acquisitionStateChanged signal + the 1 Hz stats refresh.
+_COL_ACQ = 1
+_COL_STATE = 2
+_COL_DIAG = 3
+_COL_STATS = 4
 # M1-C: Echos firmware status (fw / uptime / clients / ring / GNSS /
 # calibration) fed by the EchosStatusWorker poller. Empty for generic
 # SeedLink devices (no ``echos:`` config section).
-_COL_ECHOS = 4
+_COL_ECHOS = 5
+
+# M2-C acquisition badges (rule 13): the Recording badge is loud red,
+# Idle is dim — the current user state must be unmistakable at a glance.
+_ACQ_BADGES = {
+    AcquisitionState.IDLE: "Idle",
+    AcquisitionState.MONITORING: "Monitoring",
+    AcquisitionState.RECORDING: "\u25cf REC",
+}
+_ACQ_REC_COLOR = "#d04040"
+_ACQ_IDLE_COLOR = "#808080"
 
 # Echos column render colours: healthy text uses the default palette;
 # a failed poll renders dim amber so it reads as "stale/unreachable",
@@ -263,8 +277,8 @@ class DevicePanel(QDockWidget):
         self._stack = QStackedWidget(self._body)
 
         self._tree = QTreeWidget(self._stack)
-        self._tree.setColumnCount(5)
-        self._tree.setHeaderLabels(["Stream", "State", "Diagnostics", "Stats", "Echos"])
+        self._tree.setColumnCount(6)
+        self._tree.setHeaderLabels(["Stream", "Acq", "State", "Diagnostics", "Stats", "Echos"])
         self._tree.setRootIsDecorated(True)
         self._tree.setUniformRowHeights(True)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -279,6 +293,7 @@ class DevicePanel(QDockWidget):
         # leftmost) and let the expendable Stats column be the elastic one
         # that absorbs/yields width instead.
         header.setSectionResizeMode(_COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(_COL_ACQ, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COL_STATE, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COL_DIAG, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COL_STATS, QHeaderView.ResizeMode.Stretch)
@@ -433,6 +448,32 @@ class DevicePanel(QDockWidget):
     # Slots
     # ------------------------------------------------------------------
     @Slot(str, int)
+    def on_acquisition_state(self, device_name: str, state: int) -> None:
+        """Render the per-device acquisition badge (M2-C, rule 13).
+
+        Wired QueuedConnection from ``engine.acquisitionStateChanged``;
+        the 1 Hz stats refresh re-asserts the badge so a missed emit
+        self-heals within a tick.
+        """
+        try:
+            acq = AcquisitionState(state)
+        except ValueError:
+            return
+        item = self._device_items.get(device_name)
+        if item is None:
+            # Do NOT create a row here. The engine's removal path emits
+            # a queued IDLE for the dying device BEFORE devicesChanged
+            # tears the row down via the direct _refresh_from_store —
+            # FIFO inversion means this slot can run after the removal,
+            # and resurrecting the row would leave a permanent phantom
+            # (POSTMORTEMS 2026-06-01 class: a queued meta-call posted
+            # before teardown still dispatches after it). A device the
+            # panel doesn't know yet gets its badge on the next
+            # on_device_state / stats tick instead.
+            return
+        self._set_acq_badge(item, acq)
+
+    @Slot(str, int)
     def on_device_state(self, device_name: str, state: int) -> None:
         item = self._device_items.get(device_name)
         if item is None:
@@ -503,12 +544,23 @@ class DevicePanel(QDockWidget):
     def _add_device_row(self, device_name: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem(
             self._tree,
-            [device_name, ConnState.DISCONNECTED.name, "", "", ""],
+            [device_name, _ACQ_BADGES[AcquisitionState.IDLE], ConnState.DISCONNECTED.name, "", "", ""],
         )
         item.setForeground(_COL_STATE, QBrush(QColor(_STATE_COLORS[int(ConnState.DISCONNECTED)])))
         self._tree.addTopLevelItem(item)
         self._device_items[device_name] = item
+        if self._engine is not None:
+            self._set_acq_badge(item, self._engine.acquisition_state(device_name))
         return item
+
+    def _set_acq_badge(self, item: QTreeWidgetItem, state: AcquisitionState) -> None:
+        item.setText(_COL_ACQ, _ACQ_BADGES[state])
+        if state is AcquisitionState.RECORDING:
+            item.setForeground(_COL_ACQ, QBrush(QColor(_ACQ_REC_COLOR)))
+        elif state is AcquisitionState.MONITORING:
+            item.setForeground(_COL_ACQ, QBrush(self.palette().text().color()))
+        else:
+            item.setForeground(_COL_ACQ, QBrush(QColor(_ACQ_IDLE_COLOR)))
 
     @Slot()
     def _refresh_stats(self) -> None:
@@ -532,6 +584,8 @@ class DevicePanel(QDockWidget):
             item.setToolTip(_COL_NAME, tooltip)
             item.setToolTip(_COL_DIAG, tooltip)
             self._apply_misconfig_suffix(item, status)
+            if self._engine is not None:
+                self._set_acq_badge(item, self._engine.acquisition_state(name))
 
     def _apply_misconfig_suffix(self, item: QTreeWidgetItem, status: DeviceStatus) -> None:
         """Append/strip a ``(!)`` suffix on the state badge for misconfig states.

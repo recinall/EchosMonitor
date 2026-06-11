@@ -36,7 +36,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-import platformdirs
 import structlog
 import yaml
 from obspy import UTCDateTime as _UTCDateTime
@@ -1035,6 +1034,18 @@ class StreamingEngine(QObject):
             return
         if not self._started:
             return
+        # Flip _started FIRST, before any barrier in this teardown: a
+        # queued configChanged meta-call posted before the disconnect
+        # below survives it (POSTMORTEMS 2026-06-01) and would otherwise
+        # dispatch inside this method's processEvents with the guard
+        # still open — _on_config_changed could then restart a non-idle
+        # device, registering a fresh QThread that the remaining
+        # teardown clears from ``_threads`` without ever quitting it
+        # (the M3-prep segfault class). ``_on_config_changed`` guards on
+        # ``_started``; the early flip closes that window. Reentrant
+        # direct-connected receivers of the late IDLE/session emits get
+        # the same protection for free.
+        self._started = False
         # Detach from the ConfigStore first so a queued ``configChanged``
         # event in flight cannot fire after we've torn down the engine
         # state it would mutate.
@@ -1190,13 +1201,10 @@ class StreamingEngine(QObject):
             self._chain_max_q_by_key.clear()
             self._chain_drops_pending.clear()
             self._chain_drops_last_log.clear()
-        # Flip _started BEFORE announcing IDLE / session end: the emits
-        # are direct same-thread calls, and a receiver that re-entrantly
-        # invokes start_monitoring() (or start_session()) from its
-        # handler must hit a fully stopped engine (_ensure_started
-        # reboots the infrastructure) rather than a half-torn-down one
-        # that still claims _started.
-        self._started = False
+        # ``_started`` flipped at the top of this method — by the time
+        # the IDLE / session-end announcements below reach a reentrant
+        # direct-connected receiver, the engine is fully torn down and
+        # ``_ensure_started`` would reboot it cleanly.
         for dev_name in list(self._acq_state):
             self._set_acq_state(dev_name, AcquisitionState.IDLE)
         if session_was_active:
@@ -2036,10 +2044,12 @@ class StreamingEngine(QObject):
         index (:meth:`_ensure_archive_dao`), the base ``start_session``
         roots projects under (``ensure_project_root``), and the
         device-less branch of the public :meth:`archive_root` accessor.
+        Delegates to :func:`core.session.resolve_base_archive_root` so
+        the launch-time crash-recovery sweep resolves identically.
         """
-        if self._cfg.app.archive_root is not None:
-            return Path(self._cfg.app.archive_root)
-        return Path(platformdirs.user_data_dir("echosmonitor", "EchosMonitor")) / "archive"
+        from echosmonitor.core.session import resolve_base_archive_root
+
+        return resolve_base_archive_root(self._cfg)
 
     @staticmethod
     def _device_has_detection(dev_cfg: DeviceConfig) -> bool:
@@ -2248,9 +2258,7 @@ class StreamingEngine(QObject):
         """
         if dev_cfg.archive.root_dir is not None:
             return Path(dev_cfg.archive.root_dir)
-        if self._cfg.app.archive_root is not None:
-            return Path(self._cfg.app.archive_root)
-        return Path(platformdirs.user_data_dir("echosmonitor", "EchosMonitor")) / "archive"
+        return self._resolve_db_root()
 
     def _setup_archive_writer(self, dev_cfg: DeviceConfig) -> None:
         name = dev_cfg.name

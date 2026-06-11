@@ -75,3 +75,49 @@ def test_stream_column_survives_a_squeezed_dock(qtbot) -> None:
     header = panel._tree.header()
     needed = QFontMetrics(panel._tree.font()).horizontalAdvance(max(_NSLCS, key=len))
     assert header.sectionSize(0) >= needed
+
+
+def test_acquisition_badge_renders_states(qtbot) -> None:
+    """M2-C (rule 13): the Acq column renders Idle / Monitoring / ● REC
+    from the engine's acquisitionStateChanged payloads."""
+    from echosmonitor.core.models import AcquisitionState
+    from echosmonitor.gui.widgets.device_panel import _COL_ACQ
+
+    panel = DevicePanel()
+    qtbot.addWidget(panel)
+    panel.on_device_state("dev", int(ConnState.CONNECTED))
+    item = panel._device_items["dev"]
+    assert item.text(_COL_ACQ) == "Idle"
+
+    panel.on_acquisition_state("dev", int(AcquisitionState.MONITORING))
+    assert item.text(_COL_ACQ) == "Monitoring"
+
+    panel.on_acquisition_state("dev", int(AcquisitionState.RECORDING))
+    assert item.text(_COL_ACQ) == "● REC"
+
+    panel.on_acquisition_state("dev", int(AcquisitionState.IDLE))
+    assert item.text(_COL_ACQ) == "Idle"
+
+    # Unknown int payload is ignored (rule-4 guard), badge unchanged.
+    panel.on_acquisition_state("dev", 99)
+    assert item.text(_COL_ACQ) == "Idle"
+
+
+def test_acquisition_badge_does_not_resurrect_removed_device(qtbot) -> None:
+    """A queued IDLE for a just-removed device must NOT recreate its row
+    (the engine announces IDLE before the direct devicesChanged path
+    tears the row down — FIFO inversion; qt-concurrency-auditor F1 on
+    the M2-C diff, same ghost class as the M1-C Echos finding)."""
+    from echosmonitor.core.models import AcquisitionState
+
+    panel = DevicePanel()
+    qtbot.addWidget(panel)
+    panel.on_device_state("dev", int(ConnState.CONNECTED))
+    # Simulate the removal path: row gone, then the late queued IDLE lands.
+    item = panel._device_items.pop("dev")
+    idx = panel._tree.indexOfTopLevelItem(item)
+    panel._tree.takeTopLevelItem(idx)
+
+    panel.on_acquisition_state("dev", int(AcquisitionState.IDLE))
+    assert "dev" not in panel._device_items
+    assert panel._tree.topLevelItemCount() == 0

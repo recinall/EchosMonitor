@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from obspy import UTCDateTime
 from PySide6.QtCore import QByteArray, QSettings
-from PySide6.QtWidgets import QDockWidget, QLabel, QTabWidget
+from PySide6.QtWidgets import QDockWidget, QLabel, QTabWidget, QToolBar
 from pytestqt.qtbot import QtBot
 
 from echosmonitor.config.loader import load_config
@@ -294,3 +294,51 @@ def test_close_event_is_reentrant(qtbot: QtBot) -> None:
     window.close()
     assert not window._echos_thread.isRunning()
     window.close()  # must return, not hang
+
+
+def test_launch_has_session_toolbar_and_sweeps_crashed_sessions(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """M2-C: MainWindow exposes the session toolbar and the launch
+    crash-recovery sweep closes-as-dirty any session a crash left open."""
+    from echosmonitor.storage.dao import ArchiveDao
+
+    archive_root = tmp_path / "archive"
+    crashed = archive_root / "proj"
+    crashed.mkdir(parents=True)
+    dao = ArchiveDao(crashed / "archive.db")
+    dao.start_session("h", "v", "c", project_name="proj")  # never ended
+    dao.close()
+
+    cfg = _root_cfg(devices=[_device("dev-a", [])])
+    cfg = cfg.model_copy(update={"app": cfg.app.model_copy(update={"archive_root": archive_root})})
+    window = MainWindow(cfg, tmp_path / "cfg.yaml")
+    qtbot.addWidget(window)
+    try:
+        toolbar = window.findChild(QToolBar, "SessionToolbar")
+        assert toolbar is not None
+        label = window.findChild(QLabel, "SessionStatusLabel")
+        assert label is not None and label.text() == "Idle"
+
+        import sqlite3
+
+        conn = sqlite3.connect(crashed / "archive.db")
+        try:
+            row = conn.execute("SELECT ended_at, closed_dirty FROM sessions").fetchone()
+        finally:
+            conn.close()
+        assert row[0] is not None
+        assert row[1] == 1
+    finally:
+        window.close()
+
+
+def test_default_config_resolves_archive_root_inside_test_tmp(tmp_path: Path) -> None:
+    """Suite-isolation pin (code-reviewer blocker on the M2-C diff): with
+    a default config (archive_root=None) the platformdirs fallback must
+    resolve INSIDE the per-test tmp dir — otherwise every MainWindow
+    test sweeps (and schema-migrates) the user's real archive at launch."""
+    from echosmonitor.core.session import resolve_base_archive_root
+
+    root = resolve_base_archive_root(_root_cfg([]))
+    assert str(root).startswith(str(tmp_path)), root

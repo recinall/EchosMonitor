@@ -299,7 +299,14 @@ def test_resolve_archive_root_per_device_override(
 
 
 def test_resolve_archive_root_platformdirs_fallback() -> None:
-    """When both per-device and top-level are None, platformdirs is used."""
+    """When both per-device and top-level are None, the platformdirs
+    fallback is used — asserted via delegation to the single base-root
+    definition (``resolve_base_archive_root``), because the suite-wide
+    conftest redirect points platformdirs at the per-test tmp dir (the
+    M2-C suite-isolation blocker) so the real org/app path never
+    appears in tests."""
+    from echosmonitor.core.session import resolve_base_archive_root
+
     cfg = _make_root_cfg(
         devices=[
             DeviceConfig(
@@ -313,6 +320,5 @@ def test_resolve_archive_root_platformdirs_fallback() -> None:
     )
     engine = StreamingEngine(cfg)
     resolved = engine._resolve_archive_root(cfg.devices[0])
-    # platformdirs path includes the org/app components we passed.
-    assert "echosmonitor" in str(resolved) or "EchosMonitor" in str(resolved)
+    assert resolved == resolve_base_archive_root(cfg)
     assert resolved.name == "archive"

@@ -11,12 +11,14 @@ detach (Ctrl+Shift+N) layered on by M7.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
 from PySide6.QtCore import (
     QByteArray,
+    QLockFile,
     QMetaObject,
     QRect,
     QSettings,
@@ -64,6 +66,7 @@ from echosmonitor.core.hvsr_engine import HvsrEngine
 from echosmonitor.core.info_worker import InfoWorker
 from echosmonitor.core.models import EchosPollTarget
 from echosmonitor.core.response import ResponseProvider
+from echosmonitor.core.session import resolve_base_archive_root
 from echosmonitor.core.streaming_engine import StreamingEngine
 from echosmonitor.gui.dialogs.first_run_wizard import FirstRunWizard
 from echosmonitor.gui.dialogs.shortcuts_dialog import ShortcutsDialog
@@ -79,8 +82,10 @@ from echosmonitor.gui.widgets.hvsr_widget import HvsrWidget
 from echosmonitor.gui.widgets.live_stack import LiveStack
 from echosmonitor.gui.widgets.live_tabs import LiveTabs
 from echosmonitor.gui.widgets.psd_widget import PsdWidget
+from echosmonitor.gui.widgets.session_toolbar import SessionToolbar
 from echosmonitor.gui.widgets.spectrogram_dock import SpectrogramDock
 from echosmonitor.gui.widgets.station_browser import StationBrowser
+from echosmonitor.storage.sessions import sweep_dirty_sessions
 from echosmonitor.utils.docs import find_manual_tests
 
 if TYPE_CHECKING:
@@ -242,6 +247,38 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("EchosMonitor")
         self.resize(_DEFAULT_WIDTH, _DEFAULT_HEIGHT)
         self.setObjectName("MainWindow")
+
+        # M2-C crash recovery: close-as-dirty every session left open by
+        # a crash, BEFORE the engine exists (rule 13 keeps everything
+        # idle at launch, so nothing in THIS process contends for the
+        # DBs and the engine's own live row can never be swept).
+        # Synchronous launch bootstrap, bounded by the project count;
+        # per-DB failures are logged and skipped inside. A QLockFile on
+        # the base root gates the sweep against OTHER EchosMonitor
+        # instances: a second instance must not dirty-close a session
+        # row the first is actively recording (it is indistinguishable
+        # from a crash leftover). The lock is held for the app's
+        # lifetime; a crashed holder's lock is auto-detected as stale
+        # (dead pid) and reclaimed, so the sweep still runs after a
+        # real crash — exactly when it matters.
+        base_root = resolve_base_archive_root(config)
+        base_root.mkdir(parents=True, exist_ok=True)
+        self._instance_lock = QLockFile(str(base_root / ".echosmonitor.lock"))
+        sweep_t0 = time.monotonic()
+        _log.info("session_crash_recovery_sweep_started", root=str(base_root))
+        if self._instance_lock.tryLock(0):
+            swept = sweep_dirty_sessions(base_root)
+            _log.info(
+                "session_crash_recovery_sweep_done",
+                swept=swept,
+                elapsed_s=round(time.monotonic() - sweep_t0, 3),
+            )
+        else:
+            _log.warning(
+                "session_crash_recovery_sweep_skipped",
+                root=str(base_root),
+                reason="another EchosMonitor instance holds the archive lock",
+            )
 
         # ConfigStore (M4 stage B) is the single writer of the user
         # YAML at runtime. The engine subscribes to it for hot-reload;
@@ -429,6 +466,10 @@ class MainWindow(QMainWindow):
         self._build_focus_machinery()
         self._build_menubar()
         self._build_status_bar()
+        # M2-C: the session toolbar is the user's acquisition surface
+        # (rule 13) — Monitor / Record… / Stop + live session status.
+        self._session_toolbar = SessionToolbar(self._engine, self)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._session_toolbar)
         self._wire_engine()
         self._restore_state()
         # Reopen the last-used Live tab (by device name). The target tab
@@ -438,12 +479,12 @@ class MainWindow(QMainWindow):
         self._live_tabs.restore_active_tab()
 
         # Rule 13: the engine NEVER autostarts. Every device launches
-        # IDLE; acquisition begins only when the user explicitly starts
-        # Monitoring/Recording (M2-C surfaces the controls). The
-        # recent-detections prefill that used to follow autostart is
-        # gone with it — the engine has no DAO until a device starts, so
-        # the table fills from live sessions only (M2-B will restore
-        # history through the sessions index).
+        # IDLE; acquisition begins only when the user acts on the
+        # session toolbar (or the device panel). The recent-detections
+        # prefill that used to follow autostart is gone with it — the
+        # engine has no DAO until a device starts, so the table fills
+        # from live sessions only (M3-A restores history through the
+        # sessions index).
         _log.info(
             "streaming_engine_idle",
             reason="acquisition is user-controlled (rule 13)",
@@ -1201,6 +1242,12 @@ class MainWindow(QMainWindow):
         # Same-thread connections (Auto resolves to Direct); cross-thread is
         # already Queued inside the engine. No explicit Queued needed here.
         self._engine.deviceStateChanged.connect(self._device_panel.on_device_state)
+        # M2-C acquisition badges (rule 13): queued so the panel's
+        # handler never runs re-entrantly inside an engine emit.
+        self._engine.acquisitionStateChanged.connect(
+            self._device_panel.on_acquisition_state,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
         self._engine.deviceStateChanged.connect(self._live_tabs.set_device_state)
         self._engine.newStreamSeen.connect(self._device_panel.on_new_stream)
         self._engine.newStreamSeen.connect(self._on_new_stream)

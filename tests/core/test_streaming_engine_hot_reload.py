@@ -365,3 +365,48 @@ def test_host_change_on_idle_device_does_not_start_it(
         assert engine._workers["dev-a"]._port == server_b.port
     finally:
         engine.stop()
+
+
+def test_config_diff_posted_before_stop_does_not_apply_mid_stop(
+    qtbot,
+    make_fake_server,  # noqa: F811
+    store_path,
+    capture_structlog,
+) -> None:
+    """A queued configChanged posted just before engine.stop() must NOT
+    apply its diff inside stop()'s processEvents barrier — that would
+    spawn a fresh worker thread the remaining teardown then orphans
+    (qt-concurrency-auditor F5 on the M2-C diff; the early
+    ``_started = False`` flip closes the window)."""
+    cfg_a = FakeSeedLinkServerConfig(network="IU", station="ANMO", location="00", channel="BHZ")
+    server_a: FakeSeedLinkServer = make_fake_server(cfg_a)
+    initial_device = _device_from_server("dev-a", server_a)
+    cfg = _make_root_cfg(devices=[initial_device])
+    store = ConfigStore(cfg, store_path)
+    engine = StreamingEngine(cfg, store=store)
+    engine.start()
+    try:
+        assert _wait_until(
+            lambda: (
+                engine.device_status().get("dev-a") is not None
+                and engine.device_status()["dev-a"].state == ConnState.CONNECTED
+            ),
+            timeout_s=5.0,
+            qtbot=qtbot,
+        )
+        # Post the queued configChanged, then stop in the SAME event-loop
+        # turn so the diff can only ever dispatch inside stop()'s
+        # processEvents barrier.
+        store.update_device(
+            "dev-a",
+            initial_device.model_copy(update={"port": initial_device.port + 1}),
+        )
+        engine.stop()
+        diff_events = [
+            r for r in capture_structlog if r.get("event") == "streaming_engine_config_diff"
+        ]
+        assert diff_events == [], "config diff applied mid-stop (orphaned-worker window)"
+        assert engine._workers == {}
+        assert engine._threads == {}
+    finally:
+        engine.stop()
