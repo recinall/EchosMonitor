@@ -28,7 +28,7 @@ from pathlib import Path
 
 import structlog
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Connection-level PRAGMAs. ``WAL`` lets readers and writers proceed
 # without blocking each other. ``synchronous=NORMAL`` is the standard
@@ -65,7 +65,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- open on a later launch and closed administratively rather than
     -- by the user. ended_at then records the close time, not the
     -- real end of recording.
-    closed_dirty INTEGER NOT NULL DEFAULT 0
+    closed_dirty INTEGER NOT NULL DEFAULT 0,
+    -- v5 (M3-D re-indexer): 1 when this row was SYNTHESIZED by the
+    -- re-indexer because the DB had no real session rows (an archive
+    -- copied without its DB). Sessions cannot be reconstructed from
+    -- the SDS tree: started/ended are the DATA EXTENT, project_name
+    -- is the directory name — honest fallbacks, flagged visibly.
+    reindexed    INTEGER NOT NULL DEFAULT 0
 );
 
 -- v4 (M2-B): which devices recorded into a session. Membership only
@@ -289,6 +295,10 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
     user-chosen name; NULL for the sessionless monitoring index) and
     ``closed_dirty`` (crash-recovery flag); ``session_devices`` records
     which devices recorded into each session.
+
+    v4 → v5 (M3-D): ``sessions`` gains ``reindexed`` — marks a session
+    row synthesized by the re-indexer for an archive whose DB was
+    missing (the real session metadata is unrecoverable from the tree).
     """
     if from_version == SCHEMA_VERSION:
         return
@@ -305,6 +315,11 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
         )
         conn.executescript(_SESSION_DEVICES_DDL)
         version = 4
+    if version == 4:
+        _add_column_if_missing(
+            conn, "sessions", "reindexed", "INTEGER NOT NULL DEFAULT 0"
+        )
+        version = 5
     if version != SCHEMA_VERSION:
         # Unknown / future version we don't know how to migrate. Leave
         # the DB untouched and surface it loudly rather than silently

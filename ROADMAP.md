@@ -463,8 +463,67 @@ at `storage/sds.py:130–168` has zero callers).
         + worker/storage suites (gap-split roundtrip, CSV grid + gap
         cells, serial-queue-not-latest-wins, shutdown-during-busy
         leaves no artifact and restarts, mixed-rate CSV refusal).
-- [ ] **D. Re-indexer**: rebuild the DB from the SDS tree
+- [x] **D. Re-indexer**: rebuild the DB from the SDS tree
       (`parse_sds_path` exists) for archives copied from another machine.
+      *Done 2026-06-11* (decisions in the log):
+  - [x] `storage/reindex.py` (`reindex_session_root`, Qt-free — progress
+        and cancel are plain callables, rule 2): walks
+        `<session_root>/<device>/<SDS…>` via `parse_sds_path` (device
+        segment read from the path above `<year>`, per the skill); spans
+        from obspy headonly reads, bytes from `stat` (rule 9); `files`
+        rows upserted in place via the new `ArchiveDao.replace_file`
+        (overwrites `t_start` — disk truth, unlike the live writer's
+        `record_file`); rows whose path no longer exists are pruned;
+        per-stream `total_bytes` recomputed as SUM(files.bytes); device
+        dirs map onto existing device rows by sanitized raw name (never
+        a duplicate). Dirty/foreign files (non-SDS names, unreadable
+        MiniSEED, header NSLC ≠ path) are skipped PER FILE, counted,
+        never fatal. Idempotent; cancellation leaves a safe partial
+        index (re-run converges).
+  - [x] schema v5: `sessions.reindexed` flags THE synthesized session
+        row (at most one per DB, upserted in place) written only when
+        the DB holds no real session rows: span = data extent, project
+        name = directory name, membership = device dirs found.
+        `list_sessions` reads the column behind a `pragma table_info`
+        guard so read-only browses of pre-v5 DBs keep working
+        unmigrated (rule 8).
+  - [x] `core/archive_reindex_worker.py`: serial-queue worker on the
+        M3-C export skeleton (same shutdown-only stop + queued clear
+        semantics, same auditor reasoning); progress beats throttled to
+        10/s; per-file cooperative stop poll (rule 7). Skill §7 pinned:
+        start→stop→start, shutdown-during-busy bounded.
+  - [x] Archive tab: "Re-index…" beside Refresh → directory picker
+        restricted to direct children of the base root (where discovery
+        looks); progress + honest completion report in the browser
+        status (kept through the automatic refresh via a one-shot
+        notice — the refresh used to erase it, caught by the e2e test);
+        "re-indexed" status chip + tooltip on synthesized rows.
+  - [x] active-session guard in the main window (rule 4 keeps it out of
+        the widget/loader): a target whose `archive.db` resolves to
+        `engine.archive_db_path()` is refused loudly — the engine is
+        writing that DB. Other roots stay re-indexable mid-session;
+        cross-process safety is the app-lifetime QLockFile on the base
+        root (M2-C).
+  - [x] acceptance pinned end-to-end:
+        `test_copied_archive_reindex_then_browse_and_load` (copied SDS
+        tree, no DB → real worker → browser lists the re-indexed row →
+        waveforms load, engine fully idle) + storage suite (stale-DB
+        counts corrected from disk truth incl. foreign-machine paths
+        pruned, raw-device-name mapping, idempotency, cancel/converge,
+        dirty-files-never-fatal) + worker lifecycle suite.
+  - [x] review findings fixed, all regression-tested (majors in the
+        decision log): prune by run membership (code-reviewer M1);
+        session-start guard against in-flight re-index roots
+        (code-reviewer M2 TOCTOU, via `SessionToolbar.set_session_start_guard`);
+        late `finished` after closeEvent no longer resurrects the
+        just-joined browser thread (qt-auditor BLOCKER — handlers gate
+        on `_archive_bridge_severed`); `should_stop` polled in the scan
+        and prune phases too (both reviewers, rule 7); device-name
+        collisions in foreign DBs resolved deterministically (lowest id,
+        warned); device rows never fabricate host/port from the
+        re-indexing machine; the completion notice survives an active
+        filter; pre-v5 read-only `list_sessions` pinned; non-canonical
+        dir names warned at synthesis.
 - [x] **E. Hand-offs**: Archive → HVSR keeps working with the session-rooted
       reader.
       *Done 2026-06-11.* The seam itself landed in M3-A
@@ -626,6 +685,15 @@ launch on a clean machine of each OS and complete the M2 happy path
 
 | 2026-06-11 | M3-C: the export worker is a **serial queue**, not latest-wins; its stop flag is shutdown-only and re-armed ONLY via the queued clear | An export is an explicit "save this file" — a second request cancelling the first is data loss, the inverse of the read loaders' supersede semantics. Without a token supersede, the loaders' synchronous stop-clear idiom is unsafe (it could resurrect an export queued behind a shutdown on the restart path — auditor finding); queue FIFO drains stale requests against the still-set flag before the queued clear lands. The request seam is deliberately uncapped (rule 5 deviation): drop-oldest is wrong for saves, and each request costs one application-modal dialog — click-bounded. |
 | 2026-06-11 | M3-C: exports re-read the interval from the archive (split stream → MiniSEED; shared grid → CSV), never the on-screen arrays; mixed-rate groups refuse the CSV grid | The MiniSEED files are the source of truth (rule 8) — re-reading preserves dtype/encoding bit-identically and exports work without rendering; the display pipeline is float64 with NaN gap-breaks, a render not an archive format. A CSV is one grid: components at different rates get a clear refusal, not resampling. |
+
+| 2026-06-11 | M3-E: archive-only hand-off stations are merged into the HVSR widget's combos (tagged "(archive)") but can NEVER start a LIVE measurement | With the engine idle a closed session's station has no live buffers: unmergeable = "Run on archive" silently no-ops (the gap the e2e test exposed); but a merged station passing the live-start gate would make `start_measurement` wait forever for windows that cannot arrive — the same silent-no-op bug on the other path. Live Start is gated on live-buffer membership with an honest tooltip. |
+| 2026-06-11 | M3-D: re-indexed sessions get a SYNTHESIZED row (`sessions.reindexed`, schema v5) — span = data extent, name = directory name, membership = device dirs; at most one per DB, never written when real session rows exist | Sessions cannot be reconstructed from the tree, and `sessions.project_name` was the raw name's only durable home — a missing DB loses it irrecoverably; the dir name is the honest fallback and the flag keeps the synthesis visible (browser chip + tooltip) instead of masquerading as a real record. Real rows are the durable session history and must never be shadowed or duplicated. |
+| 2026-06-11 | M3-D: `ArchiveDao.replace_file` (a second files upsert that overwrites `t_start`) exists ONLY for the re-indexer; the live writer keeps `record_file`'s t_start-preserving semantics | The live writer's first-write `t_start` is correct for a file it is appending to; the re-indexer's job is the opposite — make the row mirror the file as it exists NOW (rules 8/9). One method serving both would silently pick a side. Per-stream `total_bytes` is recomputed from the corrected rows (packet counters are left alone — packet history is unreconstructable). |
+| 2026-06-11 | M3-D: stale `files` rows are pruned by **run membership** (any row this run did not upsert), NOT by disk existence | Code-reviewer major: `files.path` is absolute, so an existence check keeps rows pointing into a same-machine duplicate's ORIGINAL tree (the most common "copied archive") — indexing files outside the session root (rule 14) and folding foreign bytes into `total_bytes` (rule 9) — and keeps stale rows for files this run refused as dirty. A completed run's candidate set is exhaustive for the root, so non-membership is the exact prune predicate; cancelled runs skip the prune entirely. |
+| 2026-06-11 | M3-D: the session toolbar consults a main-window **start guard** — a project whose root has a re-index in flight cannot start recording (the inverse of the active-session guard) | Code-reviewer major (TOCTOU): the request-time guard stops re-indexing the active session, but nothing stopped a session from STARTING into a root mid-re-index — the engine's DAO and the re-index DAO would write one archive.db concurrently (rule 8; `refresh_stream_byte_totals` clobbering live `record_packet`, the synthesized-row check racing `start_session`). MainWindow owns both sides: it records the in-flight root and vetoes via `SessionToolbar.set_session_start_guard` with a user-facing reason; cleared on done/failed. Direct engine calls (tests/headless) bypass it knowingly — the UI is the only concurrent path. |
+| 2026-06-11 | M3-D: `list_sessions` reads `reindexed` behind a `pragma table_info` guard instead of requiring schema v5 | The M3-A browser opens every DB read-only WITHOUT migration (rule 8); an unconditional `SELECT reindexed` would break browsing every existing pre-v5 archive. The pragma costs one statement per (bounded) listing call. |
+| 2026-06-11 | M3-D: re-index targets are restricted to DIRECT CHILDREN of the base archive root; the active session's DB is refused at the main-window seam | Discovery only scans base-rooted project dirs (M3-A decision) — re-indexing anywhere else would "succeed" into invisibility; the picker therefore enforces the same scope. The ACTIVE session's `archive.db` is held open and written by the engine (rule 8) — re-indexing it would race the live writer; the guard compares against `engine.archive_db_path()` in the main window (rule 4: the widget and the loader never see the engine). Cross-process: the app-lifetime QLockFile (M2-C) already keeps other instances from recording under this root. |
+| 2026-06-11 | M3-D: the re-index worker reuses the M3-C serial-queue semantics (shutdown-only stop, queued clear re-arm); completion reports survive the auto-refresh via a one-shot notice | A re-index is an explicit action on a directory — supersede semantics would cancel work the user asked for; the stop/clear reasoning is identical to the export auditor finding. The tab's refresh used to overwrite the completion report within one event-loop turn (caught by the e2e test): the notice is consumed by exactly one `_populate_sessions` pass. |
 
 ## Open questions (resolve before the milestone that needs them)
 

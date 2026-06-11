@@ -34,6 +34,8 @@ from echosmonitor.gui.dialogs.new_session_dialog import NewSessionDialog
 from echosmonitor.storage.sessions import ProjectNameCollisionError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from echosmonitor.core.streaming_engine import StreamingEngine
 
 _log = structlog.get_logger(__name__)
@@ -66,6 +68,11 @@ class SessionToolbar(QToolBar):
         self.setObjectName("SessionToolbar")
         self.setMovable(False)
         self._engine = engine
+        # Optional host veto consulted before start_session (M3-D: the
+        # main window refuses a project whose root is being re-indexed —
+        # two writers on one archive.db, rule 8). Returns a user-facing
+        # reason string to refuse, None to allow.
+        self._start_guard: Callable[[str], str | None] | None = None
 
         self._action_monitor = QAction("▶ Monitor", self)
         self._action_record = QAction("⏺ Record…", self)
@@ -122,6 +129,10 @@ class SessionToolbar(QToolBar):
         _log.info("session_toolbar_monitor_clicked", started=started)
         self._refresh()
 
+    def set_session_start_guard(self, guard: Callable[[str], str | None]) -> None:
+        """Install the host's veto over starting a session (see ctor note)."""
+        self._start_guard = guard
+
     def _on_record_clicked(self) -> None:
         if self._engine.active_session() is not None:
             return
@@ -131,6 +142,14 @@ class SessionToolbar(QToolBar):
             return
         project = dialog.project_name()
         devices = dialog.checked_devices()
+        if self._start_guard is not None:
+            veto = self._start_guard(project)
+            if veto is not None:
+                _log.warning(
+                    "session_toolbar_start_vetoed", project=project, reason=veto
+                )
+                QMessageBox.warning(self.parentWidget(), "Cannot start session", veto)
+                return
         try:
             self._engine.start_session(project, devices)
         except (SessionError, ProjectNameCollisionError, KeyError, sqlite3.Error, OSError) as exc:

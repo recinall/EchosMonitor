@@ -303,12 +303,18 @@ class ArchiveDao:
         """Most-recent-first session rows with device membership.
 
         Bounded read for the Archive tab's session browser (M3-A) and
-        tests; every field comes straight from the rows (rule 9).
+        tests; every field comes straight from the rows (rule 9). The
+        v5 ``reindexed`` column is read via a ``pragma table_info``
+        guard: read-only opens never migrate (rule 8), so a browsed
+        pre-v5 DB simply has no such column — its rows read ``False``.
         """
 
         def _select(cur: sqlite3.Cursor) -> list[SessionRecord]:
+            cols = {row[1] for row in cur.execute("PRAGMA table_info(sessions)")}
+            reindexed_sql = "reindexed" if "reindexed" in cols else "0 AS reindexed"
             rows = cur.execute(
-                "SELECT id, project_name, started_at, ended_at, closed_dirty, host"
+                "SELECT id, project_name, started_at, ended_at, closed_dirty, host,"
+                f" {reindexed_sql}"
                 " FROM sessions ORDER BY started_at DESC, id DESC LIMIT ?",
                 (max(0, limit),),
             ).fetchall()
@@ -328,6 +334,7 @@ class ArchiveDao:
                         closed_dirty=bool(row["closed_dirty"]),
                         host=row["host"],
                         devices=tuple(r["device_name"] for r in device_rows),
+                        reindexed=bool(row["reindexed"]),
                     )
                 )
             return records
@@ -453,6 +460,152 @@ class ArchiveDao:
 
         self.transactional(_upsert)
         self.commit_if_due()
+
+    # ------------------------------------------------------------------
+    # Re-indexer writes (M3-D — storage/reindex.py is the only caller)
+    # ------------------------------------------------------------------
+
+    def replace_file(
+        self,
+        stream_id: int,
+        path: Path,
+        t_start: UTCDateTime,
+        t_end: UTCDateTime,
+        n_bytes: int,
+    ) -> None:
+        """Upsert one ``files`` row from DISK truth — ``t_start`` included.
+
+        Unlike :meth:`record_file` (live writer: a re-touched file keeps
+        its original first-write ``t_start``), the re-indexer's row must
+        mirror what is actually in the file right now (rules 8/9) — a
+        stale row's preserved ``t_start`` would be exactly the lie the
+        re-index exists to correct.
+        """
+
+        def _upsert(cur: sqlite3.Cursor) -> None:
+            cur.execute(
+                "INSERT INTO files(stream_id, path, t_start, t_end, bytes,"
+                "                  last_modified_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(path) DO UPDATE SET"
+                "   stream_id=excluded.stream_id,"
+                "   t_start=excluded.t_start,"
+                "   t_end=excluded.t_end,"
+                "   bytes=excluded.bytes,"
+                "   last_modified_at=excluded.last_modified_at",
+                (stream_id, str(path), str(t_start), str(t_end), n_bytes, _now_iso()),
+            )
+
+        self.transactional(_upsert)
+        self.commit_if_due()
+
+    def all_file_rows(self) -> list[tuple[int, str]]:
+        """Every ``files`` row as ``(id, path)`` — the prune pass input."""
+
+        def _select(cur: sqlite3.Cursor) -> list[tuple[int, str]]:
+            rows = cur.execute("SELECT id, path FROM files ORDER BY id").fetchall()
+            return [(int(r["id"]), str(r["path"])) for r in rows]
+
+        return self.transactional(_select)
+
+    def delete_files(self, ids: Sequence[int]) -> int:
+        """Delete ``files`` rows by id; returns the number deleted."""
+        if not ids:
+            return 0
+
+        def _delete(cur: sqlite3.Cursor) -> int:
+            total = 0
+            for file_id in ids:
+                cur.execute("DELETE FROM files WHERE id=?", (file_id,))
+                total += cur.rowcount
+            return total
+
+        deleted = self.transactional(_delete)
+        self.flush_now()
+        return int(deleted)
+
+    def refresh_stream_byte_totals(self) -> None:
+        """Reset every stream's ``total_bytes`` to the SUM of its file rows.
+
+        Rule 9 at the call site: after a re-index the file rows mirror
+        the on-disk bytes, so the per-stream counter is recomputed from
+        them rather than from whatever a foreign/stale DB accumulated.
+        ``total_packets`` is left alone — packet history is a live-write
+        record the tree cannot reconstruct.
+        """
+
+        def _update(cur: sqlite3.Cursor) -> None:
+            cur.execute(
+                "UPDATE streams SET total_bytes ="
+                " (SELECT COALESCE(SUM(bytes), 0) FROM files"
+                "  WHERE files.stream_id = streams.id)"
+            )
+
+        self.transactional(_update)
+        self.flush_now()
+
+    def list_device_names(self) -> list[tuple[int, str]]:
+        """Every device row as ``(id, name)`` (raw, pre-sanitisation names)."""
+
+        def _select(cur: sqlite3.Cursor) -> list[tuple[int, str]]:
+            rows = cur.execute("SELECT id, name FROM devices ORDER BY id").fetchall()
+            return [(int(r["id"]), str(r["name"])) for r in rows]
+
+        return self.transactional(_select)
+
+    def upsert_reindexed_session(
+        self,
+        project_name: str,
+        started_at: str,
+        ended_at: str,
+        host: str,
+        version: str,
+        devices: Sequence[str],
+    ) -> int:
+        """Insert-or-update THE synthesized session row (``reindexed=1``).
+
+        At most one synthesized row per DB: a re-run updates it in place
+        (span/membership track the tree) instead of stacking duplicates.
+        The caller decides WHETHER to synthesize (only when the DB holds
+        no real session rows — those are the durable session record and
+        must never be shadowed).
+        """
+
+        def _upsert(cur: sqlite3.Cursor) -> int | None:
+            row = cur.execute(
+                "SELECT id FROM sessions WHERE reindexed=1 ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                cur.execute(
+                    "INSERT INTO sessions(started_at, ended_at, host, version,"
+                    "                     config_hash, project_name, reindexed)"
+                    " VALUES (?, ?, ?, ?, '', ?, 1)",
+                    (started_at, ended_at, host, version, project_name),
+                )
+                session_id = cur.lastrowid
+            else:
+                session_id = int(row["id"])
+                cur.execute(
+                    "UPDATE sessions SET started_at=?, ended_at=?, host=?,"
+                    " version=?, project_name=? WHERE id=?",
+                    (started_at, ended_at, host, version, project_name, session_id),
+                )
+                cur.execute(
+                    "DELETE FROM session_devices WHERE session_id=?", (session_id,)
+                )
+            for device_name in devices:
+                cur.execute(
+                    "INSERT OR IGNORE INTO session_devices(session_id, device_name)"
+                    " VALUES (?, ?)",
+                    (session_id, device_name),
+                )
+            return session_id
+
+        session_id = self.transactional(_upsert)
+        self.flush_now()
+        if session_id is None:  # pragma: no cover - defensive
+            raise RuntimeError("upsert_reindexed_session: lastrowid was None")
+        return int(session_id)
 
     def record_gap(
         self,

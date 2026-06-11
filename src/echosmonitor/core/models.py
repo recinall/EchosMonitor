@@ -206,8 +206,10 @@ class SessionRecord:
     identifies the sessionless monitoring index (detection-only rows).
     ``closed_dirty`` marks a session that was found still open on a
     later launch and closed administratively — its ``ended_at`` is the
-    close time, not the real end of recording. Timestamps are ISO-8601
-    UTC strings (lexicographic == chronological).
+    close time, not the real end of recording. ``reindexed`` marks a
+    row SYNTHESIZED by the M3-D re-indexer (DB was missing — the span
+    is the data extent, the name is the directory name). Timestamps
+    are ISO-8601 UTC strings (lexicographic == chronological).
     """
 
     id: int
@@ -217,6 +219,7 @@ class SessionRecord:
     closed_dirty: bool
     host: str
     devices: tuple[str, ...]
+    reindexed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

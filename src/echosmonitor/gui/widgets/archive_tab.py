@@ -112,6 +112,7 @@ _NO_SESSION_TEXT = "Select a session to browse its archive."
 # (rule 14 / M2-C), the open (recording) session clearly live.
 _DIRTY_BRUSH = QBrush(QColor("#e0a93a"))
 _OPEN_BRUSH = QBrush(QColor("#7ee081"))
+_REINDEXED_BRUSH = QBrush(QColor("#7fb8e0"))
 
 # Qt.ItemDataRole.UserRole payloads on tree rows.
 _ENTRY_ROLE = Qt.ItemDataRole.UserRole
@@ -196,6 +197,10 @@ class ArchiveTab(QWidget):
     # fmt("mseed"|"csv"), device, group, t_start, t_end, dest_path —
     # the host resolves the session context and dispatches the worker.
     exportRequested = Signal(str, str, object, float, float, str)  # noqa: N815
+    # session_root path — the host guards against the ACTIVE session's
+    # DB (it owns the engine; rule 4 keeps that check out of this widget)
+    # and dispatches the re-index worker (M3-D).
+    reindexRequested = Signal(str)  # noqa: N815
 
     def __init__(
         self,
@@ -214,6 +219,11 @@ class ArchiveTab(QWidget):
         self._selected_station: StationCoverage | None = None
         self._list_token = 0
         self._detail_token = 0
+        # A re-index outcome to KEEP showing through the automatic
+        # session-list refresh that follows it (which would otherwise
+        # reset the status label and erase the report the user is owed).
+        # Consumed by the next _populate_sessions, then cleared.
+        self._reindex_notice: str | None = None
 
         # The currently-loaded window: the selection it was loaded for, the
         # displayed (x, y) per component in the current unit, and the window
@@ -259,6 +269,12 @@ class ArchiveTab(QWidget):
         self._search_edit.setClearButtonEnabled(True)
         self._refresh_button = QPushButton("Refresh", self)
         self._refresh_button.setToolTip("Re-scan the archive root for sessions.")
+        self._reindex_button = QPushButton("Re-index…", self)
+        self._reindex_button.setToolTip(
+            "Rebuild a project archive's index (archive.db) from its MiniSEED"
+            " files — for archives copied from another machine (missing or"
+            " stale index)."
+        )
 
         self._date_check = QCheckBox("Date:", self)
         self._date_from = QDateEdit(self)
@@ -299,6 +315,7 @@ class ArchiveTab(QWidget):
         search_row = QHBoxLayout()
         search_row.addWidget(self._search_edit, stretch=1)
         search_row.addWidget(self._refresh_button)
+        search_row.addWidget(self._reindex_button)
         left_box.addLayout(search_row)
         date_row = QHBoxLayout()
         date_row.addWidget(self._date_check)
@@ -590,6 +607,7 @@ class ArchiveTab(QWidget):
             self._on_detail_failed, Qt.ConnectionType.QueuedConnection
         )
         self._refresh_button.clicked.connect(lambda: self.refresh_sessions())
+        self._reindex_button.clicked.connect(self._on_reindex_clicked)
         self._search_edit.textChanged.connect(lambda _t: self._populate_sessions())
         self._date_check.toggled.connect(self._on_date_filter_toggled)
         self._date_from.dateChanged.connect(lambda _d: self._populate_sessions())
@@ -636,6 +654,68 @@ class ArchiveTab(QWidget):
         if token != self._list_token:
             return
         self._browser_status.setText(f"Session scan failed: {message}")
+
+    # ------------------------------------------------------------------
+    # Re-indexer (M3-D)
+    # ------------------------------------------------------------------
+    def _on_reindex_clicked(self) -> None:
+        """Pick a project directory under the archive root and request a
+        re-index. Only direct children of the base root are valid targets:
+        that is where discovery looks (rule 14 / the M2-B injectivity
+        scope), so anything else would be re-indexed into invisibility."""
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Re-index a project archive",
+            self._base_root,
+        )
+        if not chosen:
+            return
+        target = Path(chosen).resolve()
+        base = Path(self._base_root).resolve()
+        if target == base:
+            self._browser_status.setText(
+                "Pick a project directory INSIDE the archive root, not the"
+                " root itself."
+            )
+            return
+        if target.parent != base:
+            self._browser_status.setText(
+                f"Not a project directory under the archive root"
+                f" ({self._base_root}) — copy the archive there first, then"
+                f" re-index it."
+            )
+            return
+        self.reindexRequested.emit(str(target))
+
+    def set_reindex_busy(self, busy: bool) -> None:
+        """One re-index at a time from the UI: the host disables the button
+        while its request is in flight (the worker queue itself is serial)."""
+        self._reindex_button.setEnabled(not busy)
+
+    def show_reindex_progress(self, files_done: int, files_total: int) -> None:
+        self._browser_status.setText(
+            f"Re-indexing… {files_done}/{files_total} files"
+        )
+
+    def show_reindex_done(
+        self,
+        files_indexed: int,
+        files_skipped: int,
+        files_pruned: int,
+    ) -> None:
+        msg = f"Re-index complete: {files_indexed} files indexed"
+        if files_skipped:
+            msg += f", {files_skipped} skipped (unreadable or foreign)"
+        if files_pruned:
+            msg += f", {files_pruned} stale index rows removed"
+        self._browser_status.setText(msg + ".")
+        # Survive the automatic session-list refresh that follows.
+        self._reindex_notice = msg + "."
+
+    def show_reindex_failed(self, message: str) -> None:
+        msg = f"Re-index failed: {message}"
+        self._browser_status.setText(msg)
+        self._reindex_notice = msg
 
     def _on_date_filter_toggled(self, checked: bool) -> None:
         self._date_from.setEnabled(checked)
@@ -697,14 +777,21 @@ class ArchiveTab(QWidget):
             ):
                 self._browser_status.setText("Refreshing session…")
                 self._detail_token = self._browser.request_detail(fresh)
+        notice, self._reindex_notice = self._reindex_notice, None
         if not self._entries:
             self._browser_status.setText(
-                "No sessions found. Start a Recording session to create one."
+                notice
+                or "No sessions found. Start a Recording session to create one."
             )
         elif shown == 0:
-            self._browser_status.setText("No sessions match the current filter.")
+            # An active filter can hide the re-indexed session — the
+            # completion report still outranks the filter notice (review
+            # finding: this branch used to erase it).
+            self._browser_status.setText(
+                notice or "No sessions match the current filter."
+            )
         elif self._detail is None:
-            self._browser_status.setText(_NO_SESSION_TEXT)
+            self._browser_status.setText(notice or _NO_SESSION_TEXT)
 
     @staticmethod
     def _session_item(entry: SessionEntry) -> QTreeWidgetItem:
@@ -715,6 +802,8 @@ class ArchiveTab(QWidget):
             status, brush = "● open", _OPEN_BRUSH
         elif record.closed_dirty:
             status, brush = "⚠ dirty", _DIRTY_BRUSH
+        elif record.reindexed:
+            status, brush = "re-indexed", _REINDEXED_BRUSH
         else:
             status, brush = "closed", None
         item = QTreeWidgetItem([name, started, status])
@@ -725,6 +814,13 @@ class ArchiveTab(QWidget):
                 2,
                 "Closed administratively after a crash — the recorded end "
                 "time is the recovery time, not the real end of recording.",
+            )
+        elif record.reindexed:
+            item.setToolTip(
+                2,
+                "Synthesized by the re-indexer (the original session "
+                "metadata was lost with its database): the span is the "
+                "data extent and the project name is the directory name.",
             )
         item.setToolTip(0, f"{name}\ndevices: {', '.join(record.devices) or '—'}")
         item.setData(0, _ENTRY_ROLE, entry)

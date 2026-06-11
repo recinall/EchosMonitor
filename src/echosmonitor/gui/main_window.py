@@ -58,6 +58,11 @@ from echosmonitor.core.archive_detail_loader import (
     ComponentTrace,
 )
 from echosmonitor.core.archive_export_worker import ArchiveExportLoader, ArchiveExportResult
+from echosmonitor.core.archive_reindex_worker import (
+    ArchiveReindexLoader,
+    ArchiveReindexProgressEvent,
+    ArchiveReindexResult,
+)
 from echosmonitor.core.archive_window_loader import (
     ArchiveWindowLoader,
     ArchiveWindowResult,
@@ -470,6 +475,26 @@ class MainWindow(QMainWindow):
         self._archive_export_loader.empty.connect(
             self._on_archive_export_empty, type=Qt.ConnectionType.QueuedConnection
         )
+        # Re-indexer (M3-D): rebuild a project archive's DB from its SDS
+        # tree on the re-index worker's thread (rules 1/8). The active-
+        # session guard lives in the request handler below — the loader
+        # never sees the engine (rule 4).
+        self._archive_reindex_loader = ArchiveReindexLoader(parent=self)
+        self._archive_reindex_token = 0
+        # The root the UI's in-flight re-index targets (None when idle):
+        # the session-start guard refuses recording into it — the engine
+        # opening that archive.db mid-rebuild would be two writers on one
+        # DB (rule 8; the inverse of the active-session guard below).
+        self._archive_reindex_root: str | None = None
+        self._archive_reindex_loader.progressed.connect(
+            self._on_archive_reindex_progress, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._archive_reindex_loader.finished.connect(
+            self._on_archive_reindex_done, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._archive_reindex_loader.failed.connect(
+            self._on_archive_reindex_failed, type=Qt.ConnectionType.QueuedConnection
+        )
         # The most recent Archive→HVSR hand-off as (device, session_root,
         # t_start, t_end), so "Run on archive" reads the SAME session the
         # user was browsing (rule 14) — a closed session's data is
@@ -511,6 +536,7 @@ class MainWindow(QMainWindow):
         # M2-C: the session toolbar is the user's acquisition surface
         # (rule 13) — Monitor / Record… / Stop + live session status.
         self._session_toolbar = SessionToolbar(self._engine, self)
+        self._session_toolbar.set_session_start_guard(self._session_start_guard)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._session_toolbar)
         self._wire_engine()
         self._restore_state()
@@ -589,6 +615,7 @@ class MainWindow(QMainWindow):
         self._archive_tab.unitChangeRequested.connect(self._on_archive_window_unit_change)
         self._archive_tab.hvsrRequested.connect(self._handoff_archive_to_hvsr)
         self._archive_tab.exportRequested.connect(self._on_archive_export_requested)
+        self._archive_tab.reindexRequested.connect(self._on_archive_reindex_requested)
         # A started/ended session appears in the browser without a manual
         # refresh. Queued: the emit can originate inside engine transitions.
         self._engine.sessionChanged.connect(
@@ -1773,6 +1800,104 @@ class MainWindow(QMainWindow):
     def _on_archive_export_empty(self, _token: int) -> None:
         self._archive_tab.show_export_empty()
 
+    def _on_archive_reindex_requested(self, session_root: object) -> None:
+        """Guard + dispatch a re-index of a project directory (M3-D).
+
+        The guard: a re-index is a WRITE path into ``archive.db``, and
+        the engine holds the ACTIVE session's DB open and is writing it
+        — re-indexing that one would race the live writer (rule 8).
+        Refused honestly rather than queued. Cross-process safety is the
+        app-lifetime ``QLockFile`` on the base root: another instance
+        cannot be recording under this root at all.
+        """
+        import socket
+        from pathlib import Path
+
+        from echosmonitor import __version__
+
+        if not isinstance(session_root, str) or not session_root:
+            return
+        target_db = Path(session_root) / "archive.db"
+        active_db = self._engine.archive_db_path()
+        if active_db is not None and target_db.resolve() == active_db.resolve():
+            session = self._engine.active_session()
+            project = session.project_name if session is not None else "(monitoring)"
+            _log.warning(
+                "archive_reindex_refused_active_session",
+                root=session_root,
+                project=project,
+            )
+            self._archive_tab.show_reindex_failed(
+                f"'{project}' is the ACTIVE session — stop it first, then"
+                " re-index."
+            )
+            return
+        self._archive_tab.set_reindex_busy(True)
+        self._archive_reindex_root = session_root
+        self._archive_reindex_token = self._archive_reindex_loader.request(
+            session_root,
+            host=socket.gethostname(),
+            version=__version__,
+        )
+
+    def _session_start_guard(self, project_name: str) -> str | None:
+        """Toolbar veto (M3-D, the inverse of the active-session guard):
+        starting a recording session whose root is being RE-INDEXED would
+        put the engine's DAO and the re-index DAO on one archive.db
+        concurrently (rule 8) — refuse until the re-index finishes."""
+        from pathlib import Path
+
+        from echosmonitor.core.session import session_archive_root
+
+        root = self._archive_reindex_root
+        if root is None:
+            return None
+        target = session_archive_root(self._base_archive_root, project_name)
+        if target.resolve() == Path(root).resolve():
+            return (
+                f"The archive of '{project_name}' is being re-indexed — wait"
+                " for it to finish, then start the session."
+            )
+        return None
+
+    def _on_archive_reindex_progress(self, payload: object) -> None:
+        if self._archive_bridge_severed:
+            return  # closing — the tab/loaders are torn down (auditor F1 class)
+        if not isinstance(payload, ArchiveReindexProgressEvent):
+            return
+        if payload.token != self._archive_reindex_token:
+            return  # a stale queued request's beats — not the one the UI tracks
+        self._archive_tab.show_reindex_progress(payload.files_done, payload.files_total)
+
+    def _on_archive_reindex_done(self, payload: object) -> None:
+        # A re-index finishing while closeEvent's bounded joins run posts
+        # this queued — it dispatches AFTER closeEvent returns, and the
+        # refresh below would lazily RESTART the just-joined browser
+        # thread (nothing joins it again; Qt aborts at exit — the M3-A
+        # F1 class, re-found by the qt-concurrency-auditor on this path).
+        if self._archive_bridge_severed:
+            return
+        if not isinstance(payload, ArchiveReindexResult):
+            return
+        if payload.token == self._archive_reindex_token:
+            self._archive_reindex_root = None
+            self._archive_tab.set_reindex_busy(False)
+            report = payload.report
+            self._archive_tab.show_reindex_done(
+                report.files_indexed, report.files_skipped, report.files_pruned
+            )
+        # The index changed on disk either way — re-discover sessions.
+        self._archive_tab.refresh_sessions()
+
+    def _on_archive_reindex_failed(self, token: int, message: object) -> None:
+        if self._archive_bridge_severed:
+            return  # closing — see _on_archive_reindex_done
+        if token != self._archive_reindex_token:
+            return
+        self._archive_reindex_root = None
+        self._archive_tab.set_reindex_busy(False)
+        self._archive_tab.show_reindex_failed(str(message))
+
     def _on_archive_window_loaded(self, payload: object) -> None:
         from obspy import UTCDateTime
 
@@ -2264,6 +2389,10 @@ class MainWindow(QMainWindow):
         # removes its temp file (never a half-written destination) and
         # queued exports are dropped with a log line.
         self._archive_export_loader.shutdown()
+        # An in-flight re-index aborts at its next per-file poll; the
+        # partial index is safe (files win over it — rule 8) and a
+        # re-run converges.
+        self._archive_reindex_loader.shutdown()
         self._engine.stop()
         if self._live_tabs is not None:
             self._live_tabs.save_active_tab()
