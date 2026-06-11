@@ -32,7 +32,7 @@ from echosmonitor.config.schema import (
     UiConfig,
 )
 from echosmonitor.core.config_store import ConfigStore
-from echosmonitor.core.models import ConnState
+from echosmonitor.core.models import AcquisitionState, ConnState
 from echosmonitor.core.streaming_engine import StreamingEngine
 from tests.core.fakes import FakeSeedLinkServer, FakeSeedLinkServerConfig
 from tests.core.test_seedlink_worker import _LoopThread, loop_thread  # noqa: F401
@@ -64,12 +64,20 @@ def store_path(tmp_path: Path) -> Path:
     return tmp_path / "config.yaml"
 
 
-def test_add_device_via_store_starts_worker(qtbot, make_fake_server, store_path) -> None:  # noqa: F811
-    """Calling ``store.add_device`` on a running engine spawns the worker
-    and the device reaches CONNECTED.
+def test_add_device_via_store_registers_idle_until_user_starts(
+    qtbot,
+    make_fake_server,  # noqa: F811
+    store_path,
+) -> None:
+    """``store.add_device`` on a running engine registers the device IDLE
+    — no worker, no connection — until the user explicitly starts it
+    (CLAUDE.md rule 13: nothing starts without the user). M2-A
+    consciously rewrote the original autostart expectation of this test.
 
-    Demonstrates the ``added`` diff bucket reaching the engine via the
-    queued ``configChanged`` -> ``_on_config_changed`` path.
+    Still demonstrates the ``added`` diff bucket reaching the engine via
+    the queued ``configChanged`` -> ``_on_config_changed`` path: the
+    device becomes startable by name, and ``start_monitoring`` then
+    brings it to CONNECTED.
     """
     server = make_fake_server(
         FakeSeedLinkServerConfig(network="IU", station="ANMO", location="00", channel="BHZ")
@@ -82,13 +90,25 @@ def test_add_device_via_store_starts_worker(qtbot, make_fake_server, store_path)
         device_cfg = _device_from_server("dev-a", server)
         store.add_device(device_cfg)
 
+        # Wait until the queued diff lands (the engine's device view
+        # advances), then assert the device did NOT start.
+        assert _wait_until(
+            lambda: any(d.name == "dev-a" for d in engine.devices()),
+            timeout_s=2.0,
+            qtbot=qtbot,
+        ), "added device never reached the engine's device view"
+        assert engine.acquisition_state("dev-a") is AcquisitionState.IDLE
+        assert "dev-a" not in engine._workers, "added device autostarted (rule 13 violation)"
+
+        # The user starts it: now it connects.
+        engine.start_monitoring("dev-a")
+
         def reached_connected() -> bool:
-            statuses = engine.device_status()
-            status = statuses.get("dev-a")
+            status = engine.device_status().get("dev-a")
             return status is not None and status.state == ConnState.CONNECTED
 
         assert _wait_until(reached_connected, timeout_s=5.0, qtbot=qtbot), (
-            f"dev-a never reached CONNECTED after store.add_device: {engine.device_status()}"
+            f"dev-a never reached CONNECTED after start_monitoring: {engine.device_status()}"
         )
     finally:
         engine.stop()
@@ -283,5 +303,65 @@ def test_host_change_triggers_restart(qtbot, make_fake_server, store_path) -> No
         assert _wait_until(worker_recycled, timeout_s=3.0, qtbot=qtbot), (
             "host change did not recycle the worker — restart bucket was not applied"
         )
+    finally:
+        engine.stop()
+
+
+def test_host_change_on_idle_device_does_not_start_it(
+    qtbot,
+    make_fake_server,  # noqa: F811
+    store_path,
+) -> None:
+    """The ``restart`` diff bucket only restarts what the user has
+    running. A device the user stopped absorbs the new config silently
+    and connects to the NEW endpoint when monitoring resumes (M2-A,
+    rule 13)."""
+    cfg_a = FakeSeedLinkServerConfig(network="IU", station="ANMO", location="00", channel="BHZ")
+    cfg_b = FakeSeedLinkServerConfig(network="IU", station="ANMO", location="00", channel="BHZ")
+    server_a: FakeSeedLinkServer = make_fake_server(cfg_a)
+    server_b: FakeSeedLinkServer = make_fake_server(cfg_b)
+    initial_device = _device_from_server("dev-a", server_a)
+    cfg = _make_root_cfg(devices=[initial_device])
+    store = ConfigStore(cfg, store_path)
+    engine = StreamingEngine(cfg, store=store)
+    engine.start()
+    try:
+        assert _wait_until(
+            lambda: (
+                engine.device_status().get("dev-a") is not None
+                and engine.device_status()["dev-a"].state == ConnState.CONNECTED
+            ),
+            timeout_s=5.0,
+            qtbot=qtbot,
+        )
+        engine.stop("dev-a")  # user stops it → Idle
+        assert "dev-a" not in engine._workers
+
+        store.update_device(
+            "dev-a",
+            initial_device.model_copy(update={"host": server_b.host, "port": server_b.port}),
+        )
+        # Wait for the queued diff to land (engine view shows the new port),
+        # then assert no worker was spawned.
+        assert _wait_until(
+            lambda: any(d.name == "dev-a" and d.port == server_b.port for d in engine.devices()),
+            timeout_s=2.0,
+            qtbot=qtbot,
+        )
+        assert "dev-a" not in engine._workers, "restart bucket started an idle device"
+        assert engine.acquisition_state("dev-a") is AcquisitionState.IDLE
+
+        # Resuming monitoring connects to the NEW endpoint — the idle
+        # device really absorbed the config change.
+        engine.start_monitoring("dev-a")
+        assert _wait_until(
+            lambda: (
+                engine.device_status().get("dev-a") is not None
+                and engine.device_status()["dev-a"].state == ConnState.CONNECTED
+            ),
+            timeout_s=5.0,
+            qtbot=qtbot,
+        )
+        assert engine._workers["dev-a"]._port == server_b.port
     finally:
         engine.stop()

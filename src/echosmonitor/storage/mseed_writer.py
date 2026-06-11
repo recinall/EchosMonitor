@@ -2,8 +2,9 @@
 
 A :class:`MseedWriter` is a ``QObject`` that owns the file handles and
 encoder state for one configured device. The streaming engine creates
-one writer per device with ``archive.enabled=True`` and moves it to a
-shared storage ``QThread``; thereafter, the writer receives traces via
+one writer per device in the RECORDING state (M2 rule 13 — recording
+is a user action, not an ``archive.enabled`` side effect) and moves it
+to a shared storage ``QThread``; thereafter, the writer receives traces via
 the ``write_trace`` slot and flushes via a periodic ``QTimer`` whose
 interval is :class:`ArchiveConfig.fsync_interval_s`.
 

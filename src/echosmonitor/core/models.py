@@ -196,6 +196,27 @@ class ConnState(IntEnum):
     STOPPED = 5
 
 
+class AcquisitionState(IntEnum):
+    """Per-device user acquisition state (CLAUDE.md rule 13).
+
+    Distinct from :class:`ConnState`: ``ConnState`` describes what the
+    SeedLink *socket* is doing; ``AcquisitionState`` describes what the
+    *user asked for*. A device the user set to MONITORING may cycle
+    through CONNECTING/WAITING_RETRY at the connection level while its
+    acquisition state stays MONITORING throughout.
+
+    - ``IDLE`` — no worker, no traffic, no disk writes. The launch state
+      of every device; nothing leaves it without an explicit user action.
+    - ``MONITORING`` — live SeedLink streaming into ring buffers for
+      display/analysis; **zero archive writes**.
+    - ``RECORDING`` — monitoring plus an SDS archive writer (rule 14).
+    """
+
+    IDLE = 0
+    MONITORING = 1
+    RECORDING = 2
+
+
 @dataclass(slots=True)
 class DeviceStatus:
     """Snapshot of one SeedLink device's connection state and counters.
@@ -226,8 +247,9 @@ class DeviceStatus:
     since_first_attempt_at: UTCDateTime | None = None
     last_failure_detail: dict[str, object] | None = None
 
-    # M5 archive fields. Default to "off" so existing tests and any
-    # device whose ``archive.enabled=False`` keep their old behaviour.
+    # M5 archive fields. Default to "off": they only become live while
+    # the device is in the RECORDING state (M2 rule 13 — a writer is
+    # attached by ``start_recording``, never by config).
     # ``archive_files_open`` is the count of distinct SDS paths the
     # writer has *touched* this session (not the LRU live-fd count).
     archive_enabled: bool = False

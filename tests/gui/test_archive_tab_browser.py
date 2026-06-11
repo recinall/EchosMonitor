@@ -100,21 +100,20 @@ def test_empty_archive_honest_state(qtbot, tmp_path: Path) -> None:
     tab = ArchiveTab(engine, dao)  # type: ignore[arg-type]
     qtbot.addWidget(tab)
 
-    assert "No archived data" in tab.extent_text_for_test()
+    # Honest empty state: no pretended data, and (since M2-A) the text
+    # points at the action that creates archives — a Recording session.
+    assert "No archived waveforms" in tab.extent_text_for_test()
     assert not tab.load_enabled_for_test()
 
 
-def test_empty_state_names_archiving_disabled(qtbot, tmp_path: Path) -> None:
-    """When the device has archiving disabled (the field-bug cause), the empty
-    state says so — not a generic 'no data' — so the user knows WHY the archive
-    is empty even though archive.db exists (full of detection metadata)."""
+def test_empty_state_points_at_recording(qtbot, tmp_path: Path) -> None:
+    """When the device has no archived waveforms, the empty state tells
+    the user HOW data gets here — start a Recording session — not a
+    generic 'no data'. (M2-A consciously rewrote the old
+    'archiving is disabled' variant: since rule 13 made writers a
+    Recording-state artifact, ``archive.enabled`` no longer explains an
+    empty archive.)"""
     from PySide6.QtCore import QObject, Signal
-
-    from echosmonitor.config.schema import (
-        ArchiveConfig,
-        DeviceConfig,
-        StreamSelectorConfig,
-    )
 
     group = {"Z": f"{_STA}Z", "N": f"{_STA}N", "E": f"{_STA}E"}
 
@@ -128,17 +127,6 @@ def test_empty_state_names_archiving_disabled(qtbot, tmp_path: Path) -> None:
             for nslc in group.values():
                 self._buffers[device_stream_key("dev", nslc)] = object()
 
-        def devices(self):
-            return (
-                DeviceConfig(
-                    name="dev",
-                    host="h",
-                    port=18000,
-                    selectors=[StreamSelectorConfig(network="XX", station="STA")],
-                    archive=ArchiveConfig(enabled=False),
-                ),
-            )
-
     engine = _EngineWithConfig()
     dao = ArchiveDao(tmp_path / "empty.db", batch_window_s=0.1)
     dao.upsert_device("dev", "h", 18000, {})
@@ -146,7 +134,7 @@ def test_empty_state_names_archiving_disabled(qtbot, tmp_path: Path) -> None:
     qtbot.addWidget(tab)
 
     msg = tab.extent_text_for_test()
-    assert "archiving is disabled" in msg.lower()
+    assert "recording session" in msg.lower()
     assert "dev" in msg
     assert not tab.load_enabled_for_test()
 

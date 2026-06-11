@@ -108,7 +108,11 @@ def load_engine(qtbot, tmp_path):
     def _make(fs: float, window_s: int = 10, *, archive: bool = False) -> StreamingEngine:
         cfg = _build_cfg(fs, window_s, archive_dir=tmp_path / "arch", archive=archive)
         eng = StreamingEngine(cfg)
-        eng.start()
+        # M2-A: archive writers exist only in the RECORDING state (rule 13).
+        if archive:
+            eng.start_recording(_DEVICE)
+        else:
+            eng.start()
         engines.append(eng)
         return eng
 

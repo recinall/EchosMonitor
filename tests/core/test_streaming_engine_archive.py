@@ -1,7 +1,8 @@
 """Integration tests for the M5 archive wiring on the StreamingEngine.
 
 The fake SeedLink server feeds real ObsPy traces into the engine; with
-``archive.enabled=True`` on the device, files appear under the
+the device in the RECORDING state (M2-A — writers are created by
+``start_recording``, never by config), files appear under the
 configured archive root and ``DeviceStatus.archive_*`` fields update.
 Shutdown must remain clean (≤ engine's existing ~5 s budget).
 """
@@ -85,7 +86,9 @@ def archive_engine(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start()
+    # M2-A: writers are created by the RECORDING path only, never by
+    # ``archive.enabled`` config (rule 13). One call covers Idle→Recording.
+    engine.start_recording("fake")
     try:
         yield engine, archive_root, nslc
     finally:
@@ -183,11 +186,14 @@ def test_archive_updates_device_status_counters(
     assert status.archive_last_error is None
 
 
-def test_archive_disabled_writes_no_files(
+def test_monitoring_writes_no_files(
     qtbot,
     tmp_path: Path,
     fake_server: FakeSeedLinkServer,  # noqa: F811
 ) -> None:
+    """A device that is only MONITORING (here via the start() monitor-all
+    convenience) produces zero archive files — writers exist only in the
+    RECORDING state (M2-A, rule 13)."""
     archive_root = tmp_path / "archive"
     cfg = _make_root_cfg(
         devices=[
@@ -204,7 +210,8 @@ def test_archive_disabled_writes_no_files(
                         channel=fake_server.config.channel,
                     )
                 ],
-                # archive defaults to disabled.
+                # Default archive config; irrelevant either way — only
+                # start_recording() creates a writer.
             ),
         ],
         archive_root=archive_root,

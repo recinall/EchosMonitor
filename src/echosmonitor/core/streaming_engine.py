@@ -54,6 +54,7 @@ from echosmonitor.core.config_diff import diff_devices
 from echosmonitor.core.dsp_router import _DspRouter
 from echosmonitor.core.models import (
     DEVICE_KEY_SEP,
+    AcquisitionState,
     ConnState,
     Detection,
     DeviceStatus,
@@ -234,6 +235,13 @@ class StreamingEngine(QObject):
     newStreamSeen = Signal(str, str)  # device, nslc  # noqa: N815
     streamMeta = Signal(str, str, float, str)  # device, nslc, fs, starttime ISO  # noqa: N815
     deviceStateChanged = Signal(str, int)  # device_name, ConnState int  # noqa: N815
+    # ----- M2 acquisition lifecycle (rule 13) ---------------------------
+    # ``acquisitionStateChanged(device, AcquisitionState int)`` — fired on
+    # every user-driven state transition (Idle/Monitoring/Recording) and
+    # on the implicit transitions a hot-reload forces (a removed device
+    # goes Idle). Mirrors the ``deviceStateChanged`` int-payload pattern;
+    # receivers reconstruct via ``AcquisitionState(value)``.
+    acquisitionStateChanged = Signal(str, int)  # noqa: N815
     errorOccurred = Signal(str, str)  # device_name, message  # noqa: N815
     # Zero-payload notification: the configured device list mutated; readers
     # re-query ``devices()``. Introduced in M4 stage A so the StationBrowser
@@ -369,6 +377,12 @@ class StreamingEngine(QObject):
         # subsequent rolling is DEBUG. See :meth:`_note_drop`.
         self._ring_saturated: set[str] = set()
         self._started = False
+        # ----- M2 acquisition lifecycle (rule 13) -----------------------
+        # Per-device user state. Absent key == IDLE (the launch state).
+        # Owned exclusively by the public lifecycle API + the hot-reload
+        # diff path; the internal _start_device/_stop_device helpers never
+        # touch it (they implement mechanics, not user intent).
+        self._acq_state: dict[str, AcquisitionState] = {}
         # ----- DSP plumbing ----------------------------------------------
         # Set of streams that have a chain installed (built on first packet
         # if the device has a non-empty dsp_chain). Composite keys.
@@ -511,9 +525,9 @@ class StreamingEngine(QObject):
         }
 
         # ----- M5 archive plumbing --------------------------------------
-        # The storage QThread is lazily started in :meth:`start` (or in
-        # :meth:`_setup_archive_writer` for hot-reloaded devices) only
-        # if at least one device has ``archive.enabled``.
+        # The storage QThread is lazily started by
+        # :meth:`_setup_archive_writer` when the first device enters the
+        # RECORDING state (rule 13 — never from ``archive.enabled``).
         self._archive_thread: QThread | None = None
         self._archive_writers: dict[str, MseedWriter] = {}
         self._archive_senders: dict[str, _ArchiveSender] = {}
@@ -565,7 +579,32 @@ class StreamingEngine(QObject):
     # Public API
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """Start workers for all configured devices. Idempotent.
+        """Start MONITORING every configured device. Idempotent.
+
+        Convenience wrapper over :meth:`start_monitoring` for tests and
+        headless drivers; the GUI never calls it (rule 13 — acquisition
+        is per-device and user-initiated). Archive writers are NOT
+        created here regardless of any ``archive.*`` config: recording
+        is an explicit per-device action (:meth:`start_recording`).
+
+        Idempotence is per-device: devices already Monitoring/Recording
+        are untouched (``start_monitoring`` no-ops on them; a Recording
+        device would be DOWNGRADED by ``start_monitoring``, so those are
+        skipped here), idle ones start.
+        """
+        self._ensure_started()
+        for dev_cfg in self._engine_devices:
+            if self.acquisition_state(dev_cfg.name) is AcquisitionState.IDLE:
+                self.start_monitoring(dev_cfg.name)
+
+    def _ensure_started(self) -> None:
+        """Bring up the device-independent engine infrastructure once.
+
+        DSP thread, flush timer, ConfigStore subscription and the
+        device-list snapshot — everything :meth:`start` used to do
+        besides spawning workers. Called lazily by the per-device
+        lifecycle methods so the first user action on any device boots
+        the shared machinery; until then nothing runs (rule 13).
 
         When a :class:`ConfigStore` was passed at construction, the
         engine snapshots its current device list and subscribes to
@@ -598,32 +637,104 @@ class StreamingEngine(QObject):
                 nslc=collision.nslc,
                 devices=list(collision.devices),
             )
-        for dev_cfg in self._engine_devices:
-            self._start_device(dev_cfg)
-        # Detections persist independently of MSEED archiving (rule 8: the
-        # detection table is part of the same metadata index, but a device
-        # may run STA/LTA with ``archive.enabled=False``). If any device
-        # has a detection-producing stage, make sure the DAO + session
-        # exist even though no archive writer was created. The DAO row
-        # writes funnel through the engine thread, like the M5 metadata
-        # writes — no extra QThread is needed for them.
-        if self._archive_dao is None and any(
-            self._device_has_detection(d) for d in self._engine_devices
-        ):
-            self._ensure_archive_dao(self._resolve_db_root())
         self._flush_timer.start()
         self._started = True
 
-    def stop(self) -> None:
-        """Stop all workers and threads. Idempotent.
+    def start_monitoring(self, name: str) -> None:
+        """Idle → Monitoring: live streaming, zero disk writes (rule 13).
 
-        With N devices, the wall time of ``stop()`` must be bounded by
-        the slowest single device (~2 s in the pathological case), not
-        by N x 2 s. We achieve this by parallelising phase 1: each
-        ``worker.stop()`` runs on its own helper thread so the total
-        wait collapses to the max, not the sum. Phase 2 is already
-        parallelised (all ``QThread.quit()`` calls land before any
-        ``wait()``).
+        From RECORDING this is a downgrade: the archive writer is torn
+        down (flush + close, bounded) while the live socket stays
+        untouched. Already-MONITORING is a no-op.
+
+        Raises:
+            KeyError: ``name`` does not match any configured device.
+        """
+        # Validate BEFORE booting shared infrastructure: a typo must not
+        # leave the DSP thread + flush timer running with zero devices.
+        dev_cfg = self._device_cfg_or_raise(name)
+        self._ensure_started()
+        state = self.acquisition_state(name)
+        if state is AcquisitionState.MONITORING:
+            return
+        if state is AcquisitionState.RECORDING:
+            self._teardown_archive_writer(name)
+            self._set_acq_state(name, AcquisitionState.MONITORING)
+            _log.info("device_monitoring_started", device=name, downgraded_from="recording")
+            return
+        self._start_device(dev_cfg, with_archive=False)
+        self._set_acq_state(name, AcquisitionState.MONITORING)
+        _log.info("device_monitoring_started", device=name)
+
+    def start_recording(self, name: str) -> None:
+        """Monitoring (or Idle) → Recording: monitoring + SDS writes.
+
+        The archive writer is created HERE and only here — recording is
+        an explicit user action, never a config side effect (rule 13).
+        From MONITORING the live socket is untouched (the writer simply
+        attaches); from IDLE the device starts streaming and archiving
+        in one step. Already-RECORDING is a no-op.
+
+        Raises:
+            KeyError: ``name`` does not match any configured device.
+        """
+        # Validate first — see start_monitoring for why.
+        dev_cfg = self._device_cfg_or_raise(name)
+        self._ensure_started()
+        state = self.acquisition_state(name)
+        if state is AcquisitionState.RECORDING:
+            return
+        if state is AcquisitionState.MONITORING:
+            self._setup_archive_writer(dev_cfg)
+        else:
+            self._start_device(dev_cfg, with_archive=True)
+        self._set_acq_state(name, AcquisitionState.RECORDING)
+        _log.info("device_recording_started", device=name)
+
+    def acquisition_state(self, name: str) -> AcquisitionState:
+        """Current user acquisition state for ``name``; IDLE if unknown."""
+        return self._acq_state.get(name, AcquisitionState.IDLE)
+
+    def _set_acq_state(self, name: str, state: AcquisitionState) -> None:
+        prev = self._acq_state.get(name, AcquisitionState.IDLE)
+        self._acq_state[name] = state
+        if prev is not state:
+            self.acquisitionStateChanged.emit(name, int(state))
+
+    def _device_cfg_or_raise(self, name: str) -> DeviceConfig:
+        """Look up a device config in the engine's current view.
+
+        Prefers ``_engine_devices`` (advanced by hot-reload); before the
+        infrastructure has booted, falls back to the live store / frozen
+        YAML exactly like :meth:`devices`.
+        """
+        if self._engine_devices:
+            source: tuple[DeviceConfig, ...] = self._engine_devices
+        elif self._store is not None:
+            source = tuple(self._store.root.devices)
+        else:
+            source = tuple(self._cfg.devices)
+        dev_cfg = next((d for d in source if d.name == name), None)
+        if dev_cfg is None:
+            raise KeyError(f"unknown device: {name!r}")
+        return dev_cfg
+
+    def stop(self, name: str | None = None) -> None:
+        """Stop one device (``name`` given) or the whole engine. Idempotent.
+
+        Per-device: tears down that device's worker, thread and archive
+        writer (if recording) with the rule-7 bounded joins of
+        :meth:`_stop_device`, sets it IDLE, and leaves every other
+        device — and the shared DSP/flush infrastructure — running.
+        Stopping an already-idle device is a no-op.
+
+        Globally (no ``name``), with N devices the wall time of
+        ``stop()`` must be bounded by the slowest single device (~2 s in
+        the pathological case), not by N x 2 s. We achieve this by
+        parallelising phase 1: each ``worker.stop()`` runs on its own
+        helper thread so the total wait collapses to the max, not the
+        sum. Phase 2 is already parallelised (all ``QThread.quit()``
+        calls land before any ``wait()``).
 
         By the time we clear the bridge dict no queued signal is still
         in flight from the worker thread to its bridge — which would
@@ -632,6 +743,18 @@ class StreamingEngine(QObject):
         joined so a stray cross-thread emission cannot reach a soon-to-
         be-released bridge during garbage collection.
         """
+        if name is not None:
+            if self.acquisition_state(name) is AcquisitionState.IDLE:
+                return
+            t0 = time.monotonic()
+            self._stop_device(name)
+            self._set_acq_state(name, AcquisitionState.IDLE)
+            _log.info(
+                "device_acquisition_stopped",
+                device=name,
+                elapsed_s=round(time.monotonic() - t0, 3),
+            )
+            return
         if not self._started:
             return
         # Detach from the ConfigStore first so a queued ``configChanged``
@@ -786,7 +909,14 @@ class StreamingEngine(QObject):
             self._chain_max_q_by_key.clear()
             self._chain_drops_pending.clear()
             self._chain_drops_last_log.clear()
+        # Flip _started BEFORE announcing IDLE: the emits are direct
+        # same-thread calls, and a receiver that re-entrantly invokes
+        # start_monitoring() from its IDLE handler must hit a fully
+        # stopped engine (_ensure_started reboots the infrastructure)
+        # rather than a half-torn-down one that still claims _started.
         self._started = False
+        for dev_name in list(self._acq_state):
+            self._set_acq_state(dev_name, AcquisitionState.IDLE)
 
     def devices(self) -> tuple[DeviceConfig, ...]:
         """Snapshot of the engine's currently-running device list.
@@ -927,7 +1057,7 @@ class StreamingEngine(QObject):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-    def _start_device(self, dev_cfg: DeviceConfig) -> None:
+    def _start_device(self, dev_cfg: DeviceConfig, *, with_archive: bool = False) -> None:
         name = dev_cfg.name
         # Refresh the device's chain cache to match this start. M3-era
         # code populated ``_device_dsp_cfg`` only at engine construction
@@ -992,8 +1122,22 @@ class StreamingEngine(QObject):
         # first-time start populates the dict, a restart leaves the
         # accumulated counters intact.
         self._status.setdefault(name, DeviceStatus(name=name))
-        if dev_cfg.archive.enabled:
+        # Archive writers are created only when the caller is in the
+        # RECORDING path (rule 13) — never from ``archive.enabled``
+        # config. The ``archive.*`` block still parameterises the writer
+        # (root, encoding, fsync cadence, queue bound) when it IS created.
+        if with_archive:
             self._setup_archive_writer(dev_cfg)
+        # Detections persist independently of MSEED archiving (rule 8: the
+        # detection table is part of the same metadata index, but a device
+        # may run STA/LTA while only monitoring). If this device has a
+        # detection-producing stage, make sure the DAO + session exist
+        # even though no archive writer was created. The DAO row writes
+        # funnel through the engine thread, like the M5 metadata writes —
+        # no extra QThread is needed for them. (ROADMAP open question 3:
+        # Monitoring deliberately keeps writing the metadata DB.)
+        if self._archive_dao is None and self._device_has_detection(dev_cfg):
+            self._ensure_archive_dao(self._resolve_db_root())
         thread.start()
 
     @Slot(str, object)
@@ -1511,6 +1655,14 @@ class StreamingEngine(QObject):
         it. Per-stream state (buffers / coalescers / chains) is
         preserved across the cycle, so the device resumes streaming
         into the same plots.
+
+        CAVEAT (test-only seam): like ``_stop_device``, this does NOT
+        touch ``_acq_state`` — it implements mechanics, not user
+        intent. A device resumed here after a raw ``_stop_device`` is
+        consistent only because neither call moved the state; anything
+        user-facing must go through ``start_monitoring`` /
+        ``start_recording`` / ``stop(name)`` or ``stop(name)``'s IDLE
+        guard will not see the worker.
         """
         # Prefer the engine's current view: Stage B's hot-reload may
         # have advanced ``_engine_devices`` past the original
@@ -1832,15 +1984,40 @@ class StreamingEngine(QObject):
         """Synchronously close + drop the writer for one device.
 
         Called from :meth:`_stop_device` (when a device is removed via
-        hot-reload) and from :meth:`stop` (one writer at a time so a
-        slow filesystem on one device does not block the others). Uses
-        ``BlockingQueuedConnection`` so the call returns only after the
-        storage thread has finished flushing.
+        hot-reload or stopped per-device), from :meth:`start_monitoring`
+        (Recording → Monitoring downgrade) and from :meth:`stop` (one
+        writer at a time so a slow filesystem on one device does not
+        block the others). Uses ``BlockingQueuedConnection`` so the call
+        returns only after the storage thread has finished flushing.
         """
         writer = self._archive_writers.pop(name, None)
         sender = self._archive_senders.pop(name, None)
-        self._archive_inboxes.pop(name, None)
-        self._archive_drops_pending.pop(name, None)
+        inbox = self._archive_inboxes.pop(name, None)
+        # Final drain, mirroring stop()'s _drain_archive call: packets
+        # still in the bounded inbox at teardown time must reach the
+        # writer or they are silently lost (the per-device paths —
+        # downgrade, stop(name), hot-reload restart — don't pass through
+        # the global drain). FIFO posting from this thread guarantees
+        # the queued write_trace calls dispatch on the storage thread
+        # BEFORE the BlockingQueuedConnection close_all below, so the
+        # drained packets are fsynced by the close pass.
+        if inbox and sender is not None:
+            while inbox:
+                drained_nslc, drained_trace = inbox.popleft()
+                sender.request.emit(drained_nslc, drained_trace)
+        # Rule 5: drops accumulated since the last throttled log must
+        # not vanish with the counters — surface them once at teardown.
+        pending_drops = self._archive_drops_pending.pop(name, 0)
+        if pending_drops > 0:
+            _log.warning(
+                "streaming_engine_archive_backpressure",
+                device=name,
+                dropped=pending_drops,
+                at="writer_teardown",
+            )
+            status_for_drops = self._status.get(name)
+            if status_for_drops is not None:
+                status_for_drops.archive_drops_total += pending_drops
         self._archive_drops_last_log.pop(name, None)
         self._archive_paths_seen.pop(name, None)
         # Clear DAO row-id caches and stage-B gap state for every
@@ -1864,8 +2041,11 @@ class StreamingEngine(QObject):
             sender.deleteLater()
         # Disconnect engine-side listeners BEFORE the close call so a
         # late writeOk landing on a torn-down engine slot is impossible.
-        # ``flushedFile`` is reserved for Stage B; no connection exists
-        # here so we don't disconnect it (Qt would warn-log).
+        # ``flushedFile`` is DELIBERATELY left connected: ``close_all``'s
+        # final fsync pass emits the last durability claims through it,
+        # and ``_on_archive_flushed_file`` (the receiver: the engine,
+        # which outlives this teardown) records those final DAO rows.
+        # Disconnecting it here would lose the closing fsync's metadata.
         with contextlib.suppress(RuntimeError, TypeError):
             writer.writeOk.disconnect()
         with contextlib.suppress(RuntimeError, TypeError):
@@ -2075,10 +2255,14 @@ class StreamingEngine(QObject):
         :class:`StationBrowser` (and any future device-aware widget)
         can refresh its combo / panel.
         """
-        if self._store is None:
-            # Defensive: configChanged was disconnected on stop(), but
-            # if a queued emit is still in flight when the slot fires,
-            # ignore it rather than crashing on a None store.
+        if self._store is None or not self._started:
+            # Defensive: configChanged is disconnected on stop(), but a
+            # queued emit already posted before the disconnect still
+            # dispatches after stop() returns (POSTMORTEMS 2026-06-01
+            # lesson). ``_store`` is never nulled, so the live guard is
+            # ``_started`` — applying a diff to a torn-down engine would
+            # queue router work onto the dead DSP thread, to replay
+            # stale on the next lazy boot.
             return
         new_devices = tuple(self._store.root.devices)
         diff = diff_devices(self._engine_devices, new_devices)
@@ -2138,18 +2322,39 @@ class StreamingEngine(QObject):
                     self._chain_drops_last_log.pop(key, None)
             self._device_dsp_cfg.pop(name, None)
             self._status.pop(name, None)
+            # A removed device is implicitly idle; announce it so any
+            # state badge tracking the device clears before the
+            # ``devicesChanged`` refresh below drops the row entirely.
+            if self._acq_state.pop(name, AcquisitionState.IDLE) is not AcquisitionState.IDLE:
+                self.acquisitionStateChanged.emit(name, int(AcquisitionState.IDLE))
         for cfg_added in diff.added:
-            self._start_device(cfg_added)
+            # Rule 13: a device added at runtime registers IDLE and does
+            # NOT start — acquisition begins only when the user invokes
+            # ``start_monitoring``/``start_recording`` on it.
+            self._acq_state.setdefault(cfg_added.name, AcquisitionState.IDLE)
         for cfg_restart in diff.restart:
-            self._stop_device(cfg_restart.name)
-            self._start_device(cfg_restart)
+            # Restart only what the user actually has running; an idle
+            # device just absorbs the new config (its next start reads
+            # from the advanced ``_engine_devices`` snapshot). A
+            # recording device keeps recording across the restart —
+            # the writer is torn down with the worker and re-created.
+            state = self.acquisition_state(cfg_restart.name)
+            if state is not AcquisitionState.IDLE:
+                self._stop_device(cfg_restart.name)
+                self._start_device(
+                    cfg_restart,
+                    with_archive=state is AcquisitionState.RECORDING,
+                )
             # ``_stop_device`` deliberately preserves per-stream state
             # so plots survive a transient restart, but that includes
             # the previously-installed DspChain in the router. Without
             # this call the new worker's packets would still be processed
             # by the OLD chain instance until the engine restarts.
             # ``_reinstall_chain`` clears the router state and rebuilds
-            # synchronously from the new chain config + cached fs.
+            # synchronously from the new chain config + cached fs. It
+            # runs for idle devices too: their preserved router chains
+            # (from an earlier session) must track the new config or a
+            # later start would resume with a stale chain.
             self._reinstall_chain(cfg_restart)
         for cfg_chain in diff.chain_only:
             self._reinstall_chain(cfg_chain)
@@ -2261,8 +2466,14 @@ class StreamingEngine(QObject):
         cfg_match = next((d for d in source if d.name == name), None)
         if cfg_match is None:
             raise KeyError(f"unknown device: {name!r}")
+        # Reconnect restarts what's running; it never starts an idle
+        # device (rule 13 — that would be acquisition by side effect).
+        state = self.acquisition_state(name)
+        if state is AcquisitionState.IDLE:
+            _log.info("streaming_engine_reconnect_ignored_idle", device=name)
+            return
         self._stop_device(name)
-        self._start_device(cfg_match)
+        self._start_device(cfg_match, with_archive=state is AcquisitionState.RECORDING)
 
     # ------------------------------------------------------------------
     # Test-only accessors (intentionally non-public name)

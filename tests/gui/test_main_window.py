@@ -20,7 +20,7 @@ from echosmonitor.config.schema import (
     StreamSelectorConfig,
     UiConfig,
 )
-from echosmonitor.core.models import Detection
+from echosmonitor.core.models import AcquisitionState, Detection
 from echosmonitor.gui import main_window as main_window_mod
 from echosmonitor.gui.main_window import MainWindow
 
@@ -216,6 +216,25 @@ def test_qsettings_reset_log_is_one_time(
         assert len(events) == 1  # the first launch only
     finally:
         second.close()
+
+
+def test_launch_with_devices_does_not_start_engine(qtbot: QtBot) -> None:
+    """Rule 13 at the window level: constructing MainWindow with
+    configured devices must NOT start the engine — no workers, no
+    threads, every device IDLE. This pins the M2-A removal of the
+    autostart site in ``MainWindow.__init__``; the engine-level pins
+    live in ``tests/core/test_engine_session_lifecycle.py``."""
+    cfg = _root_cfg(devices=[_device("dev-a", []), _device("dev-b", [])])
+    window = MainWindow(cfg, Path("/tmp/cfg.yaml"))
+    qtbot.addWidget(window)
+    try:
+        qtbot.wait(300)
+        assert window._engine._started is False
+        assert window._engine._workers == {}
+        assert window._engine.acquisition_state("dev-a") is AcquisitionState.IDLE
+        assert window._engine.acquisition_state("dev-b") is AcquisitionState.IDLE
+    finally:
+        window.close()
 
 
 def test_status_bar_shows_note_when_device_has_no_dsp_chain(qtbot: QtBot) -> None:

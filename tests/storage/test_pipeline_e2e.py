@@ -82,7 +82,8 @@ def archive_engine(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start()
+    # M2-A: archive writers exist only in the RECORDING state (rule 13).
+    engine.start_recording("fake")
     try:
         yield engine, archive_root
     finally:
@@ -148,7 +149,7 @@ def test_session_row_finalized_on_stop(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start()
+    engine.start_recording("fake")
     qtbot.wait(500)
     engine.stop()
 
@@ -302,7 +303,7 @@ def test_restart_resumption_reuses_existing_db(
 
     # First session.
     engine1 = _build_engine()
-    engine1.start()
+    engine1.start_recording("fake")
     qtbot.wait(1500)  # let some packets land
     engine1.stop()
 
@@ -321,7 +322,7 @@ def test_restart_resumption_reuses_existing_db(
 
     # Second session — same archive root, same device, same NSLC.
     engine2 = _build_engine()
-    engine2.start()
+    engine2.start_recording("fake")
     qtbot.wait(1500)
     engine2.stop()
 
@@ -392,7 +393,8 @@ def test_two_devices_share_db_without_constraint_violation(
         archive_root=archive_root,
     )
     engine = StreamingEngine(cfg)
-    engine.start()
+    engine.start_recording("fake-a")
+    engine.start_recording("fake-b")
     qtbot.wait(2000)
     engine.stop()
 

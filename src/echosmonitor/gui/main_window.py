@@ -437,14 +437,18 @@ class MainWindow(QMainWindow):
         assert self._live_tabs is not None
         self._live_tabs.restore_active_tab()
 
-        if self._config.devices:
-            self._engine.start()
-            _log.info("streaming_engine_autostart", device_count=len(self._config.devices))
-            # Recent-detections historical taste (C3): pre-fill the table
-            # from the DB index now that the engine (and its DAO) is up.
-            self._load_recent_detections()
-        else:
-            _log.info("streaming_engine_idle", reason="no devices in config")
+        # Rule 13: the engine NEVER autostarts. Every device launches
+        # IDLE; acquisition begins only when the user explicitly starts
+        # Monitoring/Recording (M2-C surfaces the controls). The
+        # recent-detections prefill that used to follow autostart is
+        # gone with it — the engine has no DAO until a device starts, so
+        # the table fills from live sessions only (M2-B will restore
+        # history through the sessions index).
+        _log.info(
+            "streaming_engine_idle",
+            reason="acquisition is user-controlled (rule 13)",
+            device_count=len(self._config.devices),
+        )
 
         _log.info(
             "main_window_ready",
@@ -1909,21 +1913,6 @@ class MainWindow(QMainWindow):
         if self._live_tabs is not None:
             self._live_tabs.set_markers_visible(checked)
         self._spectrogram_widget.set_markers_visible(checked)
-
-    def _load_recent_detections(self) -> None:
-        """Pre-populate the table from the DB index (C3): the last 24 h of
-        detections, capped by ``ui.recent_detections_limit``. A bounded
-        index read — no waveforms are loaded."""
-        from obspy import UTCDateTime
-
-        limit = int(self._config.ui.recent_detections_limit)
-        if limit <= 0:
-            return
-        since = UTCDateTime() - 24 * 3600
-        recent = self._engine.recent_detections(limit, since)
-        if recent:
-            self._detection_table.load_historical(recent)
-            _log.info("detections_recent_loaded", count=len(recent), limit=limit)
 
     def _on_engine_error(self, device_name: str, message: str) -> None:
         bar = self.statusBar()

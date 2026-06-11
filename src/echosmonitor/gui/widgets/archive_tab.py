@@ -527,27 +527,16 @@ class ArchiveTab(QWidget):
         self._title.setText(f"Archive — {device} / {station}")
 
     def _empty_extent_message(self, device: object) -> str:
-        """Actionable empty-state text — names archiving-disabled when that is
-        why the ``files`` index is empty (read via the engine's public
-        ``devices()`` snapshot; degrades to the generic text if unavailable)."""
-        if isinstance(device, str) and self._archive_disabled_for(device):
+        """Actionable empty-state text. Since M2-A, archives exist only
+        when the user runs a Recording session (rule 13) — the old
+        ``archive.enabled`` special case is gone with the config-driven
+        writers it described."""
+        if isinstance(device, str):
             return (
-                f"No archived waveforms — archiving is disabled for '{device}'. "
-                f"Enable archive in the device settings to record data here."
+                f"No archived waveforms for '{device}'. "
+                f"Start a Recording session to archive data here."
             )
         return _NO_DATA_TEXT
-
-    def _archive_disabled_for(self, device: str) -> bool:
-        getter = getattr(self._engine, "devices", None)
-        if not callable(getter):
-            return False
-        try:
-            for dev in getter():
-                if getattr(dev, "name", None) == device:
-                    return not bool(dev.archive.enabled)
-        except Exception:
-            return False
-        return False
 
     def _update_coverage(self) -> None:
         group = self.selected_group()

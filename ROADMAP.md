@@ -268,7 +268,7 @@ real-device wire-contract smoke check below.
 
 Goal: rules 13–14 implemented end to end.
 
-- [ ] **A. Engine**: remove autostart from `MainWindow` — single site,
+- [x] **A. Engine**: remove autostart from `MainWindow` — single site,
       `main_window.py:432–434` (`if self._config.devices: self._engine.start()`);
       split per-device lifecycle into `start_monitoring(name)` /
       `start_recording(name)` / `stop(name)` — note the engine API is
@@ -277,6 +277,13 @@ Goal: rules 13–14 implemented end to end.
       so this is an engine-API change, not just UI; archive writers are
       created only on Recording (today they are config-driven at
       `_start_device` time via `archive.enabled`, `:1116–1117`).
+      *Done 2026-06-11:* `AcquisitionState` (IDLE/MONITORING/RECORDING) in
+      `core/models.py`; engine API `start_monitoring`/`start_recording`/
+      `stop(name)` + `acquisition_state(name)` + `acquisitionStateChanged`
+      signal (int payload, `deviceStateChanged` pattern — M2-C consumes);
+      Monitoring↔Recording transitions attach/detach the writer without
+      socket churn; hot-reload buckets are state-aware (see decision log);
+      tests in `tests/core/test_engine_session_lifecycle.py`.
 - [ ] **B. Session model** `core/session.py` + `storage` sessions index:
       project name (sanitised, injectivity-checked), started/ended, devices,
       archive path `<root>/<project>/<device>/<SDS…>`. New-session dialog
@@ -430,6 +437,11 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M1 closure: **Network tab is read-only**; the client has NO `set_network_config` | The firmware's POST schema for `/api/network/config` is unverified and the real read shape (known_networks list + AP + NTP) differs wildly from the skill sketch; a guessed write can take a device off the LAN with button-B AP mode as the only recovery. Pin the schema from firmware sources before M6's wizard needs it. |
 | 2026-06-11 | M1 closure: POSTable models use `extra="allow"` and round-trip unmodelled fields; read models stay `extra="ignore"` | The real `/api/config` carries ~10 fields beyond OSR/gains (trigger_mode, schedule, seed_metadata…); a full-body read-modify-write that dropped them would silently reset device behaviour. |
 | 2026-06-11 | M1 closure: `RestartStatus` terminal heuristic is `state=="done"` OR (`"idle"` + non-empty `applied`); POST 200 (vs 202) = applied-without-restart | The real idle shape is `{"state":"idle","applied":{}}` and the in-progress shape is write-gated; the device note says auth_required hot-applies without restart. Provisional until the first real authenticated apply is observed. |
+| 2026-06-11 | M2-A: global `engine.start()` **kept** as "monitor all configured devices" (tests/headless only; GUI never calls it) | ~25 test call sites use it as the boot convenience; its new semantics (no writers ever) keep the rule-13 invariant intact while avoiding a whole-suite rewrite. |
+| 2026-06-11 | M2-A: `archive.enabled` no longer creates writers — **only `start_recording` does**; the rest of `archive.*` (root, encoding, fsync, queue) still parameterises the writer | Rule 13: recording is a user action, not a config side effect. `enabled` is now vestigial; M2-B/C decide whether it becomes "default record set" in the new-session dialog or is dropped (schema v4 moment). |
+| 2026-06-11 | M2-A: hot-reload `added` bucket registers the device **IDLE** (no autostart); `restart` bucket only recycles devices the user has running (Recording survives with a fresh writer); `reconnect_device` is a no-op on idle devices | Rule 13 applies to runtime adds too. `test_add_device_via_store_starts_worker` consciously rewritten to `…_registers_idle_until_user_starts`. Idle devices still get `_reinstall_chain` so preserved router chains track config. |
+| 2026-06-11 | M2-A: detection DAO creation moved from global `start()` to per-device `_start_device` (first detection-capable device to start) | Keeps open question 3's current answer (Monitoring persists detections, rule 8) under the per-device API; on launch with everything idle there is NO archive.db and no recent-detections prefill — M2-B's sessions index restores history. |
+| 2026-06-11 | M2-A reviews: `_teardown_archive_writer` drains the device's archive inbox to the writer (FIFO before the blocking `close_all`) and logs residual drops | qt-concurrency-auditor F1 / code-reviewer major 1: the per-device paths (downgrade, `stop(name)`, hot-reload restart) bypassed `stop()`'s global drain and silently lost up to one flush-tick of recorded tail. Regression test `test_downgrade_flushes_inflight_archive_inbox`. Also from review: `_started=False` precedes the IDLE emits (reentrancy), `_on_config_changed` guards on `_started` (stale queued diff), name validation precedes infra boot, Archive-tab empty state points at Recording instead of the vestigial `archive.enabled`. |
 
 ## Open questions (resolve before the milestone that needs them)
 
@@ -439,6 +451,9 @@ launch on a clean machine of each OS and complete the M2 happy path
    we call from Python, not a browser; confirm no Origin checks server-side.
 3. M2: should Monitoring without Recording still write the metadata DB
    (detections)? Proposed: yes — detections are cheap and useful; waveforms no.
+   *M2-A interim:* current behaviour kept (a monitoring device with STA/LTA
+   creates the DAO and persists detections); final call belongs to M2-B's
+   session model.
 4. M4: tile stack choice (offline requirement? QtWebEngine weight?).
 5. M5: common-window vs per-device windows for array HVSR (see M5-A).
 6. M7: signing — is a Windows cert / Apple Developer account available, or
