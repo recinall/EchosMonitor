@@ -57,6 +57,7 @@ from echosmonitor.core.archive_detail_loader import (
     ArchiveDetailResult,
     ComponentTrace,
 )
+from echosmonitor.core.archive_export_worker import ArchiveExportLoader, ArchiveExportResult
 from echosmonitor.core.archive_window_loader import (
     ArchiveWindowLoader,
     ArchiveWindowResult,
@@ -454,6 +455,21 @@ class MainWindow(QMainWindow):
         # the Archive tab, on its own worker thread. Owned here (shutdown
         # joins it with the other loaders); the tab only emits requests.
         self._archive_browser = ArchiveBrowserLoader(parent=self)
+
+        # Data exports (M3-C): MiniSEED/CSV of an archive interval, re-read
+        # from the session-scoped archive and written on the export
+        # worker's thread (rule 1/8). A serial queue — exports never
+        # supersede each other.
+        self._archive_export_loader = ArchiveExportLoader(parent=self)
+        self._archive_export_loader.exported.connect(
+            self._on_archive_export_done, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._archive_export_loader.failed.connect(
+            self._on_archive_export_failed, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._archive_export_loader.empty.connect(
+            self._on_archive_export_empty, type=Qt.ConnectionType.QueuedConnection
+        )
         # The most recent Archive→HVSR hand-off as (device, session_root,
         # t_start, t_end), so "Run on archive" reads the SAME session the
         # user was browsing (rule 14) — a closed session's data is
@@ -572,6 +588,7 @@ class MainWindow(QMainWindow):
         self._archive_tab.loadRequested.connect(self._on_archive_window_load_requested)
         self._archive_tab.unitChangeRequested.connect(self._on_archive_window_unit_change)
         self._archive_tab.hvsrRequested.connect(self._handoff_archive_to_hvsr)
+        self._archive_tab.exportRequested.connect(self._on_archive_export_requested)
         # A started/ended session appears in the browser without a manual
         # refresh. Queued: the emit can originate inside engine transitions.
         self._engine.sessionChanged.connect(
@@ -1673,15 +1690,7 @@ class MainWindow(QMainWindow):
         """
         if not isinstance(device, str) or not isinstance(group, dict):
             return
-        entry = self._archive_tab.selected_session_entry()
-        archive_root: str
-        db_path: str | None
-        if entry is not None:
-            archive_root, db_path = entry.session_root, entry.db_path
-        else:
-            engine_db = self._engine.archive_db_path()
-            archive_root = str(self._engine.archive_root(device))
-            db_path = str(engine_db) if engine_db is not None else None
+        archive_root, db_path = self._archive_session_context(device)
         # Supersede any prior unit batch + clear the prior window's components
         # so an in-flight decon result for the old window can't land on the new.
         self._archive_window_decon = {}
@@ -1695,6 +1704,74 @@ class MainWindow(QMainWindow):
             archive_root,
             db_path=db_path,
         )
+
+    def _archive_session_context(self, device: str) -> tuple[str, str | None]:
+        """``(archive_root, db_path)`` for an Archive-tab data request.
+
+        The tab's SELECTED SESSION is the truth (rule 14 — only its root
+        reaches a closed session's data); the live engine context is a
+        defensive fallback for a request with no session selected (not
+        reachable through the tab's UI).
+        """
+        entry = self._archive_tab.selected_session_entry()
+        if entry is not None:
+            return entry.session_root, entry.db_path
+        engine_db = self._engine.archive_db_path()
+        return (
+            str(self._engine.archive_root(device)),
+            str(engine_db) if engine_db is not None else None,
+        )
+
+    # ------------------------------------------------------------------
+    # Archive data exports (M3-C)
+    # ------------------------------------------------------------------
+    def _on_archive_export_requested(
+        self,
+        fmt: object,
+        device: object,
+        group: object,
+        t_start_epoch: float,
+        t_end_epoch: float,
+        dest_path: object,
+    ) -> None:
+        """Queue a MiniSEED/CSV export of the selected interval.
+
+        The session context is snapshotted HERE, at request time (rule 8)
+        — the export then runs independently on the worker's serial
+        queue; a later session selection cannot redirect it.
+        """
+        if not isinstance(fmt, str) or not isinstance(device, str) or not isinstance(group, dict):
+            return
+        if not isinstance(dest_path, str) or not dest_path:
+            return
+        archive_root, db_path = self._archive_session_context(device)
+        self._archive_export_loader.request(
+            fmt,
+            device,
+            {str(k): str(v) for k, v in group.items()},
+            float(t_start_epoch),
+            float(t_end_epoch),
+            archive_root,
+            db_path,
+            dest_path,
+        )
+
+    def _on_archive_export_done(self, payload: object) -> None:
+        if not isinstance(payload, ArchiveExportResult):
+            return
+        self._archive_tab.show_export_done(payload.fmt, payload.dest_path, payload.n_bytes)
+        bar = self.statusBar()
+        if bar is not None:
+            bar.showMessage(f"Exported {payload.fmt.upper()} to {payload.dest_path}", 6000)
+
+    def _on_archive_export_failed(self, _token: int, message: object) -> None:
+        self._archive_tab.show_export_failed(str(message))
+        bar = self.statusBar()
+        if bar is not None:
+            bar.showMessage(f"Archive export failed: {message}", 6000)
+
+    def _on_archive_export_empty(self, _token: int) -> None:
+        self._archive_tab.show_export_empty()
 
     def _on_archive_window_loaded(self, payload: object) -> None:
         from obspy import UTCDateTime
@@ -2183,6 +2260,10 @@ class MainWindow(QMainWindow):
         self._archive_loader.shutdown()
         self._archive_window_loader.shutdown()
         self._archive_browser.shutdown()
+        # The export worker aborts cooperatively: an in-flight export
+        # removes its temp file (never a half-written destination) and
+        # queued exports are dropped with a log line.
+        self._archive_export_loader.shutdown()
         self._engine.stop()
         if self._live_tabs is not None:
             self._live_tabs.save_active_tab()

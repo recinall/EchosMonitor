@@ -476,6 +476,91 @@ def test_hvsr_handoff_carries_session_root(qtbot, tmp_path) -> None:
         window.close()
 
 
+def test_export_buttons_track_station_selection(qtbot, tmp_path, browser) -> None:
+    """The data exports share Load's precondition: a selected station with
+    session coverage (M3-C)."""
+    base = tmp_path / "archive"
+    _seed_session(base, "proj", started=_T0 - 10, ended=_T0 + 120)
+    tab = _make_tab(qtbot, base, browser)
+    assert not tab._export_mseed_button.isEnabled()
+    assert not tab._export_csv_button.isEnabled()
+    _wait_rows(qtbot, tab, 1)
+    tab.select_session_for_test(0)
+    _wait_station(qtbot, tab)
+    assert tab.select_station_for_test(_DEVICE, _STA)
+    assert tab._export_mseed_button.isEnabled()
+    assert tab._export_csv_button.isEnabled()
+
+
+def test_export_click_emits_exact_request(qtbot, tmp_path, browser, monkeypatch) -> None:
+    base = tmp_path / "archive"
+    _seed_session(base, "proj", started=_T0 - 10, ended=_T0 + 120)
+    tab = _make_tab(qtbot, base, browser)
+    _wait_rows(qtbot, tab, 1)
+    tab.select_session_for_test(0)
+    _wait_station(qtbot, tab)
+    assert tab.select_station_for_test(_DEVICE, _STA)
+
+    dest = tmp_path / "interval"  # extension intentionally missing
+    monkeypatch.setattr(
+        "echosmonitor.gui.widgets.archive_tab.QFileDialog.getSaveFileName",
+        staticmethod(lambda *a, **k: (str(dest), "MiniSEED (*.mseed)")),
+    )
+    captured: list[tuple] = []
+    tab.exportRequested.connect(lambda *a: captured.append(a))
+    sel_start, sel_end = tab.interval_for_test()
+
+    tab._export_mseed_button.click()
+
+    assert len(captured) == 1
+    fmt, device, group, t_start, t_end, path = captured[0]
+    assert fmt == "mseed"
+    assert device == _DEVICE
+    assert group == tab.selected_group()
+    assert (t_start, t_end) == (sel_start, sel_end)
+    assert path.endswith(".mseed")  # extension appended
+
+
+def test_closed_session_export_end_to_end(qtbot, tmp_path, monkeypatch) -> None:
+    """M3-C acceptance: a CLOSED session's interval exports to a readable
+    MiniSEED file through the real worker, with the engine fully idle."""
+    import obspy
+
+    from echosmonitor.config.schema import AppConfig, RootConfig, UiConfig
+    from echosmonitor.gui.main_window import MainWindow
+
+    base = tmp_path / "archive"
+    _seed_session(base, "field day", started=_T0 - 10, ended=_T0 + 120)
+    cfg = RootConfig(app=AppConfig(archive_root=base), ui=UiConfig(), devices=[])
+    window = MainWindow(cfg, tmp_path / "config.yaml")
+    qtbot.addWidget(window)
+    try:
+        assert window._engine.active_session() is None  # rule 13
+        tab = window._archive_tab
+        _wait_rows(qtbot, tab, 1)
+        tab.select_session_for_test(0)
+        _wait_station(qtbot, tab)
+        assert tab.select_station_for_test(_DEVICE, _STA)
+
+        dest = tmp_path / "field.mseed"
+        monkeypatch.setattr(
+            "echosmonitor.gui.widgets.archive_tab.QFileDialog.getSaveFileName",
+            staticmethod(lambda *a, **k: (str(dest), "MiniSEED (*.mseed)")),
+        )
+        tab._export_mseed_button.click()
+
+        qtbot.waitUntil(dest.is_file, timeout=15_000)
+        qtbot.waitUntil(
+            lambda: "Exported MSEED" in tab.status_text_for_test(), timeout=15_000
+        )
+        back = obspy.read(str(dest))
+        assert {tr.stats.channel for tr in back} == {"HHZ", "HHN", "HHE"}
+        assert sum(tr.stats.npts for tr in back) > 0
+        assert window._engine.active_session() is None
+    finally:
+        window.close()
+
+
 def test_close_does_not_resurrect_browser_thread(qtbot, tmp_path) -> None:
     """Teardown regression (qt-concurrency-auditor F1): a sessionChanged
     emitted at/after closeEvent (engine.stop closes the active session)

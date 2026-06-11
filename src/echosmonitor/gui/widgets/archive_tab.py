@@ -193,6 +193,9 @@ class ArchiveTab(QWidget):
     loadRequested = Signal(str, object, float, float)  # noqa: N815
     hvsrRequested = Signal(str, object, float, float)  # noqa: N815
     unitChangeRequested = Signal(str)  # unit code  # noqa: N815
+    # fmt("mseed"|"csv"), device, group, t_start, t_end, dest_path —
+    # the host resolves the session context and dispatches the worker.
+    exportRequested = Signal(str, str, object, float, float, str)  # noqa: N815
 
     def __init__(
         self,
@@ -339,6 +342,19 @@ class ArchiveTab(QWidget):
 
         self._load_button = QPushButton("Load window", self)
         self._load_button.setToolTip("Read the selected interval from the archive (static view).")
+        # Per-interval data exports (M3-C): re-read the SELECTED interval
+        # from the archive on the export worker — no render required, so
+        # large intervals export without being plotted first.
+        self._export_mseed_button = QPushButton("Export MiniSEED…", self)
+        self._export_mseed_button.setEnabled(False)
+        self._export_mseed_button.setToolTip(
+            "Save the selected interval's archived records as a MiniSEED file."
+        )
+        self._export_csv_button = QPushButton("Export CSV…", self)
+        self._export_csv_button.setEnabled(False)
+        self._export_csv_button.setToolTip(
+            "Save the selected interval as CSV (counts; gaps stay empty cells)."
+        )
 
         # Let the wide controls shrink horizontally so this tab page's minimum
         # width never inflates the central QTabWidget minimum (the layout trap
@@ -366,8 +382,12 @@ class ArchiveTab(QWidget):
         interval.addWidget(QLabel("to"))
         interval.addWidget(self._end_edit, stretch=3)
         interval.addWidget(self._load_button)
+        interval.addWidget(self._export_mseed_button)
+        interval.addWidget(self._export_csv_button)
         interval.addStretch(1)
         form.addRow("Interval:", _wrap(interval))
+        for btn in (self._export_mseed_button, self._export_csv_button):
+            btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         # --- view area ---------------------------------------------------
         self._view_container = self._build_view()
@@ -580,6 +600,8 @@ class ArchiveTab(QWidget):
         self._start_edit.dateTimeChanged.connect(lambda _d: self._update_coverage())
         self._end_edit.dateTimeChanged.connect(lambda _d: self._update_coverage())
         self._load_button.clicked.connect(self._on_load_clicked)
+        self._export_mseed_button.clicked.connect(lambda: self._on_export_data_clicked("mseed"))
+        self._export_csv_button.clicked.connect(lambda: self._on_export_data_clicked("csv"))
         self._unit_combo.currentIndexChanged.connect(self._on_unit_combo_changed)
         self._stacked_radio.toggled.connect(self._on_layout_toggled)
         self._readout_combo.currentIndexChanged.connect(lambda _i: self._refresh_readout())
@@ -812,7 +834,7 @@ class ArchiveTab(QWidget):
         self._group_label.setText("—")
         self._extent_label.setText(_NO_DATA_TEXT)
         self._coverage.set_coverage(0.0, 0.0, [])
-        self._load_button.setEnabled(False)
+        self._set_interval_actions_enabled(False)
         self._title.setText(_NO_STREAM_TITLE)
 
     # ------------------------------------------------------------------
@@ -837,7 +859,7 @@ class ArchiveTab(QWidget):
             # those are browsable via their own rows).
             self._extent_label.setText(self._empty_extent_message(station.device))
             self._coverage.set_coverage(0.0, 0.0, [])
-            self._load_button.setEnabled(False)
+            self._set_interval_actions_enabled(False)
             self._title.setText(_NO_STREAM_TITLE)
             return
         cov_start = station.intervals[0][0]
@@ -853,7 +875,7 @@ class ArchiveTab(QWidget):
         self._end_edit.setDateTime(_qdt_from_epoch(cov_end))
         self._start_edit.blockSignals(False)
         self._end_edit.blockSignals(False)
-        self._load_button.setEnabled(True)
+        self._set_interval_actions_enabled(True)
         self._update_coverage()
         detail = self._detail
         project = (
@@ -926,6 +948,59 @@ class ArchiveTab(QWidget):
         self._pending_window = (device, dict(group), t_start, t_end)
         self._status_label.setText("Loading window…")
         self.loadRequested.emit(device, dict(group), t_start, t_end)
+
+    def _set_interval_actions_enabled(self, enabled: bool) -> None:
+        """Load + the per-interval data exports share one precondition: a
+        selected station with archived coverage in this session."""
+        self._load_button.setEnabled(enabled)
+        self._export_mseed_button.setEnabled(enabled)
+        self._export_csv_button.setEnabled(enabled)
+
+    # ------------------------------------------------------------------
+    # Per-interval data exports (M3-C)
+    # ------------------------------------------------------------------
+    def _on_export_data_clicked(self, fmt: str) -> None:
+        # Selection is snapshotted before the modal dialog; the host
+        # resolves the session context at emit time, right after it.
+        # The dialog is application-modal and sessions change only via
+        # user input (rule 13), so the two snapshots cannot diverge.
+        group = self.selected_group()
+        device = self.selected_device()
+        if group is None or device is None:
+            return
+        t_start = _epoch_from_qdt(self._start_edit.dateTime())
+        t_end = _epoch_from_qdt(self._end_edit.dateTime())
+        if t_end <= t_start:
+            self._status_label.setText("The end time must be after the start time.")
+            return
+        from echosmonitor.storage.sds import sanitize_device_name
+
+        ext = "mseed" if fmt == "mseed" else "csv"
+        label = "MiniSEED (*.mseed)" if fmt == "mseed" else "CSV (*.csv)"
+        stamp = UTCDateTime(t_start).strftime("%Y%m%dT%H%M%S")
+        default = f"archive_{sanitize_device_name(device)}_{stamp}.{ext}"
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export archive interval", default, label
+        )
+        if not path:
+            return
+        if not path.lower().endswith(f".{ext}"):
+            path += f".{ext}"
+        self._status_label.setText(f"Exporting {ext.upper()}…")
+        self.exportRequested.emit(fmt, device, dict(group), t_start, t_end, path)
+
+    def show_export_done(self, fmt: str, dest_path: str, n_bytes: int) -> None:
+        self._status_label.setText(
+            f"Exported {fmt.upper()} ({n_bytes:,} bytes) to {dest_path}."
+        )
+
+    def show_export_empty(self) -> None:
+        self._status_label.setText(
+            "Nothing archived in the selected interval — no file was written."
+        )
+
+    def show_export_failed(self, message: str) -> None:
+        self._status_label.setText(f"Export failed: {message}")
 
     # ------------------------------------------------------------------
     # Rendering the loaded window (called by the host on the GUI thread)

@@ -435,7 +435,34 @@ at `storage/sds.py:130–168` has zero callers).
         loaded-window metadata (requests are committed into the
         `_loaded_*` fields only when their result renders); a component
         absent from a new load is relabelled.
-- [ ] **C. Exports**: per-interval MiniSEED export, CSV of a trace window.
+- [x] **C. Exports**: per-interval MiniSEED export, CSV of a trace window.
+      *Done 2026-06-11* (gate 956 green; code-reviewer APPROVE +
+      qt-concurrency-auditor PASS, all minors folded in):
+  - [x] `storage/exports.py`: atomic writers (tmp in same dir → fsync →
+        `os.replace`; tmp unlinked on EVERY non-success path — a
+        cancelled/failed export never leaves a partial file). MiniSEED
+        from the SPLIT window stream → gaps stay separate records,
+        samples bit-identical; CSV on one shared 1/fs grid, gaps as
+        EMPTY cells (never interpolated), `# key: value` header meta,
+        cooperative-stop poll every 50k rows (rule 7).
+  - [x] `core/archive_export_worker.py`: new worker on the loader
+        skeleton with a decision-logged deviation — exports are a
+        SERIAL QUEUE, never latest-wins (each request is an explicit
+        save; tokens only route results). Stop flag is shutdown-only and
+        re-armed exclusively via the queued clear (auditor: a sync clear
+        without a token supersede could resurrect an export queued
+        behind a shutdown). Per-request ro DAO; reads from the
+        session-scoped root (rule 14) snapshotted at request time.
+  - [x] Archive tab: Export MiniSEED…/CSV… beside Load, sharing its
+        precondition (selected station + session coverage) — exports
+        re-read the SELECTED interval from the archive, no render
+        required; default filename from device + interval start.
+  - [x] acceptance pinned end-to-end:
+        `test_closed_session_export_end_to_end` (MainWindow → real
+        worker → obspy-readable 3-channel MiniSEED, engine fully idle)
+        + worker/storage suites (gap-split roundtrip, CSV grid + gap
+        cells, serial-queue-not-latest-wins, shutdown-during-busy
+        leaves no artifact and restarts, mixed-rate CSV refusal).
 - [ ] **D. Re-indexer**: rebuild the DB from the SDS tree
       (`parse_sds_path` exists) for archives copied from another machine.
 - [ ] **E. Hand-offs**: Archive → HVSR keeps working with the session-rooted
@@ -571,6 +598,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 
 | 2026-06-11 | M3-B: the hidden trace view (Stacked vs Overlaid) is **never statically X-linked**; the layout toggle copies the range once and re-targets the spectrogram's link to the visible view | pyqtgraph maps linked ranges through each view's pixel geometry; a HIDDEN view's degenerate geometry distorts the range it pushes back (~3 % drift per load, found by `test_x_range_fits_loaded_window`). Pixel-alignment between *visible* overlapping views is intended behavior — the spectrogram-link test asserts span-relative follow, not exact equality. |
 | 2026-06-11 | M3-B: gappy components stay in counts on a unit switch (no per-segment decon), but the display says so per component | An FFT response removal smears NaNs across the window and `miniseed-sds` mandates rejecting gapped windows for science; per-segment decon would be new science behavior, out of polish scope. The honesty layer (per-component labels, "(counts — gaps)", overlay "mixed units") removes the silent-mix lie instead. Revisit per-segment decon only with a real field need. |
+
+| 2026-06-11 | M3-C: the export worker is a **serial queue**, not latest-wins; its stop flag is shutdown-only and re-armed ONLY via the queued clear | An export is an explicit "save this file" — a second request cancelling the first is data loss, the inverse of the read loaders' supersede semantics. Without a token supersede, the loaders' synchronous stop-clear idiom is unsafe (it could resurrect an export queued behind a shutdown on the restart path — auditor finding); queue FIFO drains stale requests against the still-set flag before the queued clear lands. The request seam is deliberately uncapped (rule 5 deviation): drop-oldest is wrong for saves, and each request costs one application-modal dialog — click-bounded. |
+| 2026-06-11 | M3-C: exports re-read the interval from the archive (split stream → MiniSEED; shared grid → CSV), never the on-screen arrays; mixed-rate groups refuse the CSV grid | The MiniSEED files are the source of truth (rule 8) — re-reading preserves dtype/encoding bit-identically and exports work without rendering; the display pipeline is float64 with NaN gap-breaks, a render not an archive format. A CSV is one grid: components at different rates get a clear refusal, not resampling. |
 
 ## Open questions (resolve before the milestone that needs them)
 
