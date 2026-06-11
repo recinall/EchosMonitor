@@ -26,10 +26,12 @@ real per-session coverage**.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pyqtgraph as pg
+import structlog
 from obspy import UTCDateTime
 from PySide6.QtCore import QDate, QDateTime, QRectF, Qt, QTimeZone, Signal, SignalInstance, Slot
 from PySide6.QtGui import QBrush, QColor, QPainter, QPaintEvent
@@ -39,10 +41,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDateTimeEdit,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSizePolicy,
@@ -73,9 +77,9 @@ from echosmonitor.gui.widgets.spectrogram_view import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
+
+_log = structlog.get_logger(__name__)
 
 _COMPONENTS = ("Z", "N", "E")
 _COMP_PENS = {
@@ -216,8 +220,17 @@ class ArchiveTab(QWidget):
         self._loaded_group: dict[str, str] = {}
         self._win_t_start = 0.0
         self._win_t_end = 0.0
+        # The request currently in flight, committed into the _loaded_*
+        # fields only when its result actually renders (show_result) — a
+        # failed/empty request must not rebind what exports and hand-offs
+        # say about the window still on screen.
+        self._pending_window: tuple[str, dict[str, str], float, float] | None = None
         self._display: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        self._unit_label = "counts"
+        # Unit label PER COMPONENT (M3-B): a gappy component is skipped by
+        # deconvolution (an FFT response removal would smear its NaNs) and
+        # stays in counts while its siblings switch — one global label
+        # would lie about whichever side it doesn't match.
+        self._unit_labels: dict[str, str] = {}
         self._cursor_pos: dict[str, float] = {"A": 0.0, "B": 0.0}
         self._cursor_lines: dict[str, list[pg.InfiniteLine]] = {"A": [], "B": []}
         self._suppress_cursor = False
@@ -411,6 +424,9 @@ class ArchiveTab(QWidget):
         for comp in _COMPONENTS:
             self._readout_combo.addItem(comp, comp)
         self._reset_button = QPushButton("Reset view", self)
+        self._export_button = QPushButton("Export PNG…", self)
+        self._export_button.setEnabled(False)
+        self._export_button.setToolTip("Save the rendered traces + spectrogram as a PNG image.")
         self._hvsr_button = QPushButton("Run HVSR on this window", self)
         self._hvsr_button.setEnabled(False)
         bar.addWidget(QLabel("Units:"))
@@ -421,6 +437,7 @@ class ArchiveTab(QWidget):
         bar.addWidget(self._readout_combo)
         bar.addWidget(self._reset_button)
         bar.addStretch(1)
+        bar.addWidget(self._export_button)
         bar.addWidget(self._hvsr_button)
         # The toolbar's long-text buttons + combos would otherwise pin this tab
         # page's minimum width and inflate the central QTabWidget minimum (the
@@ -430,6 +447,7 @@ class ArchiveTab(QWidget):
             self._unit_combo,
             self._readout_combo,
             self._reset_button,
+            self._export_button,
             self._hvsr_button,
         ):
             w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -453,6 +471,15 @@ class ArchiveTab(QWidget):
             self._stacked_curves[comp] = plot.plot(pen=_COMP_PENS[comp])
         self._stacked_plots["N"].setXLink(self._stacked_plots["Z"])
         self._stacked_plots["E"].setXLink(self._stacked_plots["Z"])
+        # Zoom/pan ergonomics (M3-B): browsing an archive window is a
+        # time-axis activity — the mouse drives X only, and Y auto-fits
+        # the data VISIBLE in the current X range (the "seismologist
+        # zoom": zooming into a quiet stretch rescales amplitudes to it).
+        # An accidental Y zoom losing the trace was the ergonomic trap.
+        for plot in self._stacked_plots.values():
+            plot.setMouseEnabled(x=True, y=False)
+            plot.getViewBox().setAutoVisible(y=True)
+            plot.enableAutoRange(axis="y")
 
         self._overlay_glw = pg.GraphicsLayoutWidget()
         self._overlay_plot = self._overlay_glw.addPlot(
@@ -466,6 +493,15 @@ class ArchiveTab(QWidget):
         self._overlay_curves: dict[str, pg.PlotDataItem] = {}
         for comp in _COMPONENTS:
             self._overlay_curves[comp] = self._overlay_plot.plot(pen=_COMP_PENS[comp], name=comp)
+        # NOT statically X-linked to the stacked plots: exactly one of the
+        # two trace views is visible at a time, and pyqtgraph maps linked
+        # ranges through each view's pixel geometry — a HIDDEN view's
+        # degenerate geometry distorts the range it pushes back (measured
+        # ~3 % drift per load). The time zoom is carried across the
+        # Stacked/Overlaid switch by _on_layout_toggled instead.
+        self._overlay_plot.setMouseEnabled(x=True, y=False)
+        self._overlay_plot.getViewBox().setAutoVisible(y=True)
+        self._overlay_plot.enableAutoRange(axis="y")
 
         self._trace_stack_host = QWidget(self)
         self._trace_stack = QVBoxLayout(self._trace_stack_host)
@@ -484,6 +520,11 @@ class ArchiveTab(QWidget):
         self._spec_plot.setMinimumSize(40, 40)
         self._spec_image = pg.ImageItem(axisOrder="row-major")
         self._spec_plot.addItem(self._spec_image)
+        # The spectrogram shares the traces' time axis: zoom/pan in either
+        # stays in sync (M3-B ergonomics). Its Y is the frequency extent —
+        # fixed per load in _render_spectrogram, never mouse-driven.
+        self._spec_plot.setXLink(self._stacked_plots["Z"])
+        self._spec_plot.setMouseEnabled(x=True, y=False)
 
         self._trace_host.addWidget(self._trace_stack_host)
         self._trace_host.addWidget(self._spec_glw)
@@ -543,6 +584,7 @@ class ArchiveTab(QWidget):
         self._stacked_radio.toggled.connect(self._on_layout_toggled)
         self._readout_combo.currentIndexChanged.connect(lambda _i: self._refresh_readout())
         self._reset_button.clicked.connect(self._reset_view)
+        self._export_button.clicked.connect(self._on_export_clicked)
         self._hvsr_button.clicked.connect(lambda: self._emit_handoff(self.hvsrRequested))
 
     # ------------------------------------------------------------------
@@ -877,12 +919,11 @@ class ArchiveTab(QWidget):
             self._status_label.setText("The end time must be after the start time.")
             return
         self._update_coverage()
-        # Record the selection the load was requested for; the result + the
-        # HVSR hand-off and unit decon all operate on exactly this window.
-        self._loaded_device = device
-        self._loaded_group = dict(group)
-        self._win_t_start = t_start
-        self._win_t_end = t_end
+        # Snapshot the selection the load was requested for; show_result
+        # commits it into the _loaded_* fields when (and only when) the
+        # window renders — the HVSR hand-off, unit decon and PNG export
+        # all describe exactly the window on screen.
+        self._pending_window = (device, dict(group), t_start, t_end)
         self._status_label.setText("Loading window…")
         self.loadRequested.emit(device, dict(group), t_start, t_end)
 
@@ -891,10 +932,26 @@ class ArchiveTab(QWidget):
     # ------------------------------------------------------------------
     def show_result(self, result: ArchiveWindowResult) -> None:
         """Render a loaded window: 3C traces (counts) + spectrogram + cursors."""
+        # Commit the request this result belongs to (snapshotted by
+        # _on_load_clicked): the loaded-window metadata must describe what
+        # is ON SCREEN, never a later request that failed or came back
+        # empty — exports and hand-offs read it (review finding).
+        if self._pending_window is not None:
+            (
+                self._loaded_device,
+                self._loaded_group,
+                self._win_t_start,
+                self._win_t_end,
+            ) = self._pending_window
+            self._pending_window = None
         self._display = {}
         self._reset_unit_combo_to_counts()
-        self._unit_label = "counts"
+        self._unit_labels = {}
         for comp in _COMPONENTS:
+            # Relabel EVERY row per load: an absent component must not keep
+            # the previous window's unit / "counts — gaps" label over an
+            # empty plot (review finding).
+            self._stacked_plots[comp].setLabel("left", f"{comp} (counts)")
             tr = next((t for t in result.traces if t.comp == comp), None)
             if tr is None:
                 self._stacked_curves[comp].clear()
@@ -904,7 +961,6 @@ class ArchiveTab(QWidget):
             y = np.asarray(tr.y, dtype=np.float64)
             self._stacked_curves[comp].setData(x, y, connect="finite")
             self._overlay_curves[comp].setData(x, y, connect="finite")
-            self._stacked_plots[comp].setLabel("left", f"{comp} (counts)")
             self._display[comp] = (x, y)
         self._render_spectrogram(result)
         # Fit the X range to the loaded window so curves are never stuck at
@@ -915,8 +971,19 @@ class ArchiveTab(QWidget):
             for plot in self._stacked_plots.values():
                 plot.enableAutoRange(axis="y")
             self._overlay_plot.enableAutoRange(axis="y")
+            # Bound pan/zoom to the loaded window ± one window-width
+            # (M3-B ergonomics): there is nothing to see further out, and
+            # an over-pan to epoch-nowhere used to require a full reset.
+            span = self._win_t_end - self._win_t_start
+            for plot in (*self._stacked_plots.values(), self._overlay_plot, self._spec_plot):
+                plot.setLimits(
+                    xMin=self._win_t_start - span,
+                    xMax=self._win_t_end + span,
+                )
         self._place_cursors()
         self._hvsr_button.setEnabled(True)
+        self._export_button.setEnabled(True)
+        self._refresh_overlay_label()
         self._status_label.setText(
             f"Loaded {len(result.traces)} component(s) over "
             f"{UTCDateTime(self._win_t_start)} → {UTCDateTime(self._win_t_end)}."
@@ -924,19 +991,32 @@ class ArchiveTab(QWidget):
 
     def show_empty(self) -> None:
         self._display = {}
+        self._pending_window = None  # the request found nothing — discard
+        # Reset the unit state with the curves: empty axes must not keep
+        # claiming "Velocity" / "counts — gaps" / "mixed units" from the
+        # previous window (review major — the unit-honesty objective).
+        self._unit_labels = {}
+        self._reset_unit_combo_to_counts()
         for comp in _COMPONENTS:
             self._stacked_curves[comp].clear()
             self._overlay_curves[comp].clear()
+            self._stacked_plots[comp].setLabel("left", f"{comp} (counts)")
+        self._refresh_overlay_label()
         self._spec_image.clear()
         for which in ("A", "B"):
             for line in self._cursor_lines[which]:
                 line.setVisible(False)
         self._readout_label.setText("")
         self._hvsr_button.setEnabled(False)
+        self._export_button.setEnabled(False)
         self._unit_combo.setEnabled(False)
         self._status_label.setText("No archived data for this interval.")
 
     def show_failed(self, message: str) -> None:
+        # The failed REQUEST never rendered: keep showing (and describing)
+        # the previous window — discard the pending metadata so exports
+        # and hand-offs keep naming what is actually on screen.
+        self._pending_window = None
         self._status_label.setText(f"Archive read failed: {message}")
 
     def _render_spectrogram(self, result: ArchiveWindowResult) -> None:
@@ -1008,7 +1088,9 @@ class ArchiveTab(QWidget):
         a, b = self._cursor_pos["A"], self._cursor_pos["B"]
         amp_a = self._amplitude_at(comp, a)
         amp_b = self._amplitude_at(comp, b)
-        unit = self._unit_label
+        # Per-component unit: a gappy sibling left in counts must not make
+        # this component's readout claim the wrong unit (M3-B).
+        unit = self._unit_labels.get(comp, "counts")
 
         def _amp(v: float | None) -> str:
             return "gap" if v is None else f"{v:.4g} {unit}"
@@ -1041,10 +1123,64 @@ class ArchiveTab(QWidget):
         self._overlay_plot.enableAutoRange(axis="y")
 
     # ------------------------------------------------------------------
+    # PNG export (M3-B)
+    # ------------------------------------------------------------------
+    def export_png(self, path: Path) -> bool:
+        """Render the current traces + spectrogram view to ``path`` as PNG.
+
+        A widget grab of the view splitter (exactly what is on screen —
+        zoom, units, cursors included). One-shot user action on the GUI
+        thread, same as the HVSR report/CSV exports; the write is a
+        screenshot-sized pixmap, not the archive data path.
+        """
+        pixmap = self._trace_host.grab()
+        ok = bool(pixmap.save(str(path), "PNG"))
+        if ok:
+            self._status_label.setText(f"View exported to {path}.")
+            _log.info(
+                "archive_view_png_exported",
+                path=str(path),
+                device=self._loaded_device,
+                width=pixmap.width(),
+                height=pixmap.height(),
+            )
+        else:
+            _log.warning("archive_view_png_export_failed", path=str(path))
+        return ok
+
+    def _on_export_clicked(self) -> None:
+        if not self._display:
+            return
+        from echosmonitor.storage.sds import sanitize_device_name
+
+        stamp = UTCDateTime(self._win_t_start).strftime("%Y%m%dT%H%M%S")
+        default = f"archive_{sanitize_device_name(self._loaded_device)}_{stamp}.png"
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "Export archive view", default, "PNG image (*.png)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        if not self.export_png(Path(path)):
+            QMessageBox.warning(
+                self, "Export PNG", f"Could not write the image to:\n{path}"
+            )
+
+    # ------------------------------------------------------------------
     # Stacked / overlaid toggle
     # ------------------------------------------------------------------
     def _on_layout_toggled(self, _checked: bool) -> None:
         stacked = self._stacked_radio.isChecked()
+        # Carry the time zoom across the switch (M3-B ergonomics) by
+        # copying the range once, and re-target the spectrogram's X-link
+        # to the view that is about to be visible — a static link through
+        # the hidden one would distort ranges (see _build_view note).
+        src = self._overlay_plot if stacked else self._stacked_plots["Z"]
+        dst = self._stacked_plots["Z"] if stacked else self._overlay_plot
+        lo, hi = src.viewRange()[0]
+        dst.setXRange(lo, hi, padding=0.0)
+        self._spec_plot.setXLink(dst)
         self._stacked_glw.setVisible(stacked)
         self._overlay_glw.setVisible(not stacked)
 
@@ -1072,11 +1208,12 @@ class ArchiveTab(QWidget):
     def revert_to_counts(self) -> None:
         """Re-render every component in counts (e.g. response unavailable)."""
         self._reset_unit_combo_to_counts()
-        self._unit_label = "counts"
+        self._unit_labels = {}
         for comp, (x, y) in self._display.items():
             self._stacked_curves[comp].setData(x, y, connect="finite")
             self._overlay_curves[comp].setData(x, y, connect="finite")
             self._stacked_plots[comp].setLabel("left", f"{comp} (counts)")
+        self._refresh_overlay_label()
         self._refresh_readout()
 
     def show_physical_component(self, comp: str, unit_label: str, samples: np.ndarray) -> None:
@@ -1093,8 +1230,38 @@ class ArchiveTab(QWidget):
         self._overlay_curves[comp].setData(x, y, connect="finite")
         self._stacked_plots[comp].setLabel("left", f"{comp} ({unit_label})")
         code = str(self._unit_combo.currentData())
-        self._unit_label = _UNIT_LABELS.get(code, unit_label)
+        self._unit_labels[comp] = _UNIT_LABELS.get(code, unit_label)
+        self._refresh_overlay_label()
         self._refresh_readout()
+
+    def mark_components_left_in_counts(self, comps: list[str]) -> None:
+        """Flag components a unit switch left in counts (gaps — rule honesty).
+
+        Deconvolution skips components carrying NaN gaps (an FFT response
+        removal would smear them across the window); the display must say
+        so rather than silently mixing units. Called by the host after a
+        PARTIAL unit dispatch.
+        """
+        for comp in comps:
+            if comp in self._display:
+                self._stacked_plots[comp].setLabel("left", f"{comp} (counts — gaps)")
+        if comps:
+            self._status_label.setText(
+                f"{', '.join(sorted(comps))} left in counts: gaps prevent deconvolution."
+            )
+        self._refresh_overlay_label()
+
+    def _refresh_overlay_label(self) -> None:
+        """The overlaid plot has ONE y axis — label it with the common unit,
+        or call out the mix (it used to stay 'counts' forever). An empty
+        display resets to counts (a frozen stale label was the trap)."""
+        labels = {self._unit_labels.get(comp, "counts") for comp in self._display}
+        if len(labels) == 1:
+            self._overlay_plot.setLabel("left", next(iter(labels)))
+        elif len(labels) > 1:
+            self._overlay_plot.setLabel("left", "mixed units — see stacked view")
+        else:
+            self._overlay_plot.setLabel("left", "counts")
 
     def _reset_unit_combo_to_counts(self) -> None:
         self._suppress_unit = True
@@ -1190,6 +1357,12 @@ class ArchiveTab(QWidget):
     def top_unit_label_for_test(self, comp: str = "Z") -> str:
         axis = self._stacked_plots[comp].getAxis("left")
         return str(axis.labelText)
+
+    def overlay_unit_label_for_test(self) -> str:
+        return str(self._overlay_plot.getAxis("left").labelText)
+
+    def export_enabled_for_test(self) -> bool:
+        return self._export_button.isEnabled()
 
     def set_cursor_epoch_for_test(self, which: str, epoch: float) -> None:
         """Drive a cursor to a known epoch (offscreen drag is undeliverable)."""

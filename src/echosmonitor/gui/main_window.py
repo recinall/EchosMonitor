@@ -1740,6 +1740,7 @@ class MainWindow(QMainWindow):
             return
         device, group, _t_start, _t_end = self._archive_tab.current_window()
         dispatched = 0
+        skipped_gappy: list[str] = []
         for comp, nslc in group.items():
             # Always deconvolve from the COUNTS samples the loader produced
             # (``_archive_window_traces``), never the currently-displayed curve
@@ -1749,6 +1750,7 @@ class MainWindow(QMainWindow):
                 continue
             arr = np.asarray(tr.y, dtype=np.float64)
             if not np.all(np.isfinite(arr)):
+                skipped_gappy.append(comp)
                 continue  # gappy component — cannot deconvolve cleanly
             self._decon_token += 1
             self._archive_window_decon[self._decon_token] = comp
@@ -1768,6 +1770,12 @@ class MainWindow(QMainWindow):
             bar = self.statusBar()
             if bar is not None:
                 bar.showMessage("Cannot deconvolve: all window components have gaps", 6000)
+        elif skipped_gappy:
+            # Partial dispatch: the siblings switch units while these stay
+            # in counts — say so on the plot labels + status (M3-B; a
+            # silent mixed-unit display lies about whichever side it
+            # doesn't match).
+            self._archive_tab.mark_components_left_in_counts(skipped_gappy)
 
     def _handoff_archive_to_hvsr(
         self, device: object, group: object, t_start_epoch: float, t_end_epoch: float

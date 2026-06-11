@@ -407,9 +407,34 @@ at `storage/sds.py:130–168` has zero callers).
         percent-encoded (paths with `?`/`#`/`%`); probe-failure DAO
         closed explicitly; the per-session "streams indexed, no files"
         empty state re-pinned.
-- [ ] **B. Window viewing**: verify + polish the static 3C view +
+- [x] **B. Window viewing**: verify + polish the static 3C view +
       spectrogram for any session/interval (mostly implemented; remaining:
       zoom/pan ergonomics, unit switching with gaps, export PNG).
+      *Done 2026-06-11* (gate 940 green; code-reviewer findings all fixed
+      with regression tests; no thread surface → no concurrency audit):
+  - [x] zoom/pan ergonomics: mouse drives X only with Y auto-fitting the
+        VISIBLE data ("seismologist zoom"); the spectrogram is X-linked
+        to the visible trace view; pan/zoom clamped to the loaded window
+        ± one span; Stacked↔Overlaid carries the time zoom by a one-shot
+        range copy in the toggle (decision log: the hidden view must NOT
+        be statically X-linked).
+  - [x] unit switching with gaps stays honest per component: gappy
+        components are still skipped by decon (FFT response removal
+        would smear NaNs — `miniseed-sds` gap discipline), but are now
+        labelled "(counts — gaps)" with a status notice; the readout
+        reports each component in ITS unit; the overlaid plot's single
+        y axis shows the common unit or "mixed units — see stacked
+        view" (it used to stay 'counts' forever). Pinned tab-level and
+        through the real decon worker.
+  - [x] Export PNG: toolbar button (enabled only with a loaded window),
+        widget-grab of the traces+spectrogram exactly as shown, default
+        filename from device + window start, one-shot GUI-thread write
+        (the HVSR report/CSV precedent).
+  - [x] review findings fixed + regression-tested: empty/failed re-loads
+        no longer leak the previous window's unit labels or rebind the
+        loaded-window metadata (requests are committed into the
+        `_loaded_*` fields only when their result renders); a component
+        absent from a new load is relabelled.
 - [ ] **C. Exports**: per-interval MiniSEED export, CSV of a trace window.
 - [ ] **D. Re-indexer**: rebuild the DB from the SDS tree
       (`parse_sds_path` exists) for archives copied from another machine.
@@ -543,6 +568,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M3-A: browser truth = `SessionEntry` (session_root + db_path), **including for the open session**; per-device `archive.root_dir` override archives are not browsable | Discovery can only see base-rooted project dirs (the decision-logged M2-B injectivity scope); routing the open session through the engine instead would make the same window behave differently mid-recording vs after Stop. Revisit with the override-root edge config if the field uses it. |
 | 2026-06-11 | M3-A: detection-table history prefill across session DBs stays OPEN (not part of A) | A's acceptance is the waveform browser; the detections table still fills from live sessions only. The browser's discovery layer is the natural substrate when M3 revisits it. |
 | 2026-06-11 | M3-A: per-session station trees show only `session_devices` members; a membership-less row (base monitoring index) falls back to ALL devices in that DB | Membership is the rule-14 record of who recorded; the monitoring index has no membership by design and hiding everything would make it look broken. Coverage stays the honest signal either way. |
+
+| 2026-06-11 | M3-B: the hidden trace view (Stacked vs Overlaid) is **never statically X-linked**; the layout toggle copies the range once and re-targets the spectrogram's link to the visible view | pyqtgraph maps linked ranges through each view's pixel geometry; a HIDDEN view's degenerate geometry distorts the range it pushes back (~3 % drift per load, found by `test_x_range_fits_loaded_window`). Pixel-alignment between *visible* overlapping views is intended behavior — the spectrogram-link test asserts span-relative follow, not exact equality. |
+| 2026-06-11 | M3-B: gappy components stay in counts on a unit switch (no per-segment decon), but the display says so per component | An FFT response removal smears NaNs across the window and `miniseed-sds` mandates rejecting gapped windows for science; per-segment decon would be new science behavior, out of polish scope. The honesty layer (per-component labels, "(counts — gaps)", overlay "mixed units") removes the silent-mix lie instead. Revisit per-segment decon only with a real field need. |
 
 ## Open questions (resolve before the milestone that needs them)
 
