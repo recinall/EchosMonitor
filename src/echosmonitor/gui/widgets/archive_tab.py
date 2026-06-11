@@ -1,23 +1,27 @@
-"""Central "Archive" tab — browse the recorded archive and view it statically.
+"""Central "Archive" tab — session browser + static window view (M3-A).
 
-This is the explore-driven entry point into the SDS archive: pick a device +
-3-component station, see the real recorded extent and where data exists vs
-gaps, choose an interval, and load it **statically** (no animated playback —
-an explicit scope decision; the reverted replay attempt starved the live
-worker by rendering on the GUI thread). The heavy read + spectrogram build run
-off the GUI thread via :class:`~echosmonitor.core.archive_window_loader.
-ArchiveWindowLoader` (Stage B); this widget only emits a request and renders
-the result with cheap ``setData`` calls.
+Sessions are the archive unit (rule 14), so the browser is session-centric:
+a searchable/date-filterable session list (crash-dirty sessions visibly
+flagged), a per-session device/station tree with coverage strips, and the
+static 3C + spectrogram view over a chosen interval. Selecting a CLOSED
+session works with no live engine context at all — its data lives under
+``<base>/<project>/`` where the live readers cannot reach it (the M2-B
+NOTE in ROADMAP); the browser carries each session's root + ``archive.db``
+explicitly (:class:`~echosmonitor.core.models.SessionEntry`).
 
-Archive access is **read-only** (CLAUDE.md rule 8). The browser never invents
-placeholder dates: an un-archived stream shows an honest empty state, and the
-default interval is always a recent slice **within the real extent**.
+Every read happens off the GUI thread (rule 1): session discovery and the
+per-session tree/coverage on the
+:class:`~echosmonitor.core.archive_browser_loader.ArchiveBrowserLoader`,
+the waveform/spectrogram load on :class:`~echosmonitor.core.
+archive_window_loader.ArchiveWindowLoader` — this widget only emits
+requests and renders results with cheap ``setData`` calls. The coverage
+strip under the interval editors is sliced client-side from the already-
+loaded session coverage (pure arithmetic, no DB).
 
-Stage A (this skeleton): the browser — device/station selection, extent +
-coverage display, a sensible default interval, and a "Load window" button that
-emits :attr:`loadRequested`. Stage B fills in the static 3C view, the
-spectrogram, the physical-unit selector, and the measurement cursors; Stage C
-adds the HVSR hand-off button.
+Archive access is **read-only** (CLAUDE.md rule 8). The browser never
+invents placeholder dates: an un-archived stream shows an honest empty
+state, and the default interval is always a recent slice **within the
+real per-session coverage**.
 """
 
 from __future__ import annotations
@@ -27,27 +31,37 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pyqtgraph as pg
 from obspy import UTCDateTime
-from PySide6.QtCore import QDateTime, QRectF, Qt, QTimeZone, Signal, SignalInstance, Slot
-from PySide6.QtGui import QColor, QPainter, QPaintEvent
+from PySide6.QtCore import QDate, QDateTime, QRectF, Qt, QTimeZone, Signal, SignalInstance, Slot
+from PySide6.QtGui import QBrush, QColor, QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
+    QDateEdit,
     QDateTimeEdit,
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QRadioButton,
     QSizePolicy,
     QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from echosmonitor.core.archive_browser_loader import (
+    SessionDetailResult,
+    SessionListResult,
+    StationCoverage,
+)
 from echosmonitor.core.archive_window_loader import (
     ArchiveWindowResult,
 )
-from echosmonitor.gui.widgets.hvsr_widget import three_component_groups
+from echosmonitor.core.models import SessionEntry
 from echosmonitor.gui.widgets.pane_header import (
     PANE_TITLE_OBJECT_NAME,
     PANE_TITLE_STYLE,
@@ -59,8 +73,9 @@ from echosmonitor.gui.widgets.spectrogram_view import (
 )
 
 if TYPE_CHECKING:
-    from echosmonitor.core.streaming_engine import StreamingEngine
-    from echosmonitor.storage.dao import ArchiveDao
+    from pathlib import Path
+
+    from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
 
 _COMPONENTS = ("Z", "N", "E")
 _COMP_PENS = {
@@ -85,11 +100,21 @@ _UNIT_LABELS = {
     "DISP": "m",
 }
 
-_NO_STREAM_TITLE = "Archive — no stream selected"
+_NO_STREAM_TITLE = "Archive — no station selected"
 _NO_DATA_TEXT = "No archived data for this stream."
+_NO_SESSION_TEXT = "Select a session to browse its archive."
+
+# Session-list status colours: crash-dirty rows must be unmistakable
+# (rule 14 / M2-C), the open (recording) session clearly live.
+_DIRTY_BRUSH = QBrush(QColor("#e0a93a"))
+_OPEN_BRUSH = QBrush(QColor("#7ee081"))
+
+# Qt.ItemDataRole.UserRole payloads on tree rows.
+_ENTRY_ROLE = Qt.ItemDataRole.UserRole
+_STATION_ROLE = Qt.ItemDataRole.UserRole
 
 # Default load window: the last 10 minutes of available data (clamped to the
-# real extent). A sensible recent slice, never an epoch placeholder.
+# real per-session coverage). A sensible recent slice, never a placeholder.
 _DEFAULT_WINDOW_S = 600.0
 
 
@@ -158,7 +183,7 @@ class CoverageStrip(QWidget):
 
 
 class ArchiveTab(QWidget):
-    """The central Archive tab (browser + static view + measurement tools)."""
+    """The central Archive tab (session browser + static view + tools)."""
 
     # device, group({"Z","N","E": nslc}), t_start_epoch, t_end_epoch
     loadRequested = Signal(str, object, float, float)  # noqa: N815
@@ -167,14 +192,21 @@ class ArchiveTab(QWidget):
 
     def __init__(
         self,
-        engine: StreamingEngine,
-        dao: ArchiveDao | None,
+        browser: ArchiveBrowserLoader,
+        base_root: Path,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._engine = engine
-        self._dao = dao
-        self._groups: dict[str, dict[str, dict[str, str]]] = {}
+        # The browser loader is owned by the main window (it joins the
+        # thread on shutdown); this widget only emits requests into it
+        # and renders the results (rule 1).
+        self._browser = browser
+        self._base_root = str(base_root)
+        self._entries: list[SessionEntry] = []
+        self._detail: SessionDetailResult | None = None
+        self._selected_station: StationCoverage | None = None
+        self._list_token = 0
+        self._detail_token = 0
 
         # The currently-loaded window: the selection it was loaded for, the
         # displayed (x, y) per component in the current unit, and the window
@@ -193,7 +225,9 @@ class ArchiveTab(QWidget):
 
         self._build_ui()
         self._wire()
-        self._refresh_devices()
+        # Launch discovery: closed sessions are browsable from the first
+        # show, no acquisition required (rule 13 keeps launch idle).
+        self.refresh_sessions()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -203,8 +237,68 @@ class ArchiveTab(QWidget):
         self._title.setObjectName(PANE_TITLE_OBJECT_NAME)
         self._title.setStyleSheet(PANE_TITLE_STYLE)
 
-        self._device_combo = QComboBox(self)
-        self._station_combo = QComboBox(self)
+        # --- session browser (left panel) ---------------------------------
+        self._search_edit = QLineEdit(self)
+        self._search_edit.setPlaceholderText("Filter by project name…")
+        self._search_edit.setClearButtonEnabled(True)
+        self._refresh_button = QPushButton("Refresh", self)
+        self._refresh_button.setToolTip("Re-scan the archive root for sessions.")
+
+        self._date_check = QCheckBox("Date:", self)
+        self._date_from = QDateEdit(self)
+        self._date_from.setCalendarPopup(True)
+        self._date_from.setDisplayFormat("yyyy-MM-dd")
+        self._date_to = QDateEdit(self)
+        self._date_to.setCalendarPopup(True)
+        self._date_to.setDisplayFormat("yyyy-MM-dd")
+        today = QDate.currentDate()
+        self._date_from.setDate(today.addDays(-30))
+        self._date_to.setDate(today)
+        self._date_from.setEnabled(False)
+        self._date_to.setEnabled(False)
+
+        self._session_tree = QTreeWidget(self)
+        self._session_tree.setHeaderLabels(["Project", "Started", "Status"])
+        self._session_tree.setRootIsDecorated(False)
+        self._session_tree.setUniformRowHeights(True)
+        self._session_tree.setToolTip(
+            "Recorded sessions found under the archive root (newest first)."
+        )
+
+        self._station_tree = QTreeWidget(self)
+        self._station_tree.setHeaderLabels(["Device / station", "Coverage"])
+        self._station_tree.setUniformRowHeights(False)
+        self._station_tree.setToolTip(
+            "3-component stations recorded in the selected session;"
+            " green = data within the session span, dark = gap."
+        )
+        self._browser_status = QLabel(_NO_SESSION_TEXT, self)
+        self._browser_status.setStyleSheet("color: #9aa4af; font-style: italic;")
+        self._browser_status.setWordWrap(True)
+
+        left = QWidget(self)
+        left_box = QVBoxLayout(left)
+        left_box.setContentsMargins(0, 0, 0, 0)
+        left_box.setSpacing(3)
+        search_row = QHBoxLayout()
+        search_row.addWidget(self._search_edit, stretch=1)
+        search_row.addWidget(self._refresh_button)
+        left_box.addLayout(search_row)
+        date_row = QHBoxLayout()
+        date_row.addWidget(self._date_check)
+        date_row.addWidget(self._date_from, stretch=1)
+        date_row.addWidget(QLabel("→"))
+        date_row.addWidget(self._date_to, stretch=1)
+        left_box.addLayout(date_row)
+        left_box.addWidget(self._session_tree, stretch=2)
+        left_box.addWidget(self._station_tree, stretch=3)
+        left_box.addWidget(self._browser_status)
+        # The browser column must shrink with the tab (the HVSR layout trap):
+        # no hard minimums beyond what the trees need to stay usable.
+        for w in (self._search_edit, self._date_from, self._date_to):
+            w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        left.setMinimumWidth(120)
+
         self._group_label = QLabel("—", self)
 
         self._extent_label = QLabel(_NO_DATA_TEXT, self)
@@ -236,25 +330,19 @@ class ArchiveTab(QWidget):
         # Let the wide controls shrink horizontally so this tab page's minimum
         # width never inflates the central QTabWidget minimum (the layout trap
         # HVSR already paid for — Ignored hsize policy on the offenders).
-        for w in (
+        wide: QWidget
+        for wide in (
             self._start_edit,
             self._end_edit,
             self._group_label,
-            self._station_combo,
-            self._device_combo,
         ):
-            w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            wide.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         # --- form ---------------------------------------------------------
         form = QFormLayout()
         form.setContentsMargins(6, 2, 6, 2)
         form.setVerticalSpacing(3)
-        dev_row = QHBoxLayout()
-        dev_row.addWidget(self._device_combo, stretch=1)
-        dev_row.addWidget(QLabel("Station:"))
-        dev_row.addWidget(self._station_combo, stretch=1)
-        dev_row.addWidget(self._group_label, stretch=2)
-        form.addRow("Device:", _wrap(dev_row))
+        form.addRow("Station:", self._group_label)
 
         interval = QHBoxLayout()
         interval.addWidget(QLabel("from"))
@@ -271,14 +359,28 @@ class ArchiveTab(QWidget):
         # --- view area ---------------------------------------------------
         self._view_container = self._build_view()
 
+        right = QWidget(self)
+        right_box = QVBoxLayout(right)
+        right_box.setContentsMargins(0, 0, 0, 0)
+        right_box.setSpacing(2)
+        right_box.addLayout(form)
+        right_box.addWidget(self._extent_label)
+        right_box.addWidget(self._coverage)
+        right_box.addWidget(self._view_container, stretch=1)
+
+        self._browser_split = QSplitter(Qt.Orientation.Horizontal, self)
+        self._browser_split.addWidget(left)
+        self._browser_split.addWidget(right)
+        self._browser_split.setChildrenCollapsible(False)
+        self._browser_split.setStretchFactor(0, 0)
+        self._browser_split.setStretchFactor(1, 1)
+        self._browser_split.setSizes([260, 900])
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(2)
         layout.addWidget(self._title)
-        layout.addLayout(form)
-        layout.addWidget(self._extent_label)
-        layout.addWidget(self._coverage)
-        layout.addWidget(self._view_container, stretch=1)
+        layout.addWidget(self._browser_split, stretch=1)
 
     def _build_view(self) -> QWidget:
         """Build the static 3C view, spectrogram, measurement cursors + readout.
@@ -414,10 +516,28 @@ class ArchiveTab(QWidget):
         return container
 
     def _wire(self) -> None:
-        self._engine.newStreamSeen.connect(self._on_new_stream)
-        self._engine.devicesChanged.connect(self._refresh_devices)
-        self._device_combo.currentIndexChanged.connect(self._on_device_changed)
-        self._station_combo.currentIndexChanged.connect(self._on_station_changed)
+        self._browser.sessionsListed.connect(
+            self._on_sessions_listed, Qt.ConnectionType.QueuedConnection
+        )
+        self._browser.detailLoaded.connect(
+            self._on_detail_loaded, Qt.ConnectionType.QueuedConnection
+        )
+        self._browser.listFailed.connect(
+            self._on_list_failed, Qt.ConnectionType.QueuedConnection
+        )
+        self._browser.detailFailed.connect(
+            self._on_detail_failed, Qt.ConnectionType.QueuedConnection
+        )
+        self._refresh_button.clicked.connect(lambda: self.refresh_sessions())
+        self._search_edit.textChanged.connect(lambda _t: self._populate_sessions())
+        self._date_check.toggled.connect(self._on_date_filter_toggled)
+        self._date_from.dateChanged.connect(lambda _d: self._populate_sessions())
+        self._date_to.dateChanged.connect(lambda _d: self._populate_sessions())
+        self._session_tree.currentItemChanged.connect(self._on_session_selected)
+        self._station_tree.currentItemChanged.connect(self._on_station_selected)
+        # Coverage re-slices are pure in-memory arithmetic now — track edits.
+        self._start_edit.dateTimeChanged.connect(lambda _d: self._update_coverage())
+        self._end_edit.dateTimeChanged.connect(lambda _d: self._update_coverage())
         self._load_button.clicked.connect(self._on_load_clicked)
         self._unit_combo.currentIndexChanged.connect(self._on_unit_combo_changed)
         self._stacked_radio.toggled.connect(self._on_layout_toggled)
@@ -426,105 +546,288 @@ class ArchiveTab(QWidget):
         self._hvsr_button.clicked.connect(lambda: self._emit_handoff(self.hvsrRequested))
 
     # ------------------------------------------------------------------
-    # Device / station selection (mirrors HvsrWidget)
+    # Session list (discovery + filter)
     # ------------------------------------------------------------------
-    @Slot(str, str)
-    def _on_new_stream(self, device: str, nslc: str) -> None:
-        del device, nslc
-        self._refresh_devices()
-
     @Slot()
-    def _refresh_devices(self) -> None:
-        self._groups = three_component_groups(self._engine)
-        prior = self._device_combo.currentData()
-        self._device_combo.blockSignals(True)
-        self._device_combo.clear()
-        for device in sorted(self._groups):
-            self._device_combo.addItem(device, device)
-        if isinstance(prior, str):
-            idx = self._device_combo.findData(prior)
-            if idx >= 0:
-                self._device_combo.setCurrentIndex(idx)
-        self._device_combo.blockSignals(False)
-        self._refresh_stations()
+    def refresh_sessions(self, _payload: object = None) -> None:
+        """Re-scan the archive root for sessions (off the GUI thread).
 
-    def _refresh_stations(self) -> None:
-        device = self._device_combo.currentData()
-        prior = self._station_combo.currentData()
-        self._station_combo.blockSignals(True)
-        self._station_combo.clear()
-        if isinstance(device, str):
-            for station in sorted(self._groups.get(device, {})):
-                self._station_combo.addItem(station, station)
-        if isinstance(prior, str):
-            idx = self._station_combo.findData(prior)
-            if idx >= 0:
-                self._station_combo.setCurrentIndex(idx)
-        self._station_combo.blockSignals(False)
-        self._update_group_label()
-        self._refresh_extent()
-
-    def _on_device_changed(self, _index: int) -> None:
-        self._refresh_stations()
-
-    def _on_station_changed(self, _index: int) -> None:
-        self._update_group_label()
-        self._refresh_extent()
-
-    def selected_group(self) -> dict[str, str] | None:
-        device = self._device_combo.currentData()
-        station = self._station_combo.currentData()
-        if not isinstance(device, str) or not isinstance(station, str):
-            return None
-        return self._groups.get(device, {}).get(station)
-
-    def _update_group_label(self) -> None:
-        group = self.selected_group()
-        if group is None:
-            self._group_label.setText("no 3-component station")
-        else:
-            self._group_label.setText(
-                "  ".join(f"{c}={group[c].split('.')[-1]}" for c in ("Z", "N", "E"))
-            )
-
-    # ------------------------------------------------------------------
-    # Extent / coverage / default interval
-    # ------------------------------------------------------------------
-    def _refresh_extent(self) -> None:
-        """Query the archive extent for the primary (Z) component and set a
-        sensible default interval + coverage strip — or an honest empty state.
+        Public: the main window connects the engine's ``sessionChanged``
+        here (queued) so a started/ended recording session appears
+        without a manual refresh; the optional payload is ignored.
         """
-        group = self.selected_group()
-        device = self._device_combo.currentData()
-        extent = None
-        if group is not None and isinstance(device, str) and self._dao is not None:
-            extent = self._dao.archive_extent(device, group["Z"])
-        if extent is None:
-            # Distinguish "archiving is off for this device" (no waveforms are
-            # being recorded — the common cause) from "archiving is on but
-            # nothing is indexed yet". Knowing this resolves the frequent
-            # confusion of an existing archive.db (full of detection/session
-            # metadata) but an empty waveform archive.
-            self._extent_label.setText(self._empty_extent_message(device))
+        self._list_token = self._browser.request_sessions(self._base_root)
+
+    @Slot(object)
+    def _on_sessions_listed(self, payload: object) -> None:
+        if not isinstance(payload, SessionListResult):
+            return
+        if payload.token != self._list_token:
+            return  # stale (latest-wins) — drop
+        self._entries = list(payload.entries)
+        self._populate_sessions()
+
+    @Slot(int, str)
+    def _on_list_failed(self, token: int, message: str) -> None:
+        if token != self._list_token:
+            return
+        self._browser_status.setText(f"Session scan failed: {message}")
+
+    def _on_date_filter_toggled(self, checked: bool) -> None:
+        self._date_from.setEnabled(checked)
+        self._date_to.setEnabled(checked)
+        self._populate_sessions()
+
+    def _session_matches(self, entry: SessionEntry) -> bool:
+        """Client-side name + date filter over the discovered list."""
+        needle = self._search_edit.text().strip().lower()
+        name = entry.record.project_name or "(monitoring)"
+        if needle and needle not in name.lower():
+            return False
+        if self._date_check.isChecked():
+            # ISO-8601 prefix compare: lexicographic == chronological.
+            day = entry.record.started_at[:10]
+            if not (
+                self._date_from.date().toString("yyyy-MM-dd")
+                <= day
+                <= self._date_to.date().toString("yyyy-MM-dd")
+            ):
+                return False
+        return True
+
+    def _populate_sessions(self) -> None:
+        """Render the filtered session list, preserving the selection."""
+        prior = self.selected_session_entry()
+        prior_key = (prior.db_path, prior.record.id) if prior is not None else None
+        self._session_tree.blockSignals(True)
+        self._session_tree.clear()
+        restored = None
+        shown = 0
+        for entry in self._entries:
+            if not self._session_matches(entry):
+                continue
+            item = self._session_item(entry)
+            self._session_tree.addTopLevelItem(item)
+            shown += 1
+            if prior_key is not None and (entry.db_path, entry.record.id) == prior_key:
+                restored = item
+        if restored is not None:
+            self._session_tree.setCurrentItem(restored)
+        self._session_tree.blockSignals(False)
+        if restored is None and prior_key is not None:
+            # The selected session vanished from the filtered list —
+            # clear the dependent panes honestly.
+            self._clear_session_detail()
+        elif restored is not None:
+            # The selection survived a refresh, but its ROW may have
+            # changed (e.g. Stop just closed the open session: ended_at
+            # appears, so the span/coverage shown are stale). Re-request
+            # the detail only on a real change — an unrelated refresh
+            # must not clobber the user's station/interval selection.
+            fresh = restored.data(0, _ENTRY_ROLE)
+            shown_record = self._detail.entry.record if self._detail is not None else None
+            if (
+                isinstance(fresh, SessionEntry)
+                and shown_record is not None
+                and fresh.record != shown_record
+            ):
+                self._browser_status.setText("Refreshing session…")
+                self._detail_token = self._browser.request_detail(fresh)
+        if not self._entries:
+            self._browser_status.setText(
+                "No sessions found. Start a Recording session to create one."
+            )
+        elif shown == 0:
+            self._browser_status.setText("No sessions match the current filter.")
+        elif self._detail is None:
+            self._browser_status.setText(_NO_SESSION_TEXT)
+
+    @staticmethod
+    def _session_item(entry: SessionEntry) -> QTreeWidgetItem:
+        record = entry.record
+        name = record.project_name or "(monitoring)"
+        started = record.started_at[:19].replace("T", " ")
+        if record.ended_at is None:
+            status, brush = "● open", _OPEN_BRUSH
+        elif record.closed_dirty:
+            status, brush = "⚠ dirty", _DIRTY_BRUSH
+        else:
+            status, brush = "closed", None
+        item = QTreeWidgetItem([name, started, status])
+        if brush is not None:
+            item.setForeground(2, brush)
+        if record.closed_dirty:
+            item.setToolTip(
+                2,
+                "Closed administratively after a crash — the recorded end "
+                "time is the recovery time, not the real end of recording.",
+            )
+        item.setToolTip(0, f"{name}\ndevices: {', '.join(record.devices) or '—'}")
+        item.setData(0, _ENTRY_ROLE, entry)
+        return item
+
+    def selected_session_entry(self) -> SessionEntry | None:
+        """The selected session's entry (root + DB) — the main window
+        resolves load requests against exactly this context (rule 14)."""
+        item = self._session_tree.currentItem()
+        if item is None:
+            return None
+        entry = item.data(0, _ENTRY_ROLE)
+        return entry if isinstance(entry, SessionEntry) else None
+
+    # ------------------------------------------------------------------
+    # Per-session detail (device/station tree + coverage)
+    # ------------------------------------------------------------------
+    def _on_session_selected(
+        self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None
+    ) -> None:
+        del _previous
+        if current is None:
+            self._clear_session_detail()
+            return
+        entry = current.data(0, _ENTRY_ROLE)
+        if not isinstance(entry, SessionEntry):
+            return
+        self._browser_status.setText("Loading session…")
+        self._detail_token = self._browser.request_detail(entry)
+
+    @Slot(object)
+    def _on_detail_loaded(self, payload: object) -> None:
+        if not isinstance(payload, SessionDetailResult):
+            return
+        if payload.token != self._detail_token:
+            return  # stale (latest-wins) — drop
+        self._detail = payload
+        self._populate_stations()
+
+    @Slot(int, str)
+    def _on_detail_failed(self, token: int, message: str) -> None:
+        if token != self._detail_token:
+            return
+        self._clear_session_detail()
+        self._browser_status.setText(f"Session read failed: {message}")
+
+    def _populate_stations(self) -> None:
+        """Render the selected session's device/station tree + strips."""
+        detail = self._detail
+        self._station_tree.blockSignals(True)
+        self._station_tree.clear()
+        self._selected_station = None
+        if detail is None:
+            self._station_tree.blockSignals(False)
+            self._reset_selection_panes()
+            return
+        span_start, span_end = detail.span
+        by_device: dict[str, QTreeWidgetItem] = {}
+        first_station: QTreeWidgetItem | None = None
+        for station in detail.stations:
+            parent = by_device.get(station.device)
+            if parent is None:
+                parent = QTreeWidgetItem([station.device, ""])
+                parent.setFlags(parent.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                by_device[station.device] = parent
+                self._station_tree.addTopLevelItem(parent)
+                parent.setExpanded(True)
+            child = QTreeWidgetItem([station.station, ""])
+            child.setData(0, _STATION_ROLE, station)
+            parent.addChild(child)
+            strip = CoverageStrip(self._station_tree)
+            strip.set_coverage(span_start, span_end, list(station.intervals))
+            self._station_tree.setItemWidget(child, 1, strip)
+            if first_station is None:
+                first_station = child
+        self._station_tree.blockSignals(False)
+        if first_station is not None:
+            self._station_tree.setCurrentItem(first_station)
+        else:
+            self._reset_selection_panes()
+            self._browser_status.setText(
+                "No 3-component stations recorded in this session."
+            )
+            return
+        project = detail.entry.record.project_name or "(monitoring)"
+        self._browser_status.setText(
+            f"{project}: {len(detail.stations)} station(s), "
+            f"{len(by_device)} device(s)."
+        )
+
+    def _clear_session_detail(self) -> None:
+        # Invalidate any in-flight detail load (loader tokens start at 1):
+        # a late detailLoaded for a session that vanished from the list
+        # must not resurrect a ghost station tree (the ghost-row class —
+        # qt-concurrency-auditor F2; Load on a ghost would fall back to
+        # the live engine root and read the wrong archive).
+        self._detail_token = -1
+        self._detail = None
+        self._selected_station = None
+        self._station_tree.blockSignals(True)
+        self._station_tree.clear()
+        self._station_tree.blockSignals(False)
+        self._reset_selection_panes()
+        self._browser_status.setText(_NO_SESSION_TEXT)
+
+    def _reset_selection_panes(self) -> None:
+        self._group_label.setText("—")
+        self._extent_label.setText(_NO_DATA_TEXT)
+        self._coverage.set_coverage(0.0, 0.0, [])
+        self._load_button.setEnabled(False)
+        self._title.setText(_NO_STREAM_TITLE)
+
+    # ------------------------------------------------------------------
+    # Station selection → default interval + coverage
+    # ------------------------------------------------------------------
+    def _on_station_selected(
+        self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None
+    ) -> None:
+        del _previous
+        station = current.data(0, _STATION_ROLE) if current is not None else None
+        if not isinstance(station, StationCoverage):
+            self._selected_station = None
+            self._reset_selection_panes()
+            return
+        self._selected_station = station
+        self._group_label.setText(
+            "  ".join(f"{c}={station.group[c].split('.')[-1]}" for c in ("Z", "N", "E"))
+        )
+        if not station.intervals:
+            # Honest empty state — this session recorded nothing for the
+            # stream (the project may still hold data from OTHER sessions;
+            # those are browsable via their own rows).
+            self._extent_label.setText(self._empty_extent_message(station.device))
             self._coverage.set_coverage(0.0, 0.0, [])
             self._load_button.setEnabled(False)
             self._title.setText(_NO_STREAM_TITLE)
             return
-        t_min, t_max = extent
-        self._extent_label.setText(f"Archived: {t_min} → {t_max}")
-        # Default to the last _DEFAULT_WINDOW_S within the real extent.
-        end_epoch = float(t_max.timestamp)
-        start_epoch = max(float(t_min.timestamp), end_epoch - _DEFAULT_WINDOW_S)
+        cov_start = station.intervals[0][0]
+        cov_end = station.intervals[-1][1]
+        self._extent_label.setText(
+            f"Archived (this session): {UTCDateTime(cov_start)} → {UTCDateTime(cov_end)}"
+        )
+        # Default to the last _DEFAULT_WINDOW_S within the real coverage.
+        start_epoch = max(cov_start, cov_end - _DEFAULT_WINDOW_S)
         self._start_edit.blockSignals(True)
         self._end_edit.blockSignals(True)
         self._start_edit.setDateTime(_qdt_from_epoch(start_epoch))
-        self._end_edit.setDateTime(_qdt_from_epoch(end_epoch))
+        self._end_edit.setDateTime(_qdt_from_epoch(cov_end))
         self._start_edit.blockSignals(False)
         self._end_edit.blockSignals(False)
         self._load_button.setEnabled(True)
         self._update_coverage()
-        station = self._station_combo.currentData()
-        self._title.setText(f"Archive — {device} / {station}")
+        detail = self._detail
+        project = (
+            (detail.entry.record.project_name or "(monitoring)")
+            if detail is not None
+            else "?"
+        )
+        self._title.setText(f"Archive — {project} / {station.device} / {station.station}")
+
+    def selected_group(self) -> dict[str, str] | None:
+        station = self._selected_station
+        return dict(station.group) if station is not None else None
+
+    def selected_device(self) -> str | None:
+        station = self._selected_station
+        return station.device if station is not None else None
 
     def _empty_extent_message(self, device: object) -> str:
         """Actionable empty-state text. Since M2-A, archives exist only
@@ -533,35 +836,40 @@ class ArchiveTab(QWidget):
         writers it described."""
         if isinstance(device, str):
             return (
-                f"No archived waveforms for '{device}'. "
+                f"No archived waveforms for '{device}' in this session. "
                 f"Start a Recording session to archive data here."
             )
         return _NO_DATA_TEXT
 
     def _update_coverage(self) -> None:
-        group = self.selected_group()
-        device = self._device_combo.currentData()
-        if group is None or not isinstance(device, str) or self._dao is None:
+        """Re-slice the selected station's session coverage to the interval.
+
+        Pure GUI-thread arithmetic over the already-loaded coverage
+        (rule 1: the DB was read once, on the browser worker) — clip each
+        covered interval to the edited window.
+        """
+        station = self._selected_station
+        if station is None:
             return
         t_start = _epoch_from_qdt(self._start_edit.dateTime())
         t_end = _epoch_from_qdt(self._end_edit.dateTime())
         if t_end <= t_start:
             self._coverage.set_coverage(t_start, t_end, [])
             return
-        intervals = self._dao.archive_coverage(
-            device, group["Z"], UTCDateTime(t_start), UTCDateTime(t_end)
-        )
-        self._coverage.set_coverage(
-            t_start, t_end, [(float(s.timestamp), float(e.timestamp)) for s, e in intervals]
-        )
+        clipped = [
+            (max(s, t_start), min(e, t_end))
+            for s, e in station.intervals
+            if min(e, t_end) > max(s, t_start)
+        ]
+        self._coverage.set_coverage(t_start, t_end, clipped)
 
     # ------------------------------------------------------------------
     # Load
     # ------------------------------------------------------------------
     def _on_load_clicked(self) -> None:
         group = self.selected_group()
-        device = self._device_combo.currentData()
-        if group is None or not isinstance(device, str):
+        device = self.selected_device()
+        if group is None or device is None:
             return
         t_start = _epoch_from_qdt(self._start_edit.dateTime())
         t_end = _epoch_from_qdt(self._end_edit.dateTime())
@@ -808,6 +1116,49 @@ class ArchiveTab(QWidget):
     # ------------------------------------------------------------------
     # Test accessors
     # ------------------------------------------------------------------
+    def session_rows_for_test(self) -> list[tuple[str, str, str]]:
+        """Visible session rows as ``(project, started, status)`` triples."""
+        rows: list[tuple[str, str, str]] = []
+        for i in range(self._session_tree.topLevelItemCount()):
+            item = self._session_tree.topLevelItem(i)
+            if item is not None:
+                rows.append((item.text(0), item.text(1), item.text(2)))
+        return rows
+
+    def select_session_for_test(self, row: int) -> None:
+        item = self._session_tree.topLevelItem(row)
+        if item is not None:
+            self._session_tree.setCurrentItem(item)
+
+    def _station_item_for_test(self, device: str, station: str) -> QTreeWidgetItem | None:
+        for i in range(self._station_tree.topLevelItemCount()):
+            parent = self._station_tree.topLevelItem(i)
+            if parent is None or parent.text(0) != device:
+                continue
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                if child is not None and child.text(0) == station:
+                    return child
+        return None
+
+    def select_station_for_test(self, device: str, station: str) -> bool:
+        """Select a station row in the session tree; True when found."""
+        child = self._station_item_for_test(device, station)
+        if child is None:
+            return False
+        self._station_tree.setCurrentItem(child)
+        return True
+
+    def station_strip_for_test(self, device: str, station: str) -> CoverageStrip | None:
+        child = self._station_item_for_test(device, station)
+        if child is None:
+            return None
+        widget = self._station_tree.itemWidget(child, 1)
+        return widget if isinstance(widget, CoverageStrip) else None
+
+    def browser_status_for_test(self) -> str:
+        return self._browser_status.text()
+
     def extent_text_for_test(self) -> str:
         return self._extent_label.text()
 

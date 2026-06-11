@@ -1376,6 +1376,17 @@ class StreamingEngine(QObject):
         """
         return self._archive_dao
 
+    def archive_db_path(self) -> Path | None:
+        """The CURRENT context's ``archive.db`` path, else ``None``.
+
+        Same per-context lifetime as :meth:`archive_dao` — re-resolve per
+        request, never cache. Read by the GUI to snapshot a metadata-index
+        path into loader requests (the loaders open it READ-ONLY on their
+        own threads and close it per request — the M2-B leak note); the
+        engine's own DAO is never handed across threads.
+        """
+        return self._archive_db_path
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

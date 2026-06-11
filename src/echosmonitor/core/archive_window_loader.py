@@ -29,9 +29,12 @@ never imports gui). The pure ``_stream_to_xy`` array-build helper and the
 ``ComponentTrace`` dataclass are reused from the detection-detail loader
 **without modifying it** (it stays byte-identical).
 
-The loader shares **nothing** with the live engine's data path: read-only
-``archive_root`` + thread-safe DAO (rule 8); never touches a ring buffer,
-coalescer, or live queue (rule 11).
+The loader shares **nothing** with the live engine's data path: the
+``archive_root`` AND the optional ``db_path`` index are snapshotted per
+request on the GUI thread (rule 8) — the index is opened read-only on the
+worker and closed before the slot returns (the M2-B per-context DAO
+lifetime note); it never touches a ring buffer, coalescer, or live queue
+(rule 11).
 """
 
 from __future__ import annotations
@@ -39,20 +42,20 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import numpy as np
 import structlog
 from obspy.core.utcdatetime import UTCDateTime
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 
-from echosmonitor.core.archive_detail_loader import ComponentTrace, _stream_to_xy
+from echosmonitor.core.archive_detail_loader import (
+    ComponentTrace,
+    _open_readonly_dao,
+    _stream_to_xy,
+)
 from echosmonitor.core.models import StreamID
 from echosmonitor.dsp.spectrogram import RollingSpectrogram
 from echosmonitor.storage.archive_reader import ArchiveReader
-
-if TYPE_CHECKING:
-    from echosmonitor.storage.dao import ArchiveDao
 
 _log = structlog.get_logger(__name__)
 
@@ -70,7 +73,9 @@ class ArchiveWindowRequest:
     ``group`` maps component letters to NSLCs (``{"Z","N","E": nslc}``).
     ``primary_comp`` selects which component's samples drive the spectrogram
     (default ``"Z"``). ``archive_root`` is snapshotted on the GUI thread so
-    the worker never touches the live engine.
+    the worker never touches the live engine; ``db_path`` (optional) names
+    that root's ``archive.db``, opened read-only per request and closed
+    before the slot returns — ``None`` or unreadable means scan-only.
     """
 
     token: int
@@ -80,6 +85,7 @@ class ArchiveWindowRequest:
     t_start_epoch: float
     t_end_epoch: float
     archive_root: str
+    db_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -140,9 +146,8 @@ class _ArchiveWindowWorker(QObject):
     failed = Signal(int, str)  # token, message
     empty = Signal(int)  # token
 
-    def __init__(self, dao: ArchiveDao | None) -> None:
+    def __init__(self) -> None:
         super().__init__()  # parentless — moveToThread requires no parent
-        self._dao = dao
         self._stop = False
         # Latest-wins gate, written GIL-atomically from the GUI thread.
         self._active_token = -1
@@ -164,8 +169,9 @@ class _ArchiveWindowWorker(QObject):
             n_components=len(request.group),
             primary=request.primary_comp,
         )
+        dao = _open_readonly_dao(request.db_path)
         try:
-            reader = ArchiveReader(Path(request.archive_root), self._dao)
+            reader = ArchiveReader(Path(request.archive_root), dao)
             t_start_u = UTCDateTime(request.t_start_epoch)
             t_end_u = UTCDateTime(request.t_end_epoch)
             traces: list[ComponentTrace] = []
@@ -200,6 +206,9 @@ class _ArchiveWindowWorker(QObject):
             _log.error("archive_window_load_failed", token=token, error=str(exc))
             self.failed.emit(token, str(exc))
             return
+        finally:
+            if dao is not None:
+                dao.close()  # this thread's connection — per-request lifetime
         if self._stop or token != self._active_token:
             return
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -270,11 +279,11 @@ class ArchiveWindowLoader(QObject):
     _stopRequested = Signal()  # noqa: N815
     _clearStopRequested = Signal()  # noqa: N815
 
-    def __init__(self, dao: ArchiveDao | None, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._token = 0
 
-        self._worker = _ArchiveWindowWorker(dao)
+        self._worker = _ArchiveWindowWorker()
         self._thread = QThread()
         self._thread.setObjectName("archive-window-loader")
         self._worker.moveToThread(self._thread)
@@ -297,6 +306,7 @@ class ArchiveWindowLoader(QObject):
         t_end_epoch: float,
         archive_root: str,
         primary_comp: str = "Z",
+        db_path: str | None = None,
     ) -> int:
         """Dispatch a 3C archive read + spectrogram build off the GUI thread.
 
@@ -304,6 +314,9 @@ class ArchiveWindowLoader(QObject):
         ``_active_token`` GIL-atomically so a load already in flight notices it
         was superseded and aborts; the new load runs with a cleared stop flag.
         The thread is started lazily on first use. Returns the new token.
+        ``db_path`` is the caller's per-request snapshot of the matching
+        metadata index (the engine's DAO is per-session-context — never
+        captured at construction).
         """
         self._token += 1
         token = self._token
@@ -321,6 +334,7 @@ class ArchiveWindowLoader(QObject):
                 t_start_epoch=t_start_epoch,
                 t_end_epoch=t_end_epoch,
                 archive_root=archive_root,
+                db_path=db_path,
             )
         )
         return token

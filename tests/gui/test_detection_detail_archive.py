@@ -85,7 +85,7 @@ def test_out_of_buffer_selection_dispatches_off_thread_load(qtbot: QtBot, tmp_pa
     try:
         captured: list[tuple] = []
 
-        def _fake_request(*args):  # type: ignore[no-untyped-def]
+        def _fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
             captured.append(args)
             window._archive_load_token += 1
             return window._archive_load_token
@@ -127,7 +127,7 @@ def test_sta_lta_read_window_includes_lta_warmup_preroll(qtbot: QtBot, tmp_path:
     try:
         captured: list[tuple] = []
 
-        def _fake_request(*args):  # type: ignore[no-untyped-def]
+        def _fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
             captured.append(args)
             window._archive_load_token += 1
             return window._archive_load_token
@@ -246,7 +246,7 @@ def test_new_selection_supersedes_in_flight_load(qtbot: QtBot, tmp_path: Path) -
     try:
         tokens = {"v": 0}
 
-        def _fake_request(*args):  # type: ignore[no-untyped-def]
+        def _fake_request(*args, **kwargs):  # type: ignore[no-untyped-def]
             tokens["v"] += 1
             window._archive_load_token = tokens["v"]
             return tokens["v"]

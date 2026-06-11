@@ -27,15 +27,20 @@ pattern exactly:
 
 The loader shares **nothing** with the live engine's data path: it never
 touches a ring buffer, coalescer, or live queue. Its only inputs are an
-``archive_root`` path (snapshotted on the GUI thread into the request) and a
-thread-safe :class:`~echosmonitor.storage.dao.ArchiveDao` (per-thread
-sqlite via ``threading.local``), both consulted **read-only** (rule 8). A
-fresh :class:`~echosmonitor.storage.archive_reader.ArchiveReader` is
-built per call on the worker thread.
+``archive_root`` path and an optional ``db_path``, BOTH snapshotted on the
+GUI thread into each request (rule 8) — since M2-B made the engine's DAO
+per-session-context, a DAO captured at construction goes stale on the
+first session swap, so the worker instead opens that request's index
+**read-only** and closes it before the slot returns (its own thread's
+connection — the M2-B leak note). A missing or unreadable index degrades
+to the reader's canonical SDS day-scan, never to a failure. A fresh
+:class:`~echosmonitor.storage.archive_reader.ArchiveReader` is built per
+call on the worker thread.
 """
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,11 +53,10 @@ from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 
 from echosmonitor.core.models import StreamID
 from echosmonitor.storage.archive_reader import ArchiveReader
+from echosmonitor.storage.dao import ArchiveDao
 
 if TYPE_CHECKING:
     from obspy import Stream
-
-    from echosmonitor.storage.dao import ArchiveDao
 
 _log = structlog.get_logger(__name__)
 
@@ -69,7 +73,10 @@ class ArchiveDetailRequest:
     ``components`` maps component letters to NSLCs
     (``{"Z": .., "N": .., "E": ..}``). ``archive_root`` is snapshotted on
     the GUI thread (``str(engine.archive_root(device))``) so the worker
-    never touches the live engine.
+    never touches the live engine. ``db_path`` (optional) names that
+    root's ``archive.db``, also snapshotted per request — the worker
+    opens it read-only for index-backed file discovery and closes it
+    before returning; ``None`` (or an unreadable file) means scan-only.
     """
 
     token: int
@@ -79,6 +86,7 @@ class ArchiveDetailRequest:
     t_start_epoch: float
     t_end_epoch: float
     archive_root: str
+    db_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -111,6 +119,35 @@ class ArchiveDetailResult:
     trigger_comp: str
     traces: list[ComponentTrace]
     elapsed_ms: float
+
+
+def _open_readonly_dao(db_path: str | None) -> ArchiveDao | None:
+    """Open a request's metadata index read-only, or ``None`` to scan.
+
+    Runs on the loader worker threads (here and in the archive window
+    loader). The index is purely an accelerator for file discovery — a
+    missing or unreadable DB is logged and degraded to the reader's
+    canonical SDS day-scan, never surfaced as a load failure. The caller
+    owns the close (same thread — the M2-B connection-leak note).
+    """
+    if db_path is None:
+        return None
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+    dao = ArchiveDao(path, read_only=True)
+    try:
+        # Force the connection open NOW so an unreadable file degrades
+        # here (scan-only) instead of failing the read mid-request.
+        dao.last_packet_time(-1)
+    except Exception as exc:
+        _log.warning("archive_loader_index_unreadable", db=db_path, error=str(exc))
+        # The probe can fail AFTER the connection opened (connectable but
+        # corrupt file) — close it rather than lean on GC.
+        with contextlib.suppress(Exception):
+            dao.close()
+        return None
+    return dao
 
 
 def _stream_to_xy(
@@ -174,9 +211,8 @@ class _ArchiveDetailWorker(QObject):
     failed = Signal(int, str)  # token, message
     empty = Signal(int)  # token
 
-    def __init__(self, dao: ArchiveDao | None) -> None:
+    def __init__(self) -> None:
         super().__init__()  # parentless — moveToThread requires no parent
-        self._dao = dao
         self._stop = False
         # Latest-wins gate, written GIL-atomically from the GUI thread: a
         # load already inside ``load`` notices it was superseded and aborts.
@@ -199,8 +235,9 @@ class _ArchiveDetailWorker(QObject):
             t_end=request.t_end_epoch,
             n_components=len(request.components),
         )
+        dao = _open_readonly_dao(request.db_path)
         try:
-            reader = ArchiveReader(Path(request.archive_root), self._dao)
+            reader = ArchiveReader(Path(request.archive_root), dao)
             t_start_u = UTCDateTime(request.t_start_epoch)
             t_end_u = UTCDateTime(request.t_end_epoch)
             traces: list[ComponentTrace] = []
@@ -234,6 +271,9 @@ class _ArchiveDetailWorker(QObject):
             _log.error("archive_detail_load_failed", token=token, error=str(exc))
             self.failed.emit(token, str(exc))
             return
+        finally:
+            if dao is not None:
+                dao.close()  # this thread's connection — per-request lifetime
         if self._stop or token != self._active_token:
             return  # disengaged mid-read — do not announce
         elapsed = (time.monotonic() - t0) * 1000.0
@@ -291,11 +331,11 @@ class ArchiveDetailLoader(QObject):
     _stopRequested = Signal()  # noqa: N815
     _clearStopRequested = Signal()  # noqa: N815
 
-    def __init__(self, dao: ArchiveDao | None, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._token = 0
 
-        self._worker = _ArchiveDetailWorker(dao)
+        self._worker = _ArchiveDetailWorker()
         self._thread = QThread()
         self._thread.setObjectName("archive-detail-loader")
         self._worker.moveToThread(self._thread)
@@ -320,13 +360,17 @@ class ArchiveDetailLoader(QObject):
         t_start_epoch: float,
         t_end_epoch: float,
         archive_root: str,
+        db_path: str | None = None,
     ) -> int:
         """Dispatch a 3C archive read off the GUI thread; return its token.
 
         Latest-wins: bumps the token and writes it to the worker's
         ``_active_token`` GIL-atomically so a load already in flight notices
         it was superseded and aborts; the new load runs with a cleared stop
-        flag. The thread is started lazily on first use.
+        flag. The thread is started lazily on first use. ``db_path`` is the
+        caller's per-request snapshot of the matching metadata index (the
+        engine's DAO is per-session-context — never captured at
+        construction).
         """
         self._token += 1
         token = self._token
@@ -346,6 +390,7 @@ class ArchiveDetailLoader(QObject):
                 t_start_epoch=t_start_epoch,
                 t_end_epoch=t_end_epoch,
                 archive_root=archive_root,
+                db_path=db_path,
             )
         )
         return token

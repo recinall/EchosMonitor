@@ -184,7 +184,7 @@ _CREATE_SCHEMA_SQL = _CREATE_SCHEMA_SQL + _DETECTIONS_DDL
 _log = structlog.get_logger(__name__)
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
+def connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     """Open or initialise the archive database at ``db_path``.
 
     Idempotent: existing databases keep their data; the schema
@@ -192,12 +192,36 @@ def connect(db_path: Path) -> sqlite3.Connection:
     row is created lazily on first connect; a future schema bump
     flows through :func:`_upgrade`.
 
+    ``read_only=True`` opens the file with ``mode=ro`` + ``PRAGMA
+    query_only`` and runs **no** schema creation or migration — a
+    *browse* of a foreign or older DB must never rewrite it as a side
+    effect (rule 8; same reasoning as
+    :func:`storage.sessions.stored_project_name`). The M3-A session
+    browser and the archive loaders open every DB this way. Raises
+    ``sqlite3.OperationalError`` when the file does not exist.
+
     The connection is configured with thread-checks disabled
     (``check_same_thread=False``) so a single ``ArchiveDao`` can lazy-
     create connections per accessing thread without crashing the
     sqlite3 module's thread guard. Callers MUST still use one
     connection per thread (see :class:`storage.dao.ArchiveDao`).
     """
+    if read_only:
+        # Percent-encode the path: a raw f-string URI mis-parses paths
+        # containing '?', '#' or '%' (archive_root is user-chosen config).
+        from urllib.request import pathname2url
+
+        conn = sqlite3.connect(
+            f"file:{pathname2url(str(db_path.absolute()))}?mode=ro",
+            uri=True,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        # Belt-and-suspenders on top of mode=ro: any write statement
+        # errors instead of silently mutating a browsed archive.
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row

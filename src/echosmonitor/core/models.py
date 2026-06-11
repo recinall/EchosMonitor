@@ -12,6 +12,8 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from obspy.core.utcdatetime import UTCDateTime
 
 
@@ -215,6 +217,57 @@ class SessionRecord:
     closed_dirty: bool
     host: str
     devices: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionEntry:
+    """One browsable session: its index row plus where it lives on disk.
+
+    Produced by :func:`echosmonitor.storage.sessions.discover_sessions`
+    for the Archive tab's session browser (M3-A). ``session_root`` is
+    the directory the per-device SDS trees hang from (a project dir for
+    recorded sessions; the bare base root for the sessionless
+    monitoring index) and ``db_path`` is that root's ``archive.db`` —
+    together they are everything a reader needs to reach a CLOSED
+    session's data without any live engine context (rule 14).
+
+    Paths are strings, not ``Path``: the entry crosses Qt signal
+    boundaries and feeds loader requests that snapshot plain strings.
+    """
+
+    record: SessionRecord
+    session_root: str
+    db_path: str
+
+
+def three_component_groups_from_pairs(
+    pairs: Iterable[tuple[str, str]],
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Map ``device -> station_key -> {Z,N,E: nslc}`` for 3C-capable stations.
+
+    A station is 3C-capable when it has a vertical (``Z``) plus two
+    horizontals (``N``/``E`` or ``1``/``2``). The two horizontals map to
+    ``N`` (first) and ``E`` (second) so they feed hvsrpy's ``ns``/``ew``.
+    Pure: consumed by the live HVSR/Archive widgets (over engine buffer
+    keys) and by the archive-browser worker (over DB stream rows).
+    """
+    by_device: dict[str, dict[str, dict[str, str]]] = {}
+    raw: dict[tuple[str, str], dict[str, str]] = {}
+    for device, nslc in pairs:
+        parts = nslc.split(".")
+        if len(parts) != 4 or len(parts[3]) < 3:
+            continue
+        orient = parts[3][2]
+        station_key = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3][:2]}"
+        raw.setdefault((device, station_key), {})[orient] = nslc
+    for (device, station), orients in raw.items():
+        vertical = orients.get("Z")
+        horizontals = sorted(n for o, n in orients.items() if o != "Z")
+        if vertical is None or len(horizontals) < 2:
+            continue
+        group = {"Z": vertical, "N": horizontals[0], "E": horizontals[1]}
+        by_device.setdefault(device, {})[station] = group
+    return by_device
 
 
 class AcquisitionState(IntEnum):

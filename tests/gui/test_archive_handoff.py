@@ -15,9 +15,11 @@ round-trips exactly through every hop:
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from obspy import UTCDateTime
 from PySide6.QtCore import QObject, Signal
 
+from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
 from echosmonitor.core.archive_window_loader import (
     ArchiveWindowResult,
     ComponentTrace,
@@ -46,6 +48,14 @@ class _FakeEngine(QObject):
             self._buffers[device_stream_key(device, nslc)] = object()
 
 
+@pytest.fixture
+def browser():
+    """A real (idle) browser loader; the tab's ctor needs one (M3-A)."""
+    loader = ArchiveBrowserLoader()
+    yield loader
+    loader.shutdown()
+
+
 class _FakeHvsrEngine(QObject):
     hvsrUpdated = Signal(object)  # noqa: N815
     hvsrPsdReady = Signal(object)  # noqa: N815
@@ -70,8 +80,8 @@ class _FakeHvsrEngine(QObject):
 # --------------------------------------------------------------------------
 # 1. The tab emits the exact selection on the hand-off button.
 # --------------------------------------------------------------------------
-def test_handoff_button_emits_exact_selection(qtbot) -> None:
-    tab = ArchiveTab(_FakeEngine(), None)  # type: ignore[arg-type]
+def test_handoff_button_emits_exact_selection(qtbot, tmp_path, browser) -> None:
+    tab = ArchiveTab(browser, tmp_path)
     qtbot.addWidget(tab)
     n = int(_FS * 30)
     x = _T0 + np.arange(n, dtype=np.float64) / _FS

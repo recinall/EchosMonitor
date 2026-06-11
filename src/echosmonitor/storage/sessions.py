@@ -27,7 +27,10 @@ import structlog
 from echosmonitor.core.session import sanitize_project_name, session_archive_root
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
+
+    from echosmonitor.core.models import SessionEntry
 
 _log = structlog.get_logger(__name__)
 
@@ -141,6 +144,96 @@ def sweep_dirty_sessions(base_root: Path) -> dict[str, int]:
         if count:
             swept[str(db_path)] = count
     return swept
+
+
+def discover_sessions(
+    base_root: Path,
+    limit_per_db: int = 200,
+    should_stop: Callable[[], bool] | None = None,
+) -> list[SessionEntry]:
+    """Every browsable session under ``base_root``, most-recent-first.
+
+    The M3-A session browser's discovery pass (ROADMAP NOTE on M2-B):
+    between sessions the engine exposes only the bare base root, so data
+    recorded in CLOSED sessions — living under ``<base>/<project>/`` —
+    is reachable only by opening the project dirs' ``archive.db``s
+    explicitly. This visits the base monitoring index plus every
+    immediate project dir's DB (the same candidate set as
+    :func:`sweep_dirty_sessions`), reads their session rows
+    **read-only** (a browse must never migrate or rewrite a DB as a
+    side effect — rule 8), and tags each row with the session root +
+    DB path a reader needs.
+
+    Per-DB errors are logged and skipped: one corrupt or foreign file
+    must not blank the whole browser. Rows are merged across DBs and
+    sorted by ``started_at`` (ISO-8601 — lexicographic == chronological)
+    newest first.
+    """
+    import time
+
+    from echosmonitor.core.models import SessionEntry
+    from echosmonitor.storage.dao import ArchiveDao
+
+    t0 = time.monotonic()
+    try:
+        if not base_root.is_dir():
+            return []
+        roots = [base_root]
+        roots.extend(
+            sorted(child for child in base_root.iterdir() if child.is_dir())
+        )
+    except OSError as exc:
+        _log.warning(
+            "session_discovery_root_unreadable",
+            root=str(base_root),
+            error=str(exc),
+        )
+        return []
+    entries: list[SessionEntry] = []
+    scanned = 0
+    for root in roots:
+        # Cooperative cancel between DBs (rule 7): each open can busy-wait
+        # up to sqlite's busy_timeout, so a many-project scan must remain
+        # interruptible inside the loop, not only at its edges. The
+        # callable keeps this module Qt-free (rule 2) — the browser
+        # worker passes its stop/token check.
+        if should_stop is not None and should_stop():
+            _log.info("session_discovery_cancelled", root=str(base_root), scanned=scanned)
+            return entries
+        db_path = root / _DB_FILENAME
+        try:
+            if not db_path.is_file():
+                continue
+            dao = ArchiveDao(db_path, read_only=True)
+            try:
+                records = dao.list_sessions(limit=limit_per_db)
+            finally:
+                dao.close()
+        except (sqlite3.Error, OSError) as exc:
+            _log.warning(
+                "session_discovery_db_failed",
+                db=str(db_path),
+                error=str(exc),
+            )
+            continue
+        scanned += 1
+        entries.extend(
+            SessionEntry(
+                record=record,
+                session_root=str(root),
+                db_path=str(db_path),
+            )
+            for record in records
+        )
+    entries.sort(key=lambda e: (e.record.started_at, e.record.id), reverse=True)
+    _log.info(
+        "session_discovery_done",
+        root=str(base_root),
+        dbs_scanned=scanned,
+        sessions=len(entries),
+        elapsed_s=round(time.monotonic() - t0, 3),
+    )
+    return entries
 
 
 def ensure_project_root(base_root: Path, project_name: str) -> Path:

@@ -341,7 +341,7 @@ no session concept in the UI, no trace-window MiniSEED/CSV export (only
 HVSR CSV/JSON exist), no PNG export, re-indexer unbuilt (`parse_sds_path`
 at `storage/sds.py:130–168` has zero callers).
 
-- [ ] **A. Session browser**: list sessions by name/date (search + date
+- [x] **A. Session browser**: list sessions by name/date (search + date
       filter), per-session device/stream tree with coverage strips
       (extent/coverage DAO + strip widget already exist — re-scope them
       per-session). NOTE (M2-B consequence): between sessions
@@ -351,6 +351,62 @@ at `storage/sds.py:130–168` has zero callers).
       this browser opens project DBs explicitly (scan project dirs'
       `archive.db`s + the base monitoring index). Detection replay /
       Archive→HVSR hand-offs for closed sessions depend on this.
+      *Done 2026-06-11* (gate green; code-reviewer + qt-concurrency-auditor
+      on the diff):
+  - [x] `storage/sessions.discover_sessions(base_root)`: scans the base
+        monitoring index + every project dir's `archive.db` **read-only**
+        (`db.connect(read_only=True)`: `mode=ro` + `query_only`, no
+        schema/migration — a browse never rewrites a DB, rule 8); per-DB
+        errors logged + skipped. Returns `SessionEntry` (SessionRecord +
+        session_root + db_path, `core/models.py`) — everything a reader
+        needs to reach a CLOSED session with no live engine context.
+  - [x] `core/archive_browser_loader.py`: standard worker (skill §1–§2)
+        with TWO latest-wins token streams (list vs detail — neither
+        supersedes the other); detail builds the per-device 3C station
+        tree (`three_component_groups_from_pairs`, the pure core twin of
+        the live HVSR grouping) + extent/coverage clipped to the session
+        span, opening each session DB read-only and closing it before the
+        slot returns. Start→stop→start + stop-during-busy pinned.
+  - [x] ArchiveTab rebuilt session-centric: session list (name search +
+        date filter, `⚠ dirty` amber, `● open` green), per-session
+        device/station tree with CoverageStrips over the session span,
+        default interval inside the session's REAL coverage, the main
+        coverage strip re-sliced client-side (zero GUI-thread DB reads —
+        the old ctor-DAO `archive_extent` calls on the GUI thread are
+        gone with the ctor DAO itself).
+  - [x] stale-DAO debt rewired: `ArchiveDetailLoader`/`ArchiveWindowLoader`
+        take NO constructor DAO; each request snapshots `db_path` (the
+        tab's selected `SessionEntry`, else `engine.archive_db_path()` —
+        new per-context accessor) and the worker opens it read-only per
+        load, closing in `finally` (own-thread connection, the M2-B leak
+        note). Missing/corrupt index degrades to the canonical SDS scan,
+        never a failure (both pinned).
+  - [x] M3-E seam: an Archive→HVSR hand-off stores the browsed session
+        root keyed to the device AND interval (±1 s, the prefill's
+        second-resolution round-trip); `_run_hvsr_archive` reads that
+        root (index-less reader — no cross-thread DAO lifetime) so "Run
+        on archive" works for closed sessions; ANY manual re-target
+        (other device or other interval) falls back to the live engine
+        roots — regression-tested (the device-only keying was a
+        code-reviewer major: it silently re-routed later same-device
+        manual runs to the stale session).
+  - [x] acceptance pinned end-to-end:
+        `test_closed_session_waveforms_load_without_active_session`
+        (MainWindow + real loaders + real SDS files, engine fully idle).
+        Bonus regression caught by it: `_on_archive_window_loaded` had a
+        latent `UTCDateTime` NameError — the loaded-path had never been
+        driven through the real loader before.
+  - [x] review findings fixed + regression-tested: closeEvent severs the
+        `sessionChanged`→refresh bridge BEFORE joining the browser thread
+        (qt-auditor F1 — `engine.stop()`'s queued emit used to lazily
+        RESTART the just-joined thread mid-teardown → Qt abort at exit);
+        `_clear_session_detail` invalidates the detail token (F2 — a late
+        `detailLoaded` for a vanished session resurrected a ghost tree
+        whose Load fell back to the wrong root); discovery polls a
+        cooperative `should_stop` between DB opens (F3, rule 7); ro URI
+        percent-encoded (paths with `?`/`#`/`%`); probe-failure DAO
+        closed explicitly; the per-session "streams indexed, no files"
+        empty state re-pinned.
 - [ ] **B. Window viewing**: verify + polish the static 3C view +
       spectrogram for any session/interval (mostly implemented; remaining:
       zoom/pan ergonomics, unit switching with gaps, export PNG).
@@ -481,6 +537,12 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M2-C: crash-recovery sweep runs **synchronously in `MainWindow.__init__`** before the engine exists, gated by a **QLockFile** on the base root | Rule 13 guarantees nothing in THIS process touches the DBs at launch; the lock closes the cross-process hole (a second instance must not dirty-close a session another instance is recording — qt-concurrency-auditor F4). A crashed holder's lock is stale (dead pid) and reclaimed, so the sweep still runs after real crashes. Pre-event-loop bootstrap I/O, per-DB elapsed-logged, OSError-contained. |
 | 2026-06-11 | M2-C reviews: tests redirect `platformdirs.user_data_dir` into the per-test tmp (autouse conftest fixture + pin) | Code-reviewer BLOCKER: default-config MainWindow tests ran the launch sweep against the user's REAL `~/.local/share/echosmonitor/archive` (the M0-C QSettings bug class — no damage occurred only because the dir didn't exist yet). Also from review: panel badge slot no longer resurrects removed-device rows (ghost class); toolbar bytes baselines snapshot on first sight in `_refresh` (no lifetime-counter flash); engine `stop()` flips `_started` before its event barrier so a pre-posted config diff can't spawn an orphaned worker mid-teardown (regression-tested). |
 | 2026-06-11 | M2-B reviews: session transitions are guarded (`_session_transition` flag + `ExcludeUserInputEvents` on every absorb barrier; config diffs re-queue past the swap); `start_session` absorbs queued DSP-thread detections BEFORE the DAO swap; a failed swap restores the sessionless detection index; `started_at` fetched by row id; base index sweeps crash-dirty rows on open | qt-concurrency-auditor F1/F2/F4/F5 + code-reviewer majors 1–2, minors 4–5 on the M2-B diff: `processEvents()` inside the swap could dispatch a reentrant `start_session`/click and route the old session's queued `flushedFile`/detection events into the NEW project's DB; `list_sessions(limit=1)` provenance could be fooled by a crash-dirty future-dated row. DAO lifetime is now documented as per-context on `archive_dao()`; consumer re-resolution is the contract (stale-reference rewiring lands with M2-C/M3-A). |
+
+| 2026-06-11 | M3-A: browsing opens every DB **read-only** (`mode=ro` + `query_only`, no migration) | A browse must never rewrite an archive as a side effect (rule 8; the `stored_project_name` precedent). The launch sweep already migrates every base-root DB, so the browser never needs write access; a v-old foreign DB that fails the ro query is skipped per-DB, not migrated. |
+| 2026-06-11 | M3-A: loaders take **no constructor DAO** — requests carry `db_path`, the worker opens it read-only and closes per request | The M2-B DAO is per-session-context; a captured reference goes stale on the first swap and a worker-thread connection on it leaks (`close()` is per-thread). Per-request open/close on the worker thread kills both, and the index stays a pure accelerator (missing/corrupt → canonical-scan fallback). Same reasoning removed the engine-DAO hand-off into the HVSR thread (`_run_hvsr_archive` is index-less now). |
+| 2026-06-11 | M3-A: browser truth = `SessionEntry` (session_root + db_path), **including for the open session**; per-device `archive.root_dir` override archives are not browsable | Discovery can only see base-rooted project dirs (the decision-logged M2-B injectivity scope); routing the open session through the engine instead would make the same window behave differently mid-recording vs after Stop. Revisit with the override-root edge config if the field uses it. |
+| 2026-06-11 | M3-A: detection-table history prefill across session DBs stays OPEN (not part of A) | A's acceptance is the waveform browser; the detections table still fills from live sessions only. The browser's discovery layer is the natural substrate when M3 revisits it. |
+| 2026-06-11 | M3-A: per-session station trees show only `session_devices` members; a membership-less row (base monitoring index) falls back to ALL devices in that DB | Membership is the rule-14 record of who recorded; the monitoring index has no membership by design and hiding everything would make it look broken. Coverage stays the honest signal either way. |
 
 ## Open questions (resolve before the milestone that needs them)
 

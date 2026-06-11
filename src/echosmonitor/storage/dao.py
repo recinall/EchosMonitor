@@ -62,9 +62,16 @@ def _now_iso() -> str:
 class ArchiveDao:
     """Per-archive-root DAO. Holds one connection per accessing thread."""
 
-    def __init__(self, db_path: Path, batch_window_s: float = 1.0) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        batch_window_s: float = 1.0,
+        *,
+        read_only: bool = False,
+    ) -> None:
         self._db_path = db_path
         self._batch_window_s = batch_window_s
+        self._read_only = read_only
         self._local = threading.local()
         # ``_dirty`` and ``_last_commit`` are only touched by the
         # storage thread (the only writer). Read-only readers don't
@@ -80,7 +87,7 @@ class ArchiveDao:
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = connect(self._db_path)
+            conn = connect(self._db_path, read_only=self._read_only)
             self._local.conn = conn
         return conn
 
@@ -153,7 +160,7 @@ class ArchiveDao:
         DB) is the source of truth, so a crash in this window loses
         only the index row — re-derivable from the file.
         """
-        if not self._dirty:
+        if not self._dirty or self._read_only:
             return
         now = time.monotonic()
         if now - self._last_commit >= self._batch_window_s:
@@ -162,8 +169,13 @@ class ArchiveDao:
             self._dirty = False
 
     def flush_now(self) -> None:
-        """Commit immediately if dirty. Called at session boundaries."""
-        if not self._dirty:
+        """Commit immediately if dirty. Called at session boundaries.
+
+        A no-op on read-only DAOs: ``transactional`` marks the
+        connection dirty even for SELECT-only actions, and a commit on
+        a ``query_only`` connection has nothing to write.
+        """
+        if not self._dirty or self._read_only:
             return
         self._conn().commit()
         self._last_commit = time.monotonic()
@@ -617,6 +629,27 @@ class ArchiveDao:
         )
         row = cur.fetchone()
         return int(row["id"]) if row is not None else None
+
+    def list_streams(self) -> list[tuple[str, str]]:
+        """Every indexed ``(device_name, nslc)`` pair — read-only.
+
+        Browse helper for the M3-A session browser: the per-session
+        device/stream tree is derived from these pairs (filtered to the
+        session's member devices by the caller). Ordered for stable UI.
+        """
+        rows = self._conn().execute(
+            "SELECT dev.name AS device, s.network AS network, s.station AS station,"
+            "       s.location AS location, s.channel AS channel"
+            " FROM streams s JOIN devices dev ON s.device_id = dev.id"
+            " ORDER BY dev.name, s.network, s.station, s.location, s.channel"
+        ).fetchall()
+        return [
+            (
+                str(row["device"]),
+                f"{row['network']}.{row['station']}.{row['location']}.{row['channel']}",
+            )
+            for row in rows
+        ]
 
     def files_in_range(
         self,

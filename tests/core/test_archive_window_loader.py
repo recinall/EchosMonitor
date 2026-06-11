@@ -238,6 +238,76 @@ def test_corrupt_path_emits_failed_without_crashing_thread(qtbot, tmp_path, monk
         loader.shutdown()
 
 
+def test_per_request_db_path_enables_index_backed_discovery(qtbot, tmp_path) -> None:
+    """M3-A stale-DAO fix: the request's ``db_path`` is opened read-only per
+    load. Pinned by a file at a NON-canonical path that only the ``files``
+    index knows: with ``db_path`` it loads, without it the scan misses it."""
+    from echosmonitor.storage.dao import ArchiveDao
+
+    root = tmp_path / "session_root"
+    t0 = _t0()
+    # Write at the canonical path, then move it where only the index points.
+    _write_trace(root, "Z", t0, npts=int(_FS * 30))
+    sid = StreamID(_NET, _STA, _LOC, f"{_PREFIX}Z")
+    canonical = sds_path(device_sds_root(root, _DEVICE), t0, sid)
+    hidden = root / "off-grammar.mseed"
+    canonical.rename(hidden)
+
+    db = root / "archive.db"
+    dao = ArchiveDao(db)
+    dev_id = dao.upsert_device(_DEVICE, "h", 18000, {})
+    stream_id = dao.upsert_stream(dev_id, (_NET, _STA, _LOC, f"{_PREFIX}Z"), _FS)
+    dao.record_file(stream_id, hidden, t0, t0 + 30, hidden.stat().st_size)
+    dao.close()
+
+    loader = ArchiveWindowLoader(None)
+    col = _Collector()
+    col.bind(loader)
+    try:
+        # Without the index: the canonical scan finds nothing.
+        loader.request(_DEVICE, {"Z": _nslc("Z")}, float(t0), float(t0 + 30.0), str(root))
+        qtbot.waitUntil(lambda: bool(col.empty) or bool(col.failed), timeout=10_000)
+        assert col.empty and not col.failed
+
+        # With the request-scoped index: the hidden file is discovered.
+        loader.request(
+            _DEVICE,
+            {"Z": _nslc("Z")},
+            float(t0),
+            float(t0 + 30.0),
+            str(root),
+            db_path=str(db),
+        )
+        qtbot.waitUntil(lambda: bool(col.loaded) or bool(col.failed), timeout=10_000)
+        assert not col.failed, col.failed
+        assert {t.comp for t in col.loaded[-1].traces} == {"Z"}
+    finally:
+        loader.shutdown()
+
+
+def test_unreadable_db_path_degrades_to_scan_not_failure(qtbot, tmp_path) -> None:
+    """A corrupt/missing index is an accelerator loss, never a load failure."""
+    root = tmp_path / "session_root"
+    t0 = _t0()
+    for comp in ("Z", "N", "E"):
+        _write_trace(root, comp, t0, npts=int(_FS * 30))
+    bad_db = root / "archive.db"
+    bad_db.write_bytes(b"not sqlite")
+
+    loader = ArchiveWindowLoader(None)
+    col = _Collector()
+    col.bind(loader)
+    try:
+        loader.request(
+            _DEVICE, _group(), float(t0), float(t0 + 30.0), str(root), db_path=str(bad_db)
+        )
+        qtbot.waitUntil(lambda: bool(col.loaded) or bool(col.failed), timeout=10_000)
+        assert not col.failed, col.failed
+        assert {t.comp for t in col.loaded[-1].traces} == {"Z", "N", "E"}
+    finally:
+        loader.shutdown()
+
+
 def test_latest_wins_supersedes_stale_load(qtbot, tmp_path) -> None:
     root = tmp_path / "sds"
     t0 = _t0()

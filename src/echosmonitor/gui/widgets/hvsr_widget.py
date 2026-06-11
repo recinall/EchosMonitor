@@ -69,10 +69,6 @@ if TYPE_CHECKING:
 # stays free of ArchiveReader / storage construction.
 ArchiveHandler = Callable[[str, dict[str, str], UTCDateTime, UTCDateTime, HvsrSettings], str]
 
-# Vertical orientation letter; everything else in a station group is a
-# horizontal. SEED uses Z/N/E or Z/1/2 — we map the two horizontals to N/E.
-_VERTICAL = "Z"
-
 # Pens / brushes.
 _MEAN_PEN = pg.mkPen("#3aa3ff", width=3)
 _PRE_MEAN_PEN = pg.mkPen("#f5b942", width=2, style=Qt.PenStyle.DashLine)
@@ -94,13 +90,6 @@ _B_MIN, _B_MAX = 5.0, 200.0
 _FREQ_MIN, _FREQ_MAX = 0.05, 100.0
 
 
-def _orientation(nslc: str) -> str:
-    parts = nslc.split(".")
-    if len(parts) != 4 or len(parts[3]) < 3:
-        return ""
-    return parts[3][2]
-
-
 def _station_key(nslc: str) -> str:
     parts = nslc.split(".")
     if len(parts) != 4:
@@ -111,32 +100,25 @@ def _station_key(nslc: str) -> str:
 
 
 def three_component_groups(engine: StreamingEngine) -> dict[str, dict[str, dict[str, str]]]:
-    """Map ``device -> station_key -> {Z,N,E: nslc}`` for 3C-capable stations.
+    """Map ``device -> station_key -> {Z,N,E: nslc}`` over the LIVE buffers.
 
-    A station is 3C-capable when it has a vertical (``Z``) plus two
-    horizontals (``N``/``E`` or ``1``/``2``). The two horizontals map to
-    ``N`` (first) and ``E`` (second) so they feed hvsrpy's ``ns``/``ew``.
+    Thin live-engine adapter over the pure
+    :func:`~echosmonitor.core.models.three_component_groups_from_pairs`
+    (shared with the archive-browser worker, which feeds it DB stream
+    rows instead of buffer keys — M3-A).
     """
-    from echosmonitor.core.models import DEVICE_KEY_SEP
+    from echosmonitor.core.models import (
+        DEVICE_KEY_SEP,
+        three_component_groups_from_pairs,
+    )
 
-    by_device: dict[str, dict[str, dict[str, str]]] = {}
-    raw: dict[tuple[str, str], dict[str, str]] = {}
+    pairs: list[tuple[str, str]] = []
     for composite in engine._buffers:
         if DEVICE_KEY_SEP not in composite:
             continue
         device, nslc = composite.split(DEVICE_KEY_SEP, maxsplit=1)
-        orient = _orientation(nslc)
-        if not orient:
-            continue
-        raw.setdefault((device, _station_key(nslc)), {})[orient] = nslc
-    for (device, station), orients in raw.items():
-        vertical = orients.get(_VERTICAL)
-        horizontals = sorted(n for o, n in orients.items() if o != _VERTICAL)
-        if vertical is None or len(horizontals) < 2:
-            continue
-        group = {"Z": vertical, "N": horizontals[0], "E": horizontals[1]}
-        by_device.setdefault(device, {})[station] = group
-    return by_device
+        pairs.append((device, nslc))
+    return three_component_groups_from_pairs(pairs)
 
 
 class HvsrWidget(QWidget):

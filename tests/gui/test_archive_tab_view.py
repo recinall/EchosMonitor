@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 from obspy import UTCDateTime
 from obspy.core.util import get_example_file
-from PySide6.QtCore import QObject, Signal
 
 from echosmonitor.config.schema import (
     AppConfig,
@@ -26,6 +25,7 @@ from echosmonitor.config.schema import (
     StreamSelectorConfig,
     UiConfig,
 )
+from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
 from echosmonitor.core.archive_window_loader import (
     ArchiveWindowResult,
     ComponentTrace,
@@ -38,13 +38,12 @@ _T0 = float(UTCDateTime("2026-05-10T12:00:00").timestamp)
 _DUR = 30.0
 
 
-class _FakeEngine(QObject):
-    newStreamSeen = Signal(str, str)  # noqa: N815
-    devicesChanged = Signal()  # noqa: N815
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._buffers: dict[str, object] = {}
+@pytest.fixture
+def browser():
+    """A real (idle) browser loader; the tab's ctor needs one (M3-A)."""
+    loader = ArchiveBrowserLoader()
+    yield loader
+    loader.shutdown()
 
 
 def _component(comp: str, *, gap: bool = False) -> ComponentTrace:
@@ -81,8 +80,8 @@ def _result(*, gap_on: str | None = None, with_spec: bool = True) -> ArchiveWind
     )
 
 
-def _make_tab(qtbot) -> ArchiveTab:
-    tab = ArchiveTab(_FakeEngine(), None)  # type: ignore[arg-type]
+def _make_tab(qtbot, tmp_path, browser) -> ArchiveTab:
+    tab = ArchiveTab(browser, tmp_path)
     qtbot.addWidget(tab)
     # Pretend a window for this selection was loaded.
     tab._loaded_device = "dev"
@@ -92,8 +91,8 @@ def _make_tab(qtbot) -> ArchiveTab:
     return tab
 
 
-def test_renders_three_components_and_spectrogram(qtbot) -> None:
-    tab = _make_tab(qtbot)
+def test_renders_three_components_and_spectrogram(qtbot, tmp_path, browser) -> None:
+    tab = _make_tab(qtbot, tmp_path, browser)
     tab.show_result(_result())
 
     for comp in ("Z", "N", "E"):
@@ -105,15 +104,15 @@ def test_renders_three_components_and_spectrogram(qtbot) -> None:
     assert float(np.var(img)) > 0.0  # non-degenerate (rule 10)
 
 
-def test_gap_is_a_break_not_interpolated(qtbot) -> None:
-    tab = _make_tab(qtbot)
+def test_gap_is_a_break_not_interpolated(qtbot, tmp_path, browser) -> None:
+    tab = _make_tab(qtbot, tmp_path, browser)
     tab.show_result(_result(gap_on="Z"))
     _x, y = tab.trace_curve_for_test("Z").getData()
     assert np.isnan(np.asarray(y, dtype=np.float64)).any()
 
 
-def test_x_range_fits_loaded_window(qtbot) -> None:
-    tab = _make_tab(qtbot)
+def test_x_range_fits_loaded_window(qtbot, tmp_path, browser) -> None:
+    tab = _make_tab(qtbot, tmp_path, browser)
     tab.show_result(_result())
     lo, hi = tab.trace_x_range_for_test()
     # The rendered X range matches the data window, not the default [0, 1].
@@ -121,8 +120,8 @@ def test_x_range_fits_loaded_window(qtbot) -> None:
     assert hi == pytest.approx(_T0 + _DUR, abs=1.0)
 
 
-def test_short_window_renders_traces_without_spectrogram(qtbot) -> None:
-    tab = _make_tab(qtbot)
+def test_short_window_renders_traces_without_spectrogram(qtbot, tmp_path, browser) -> None:
+    tab = _make_tab(qtbot, tmp_path, browser)
     tab.show_result(_result(with_spec=False))
     x, _y = tab.trace_curve_for_test("Z").getData()
     assert x is not None and len(x) > 0
@@ -130,8 +129,8 @@ def test_short_window_renders_traces_without_spectrogram(qtbot) -> None:
     assert tab.spectrogram_image_for_test() is None
 
 
-def test_unit_relabel_and_rerender_on_physical(qtbot) -> None:
-    tab = _make_tab(qtbot)
+def test_unit_relabel_and_rerender_on_physical(qtbot, tmp_path, browser) -> None:
+    tab = _make_tab(qtbot, tmp_path, browser)
     tab.show_result(_result())
     _x, y_counts = tab.trace_curve_for_test("Z").getData()
     y_counts = np.asarray(y_counts, dtype=np.float64).copy()

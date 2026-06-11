@@ -10,9 +10,10 @@ asserted (rule 10).
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from obspy import UTCDateTime
-from PySide6.QtCore import QObject, Signal
 
+from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
 from echosmonitor.core.archive_window_loader import (
     ArchiveWindowResult,
     ComponentTrace,
@@ -24,16 +25,15 @@ _T0 = float(UTCDateTime("2026-05-10T12:00:00").timestamp)
 _DUR = 30.0
 
 
-class _FakeEngine(QObject):
-    newStreamSeen = Signal(str, str)  # noqa: N815
-    devicesChanged = Signal()  # noqa: N815
+@pytest.fixture
+def browser():
+    """A real (idle) browser loader; the tab's ctor needs one (M3-A)."""
+    loader = ArchiveBrowserLoader()
+    yield loader
+    loader.shutdown()
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._buffers: dict[str, object] = {}
 
-
-def _make_tab_with_ramp(qtbot) -> tuple[ArchiveTab, np.ndarray, np.ndarray]:
+def _make_tab_with_ramp(qtbot, tmp_path, browser) -> tuple[ArchiveTab, np.ndarray, np.ndarray]:
     """Z is a known ramp y = index so amplitude readouts are predictable."""
     n = int(_FS * _DUR)
     x = _T0 + np.arange(n, dtype=np.float64) / _FS
@@ -53,7 +53,7 @@ def _make_tab_with_ramp(qtbot) -> tuple[ArchiveTab, np.ndarray, np.ndarray]:
         spec_t_end=_T0 + _DUR,
         elapsed_ms=1.0,
     )
-    tab = ArchiveTab(_FakeEngine(), None)  # type: ignore[arg-type]
+    tab = ArchiveTab(browser, tmp_path)
     qtbot.addWidget(tab)
     tab._loaded_device = "dev"
     tab._loaded_group = {"Z": "XX.STA.00.HHZ", "N": "XX.STA.00.HHN", "E": "XX.STA.00.HHE"}
@@ -63,8 +63,8 @@ def _make_tab_with_ramp(qtbot) -> tuple[ArchiveTab, np.ndarray, np.ndarray]:
     return tab, x, y
 
 
-def test_cursor_readout_time_and_amplitude(qtbot) -> None:
-    tab, _x, _y = _make_tab_with_ramp(qtbot)
+def test_cursor_readout_time_and_amplitude(qtbot, tmp_path, browser) -> None:
+    tab, _x, _y = _make_tab_with_ramp(qtbot, tmp_path, browser)
     # Cursor A at +5 s (sample 500 → amp 500), B at +7 s (sample 700 → amp 700).
     tab.set_cursor_epoch_for_test("A", _T0 + 5.0)
     tab.set_cursor_epoch_for_test("B", _T0 + 7.0)
@@ -83,8 +83,8 @@ def test_cursor_readout_time_and_amplitude(qtbot) -> None:
     assert "200" in text
 
 
-def test_reset_view_refits_window(qtbot) -> None:
-    tab, _x, _y = _make_tab_with_ramp(qtbot)
+def test_reset_view_refits_window(qtbot, tmp_path, browser) -> None:
+    tab, _x, _y = _make_tab_with_ramp(qtbot, tmp_path, browser)
     # Zoom in to a sub-range, then reset.
     tab._stacked_plots["Z"].setXRange(_T0 + 10.0, _T0 + 12.0, padding=0.0)
     tab._reset_view()
@@ -93,8 +93,8 @@ def test_reset_view_refits_window(qtbot) -> None:
     assert abs(hi - (_T0 + _DUR)) < 1.0
 
 
-def test_readout_reports_gap_when_cursor_on_missing_sample(qtbot) -> None:
-    tab, _x, _y = _make_tab_with_ramp(qtbot)
+def test_readout_reports_gap_when_cursor_on_missing_sample(qtbot, tmp_path, browser) -> None:
+    tab, _x, _y = _make_tab_with_ramp(qtbot, tmp_path, browser)
     # Put a gap in Z and re-render, then place a cursor inside it.
     n = int(_FS * _DUR)
     x = _T0 + np.arange(n, dtype=np.float64) / _FS

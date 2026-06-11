@@ -11,6 +11,7 @@ detach (Ctrl+Shift+N) layered on by M7.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
 
 from echosmonitor import __version__
 from echosmonitor.config import RootConfig
+from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
 from echosmonitor.core.archive_detail_loader import (
     ArchiveDetailLoader,
     ArchiveDetailResult,
@@ -263,6 +265,10 @@ class MainWindow(QMainWindow):
         # real crash — exactly when it matters.
         base_root = resolve_base_archive_root(config)
         base_root.mkdir(parents=True, exist_ok=True)
+        # Kept for the Archive tab's session browser: discovery scans the
+        # SAME base root the sweep (and the engine) use, so they can never
+        # disagree about where sessions live (rule 14).
+        self._base_archive_root = base_root
         self._instance_lock = QLockFile(str(base_root / ".echosmonitor.lock"))
         sweep_t0 = time.monotonic()
         _log.info("session_crash_recovery_sweep_started", root=str(base_root))
@@ -409,9 +415,11 @@ class MainWindow(QMainWindow):
         # docs/POSTMORTEMS.md). The loader mirrors HvsrEngine: a parentless
         # worker on a dedicated thread, results delivered via QueuedConnection
         # so the GUI thread only ``setData``s. Read-only (rule 8); shares
-        # nothing with the live data path (rule 11). ``archive_dao()`` is read
-        # once here on the GUI thread (the DAO is thread-safe).
-        self._archive_loader = ArchiveDetailLoader(self._engine.archive_dao(), parent=self)
+        # nothing with the live data path (rule 11). No DAO is captured at
+        # construction — since M2-B the engine's DAO is per-session-context,
+        # so each request snapshots ``engine.archive_db_path()`` instead and
+        # the worker opens it read-only per load (M3-A stale-reference fix).
+        self._archive_loader = ArchiveDetailLoader(parent=self)
         self._archive_loader.loaded.connect(
             self._on_archive_detail_loaded, type=Qt.ConnectionType.QueuedConnection
         )
@@ -438,8 +446,26 @@ class MainWindow(QMainWindow):
         # mirroring the detail loader. Read-only (rule 8); shares nothing with
         # the live data path (rule 11). Its unit-switch deconvolution reuses the
         # same dedicated worker via a SEPARATE token map so it contends neither
-        # the live nor the detail-pane decon.
-        self._archive_window_loader = ArchiveWindowLoader(self._engine.archive_dao(), parent=self)
+        # the live nor the detail-pane decon. Like the detail loader, the
+        # metadata index is snapshotted per request, never at construction.
+        self._archive_window_loader = ArchiveWindowLoader(parent=self)
+
+        # Session browser loader (M3-A): discovery + per-session trees for
+        # the Archive tab, on its own worker thread. Owned here (shutdown
+        # joins it with the other loaders); the tab only emits requests.
+        self._archive_browser = ArchiveBrowserLoader(parent=self)
+        # The most recent Archive→HVSR hand-off as (device, session_root,
+        # t_start, t_end), so "Run on archive" reads the SAME session the
+        # user was browsing (rule 14) — a closed session's data is
+        # unreachable via the live engine roots. Keyed on device AND
+        # interval: a manual re-target of the HVSR widget (which can run
+        # any device/interval without a hand-off) must fall back to the
+        # live roots, not silently read a stale session (review finding).
+        self._hvsr_archive_ctx: tuple[str, str, float, float] | None = None
+        # closeEvent can run TWICE (explicit close + harness teardown);
+        # the sessionChanged→refresh bridge is severed exactly once
+        # (a second disconnect raises a libpyside RuntimeWarning).
+        self._archive_bridge_severed = False
         self._archive_window_loader.loaded.connect(
             self._on_archive_window_loaded, type=Qt.ConnectionType.QueuedConnection
         )
@@ -483,8 +509,9 @@ class MainWindow(QMainWindow):
         # session toolbar (or the device panel). The recent-detections
         # prefill that used to follow autostart is gone with it — the
         # engine has no DAO until a device starts, so the table fills
-        # from live sessions only (M3-A restores history through the
-        # sessions index).
+        # from live sessions only. Historical WAVEFORMS are reachable
+        # through the Archive tab's session browser (M3-A); a detection-
+        # table history prefill across session DBs remains open (M3).
         _log.info(
             "streaming_engine_idle",
             reason="acquisition is user-controlled (rule 13)",
@@ -534,13 +561,22 @@ class MainWindow(QMainWindow):
         self._psd_widget = PsdWidget(engine=self._engine, parent=self)
         self._hvsr_widget = HvsrWidget(self._engine, self._hvsr_engine, parent=self)
         self._hvsr_widget.set_archive_request_handler(self._run_hvsr_archive)
-        # The Archive tab: browse the SDS archive, view a window statically,
-        # measure on it, and hand the interval to HVSR. The DAO is read
-        # once here on the GUI thread (thread-safe, read-only — rule 8).
-        self._archive_tab = ArchiveTab(self._engine, self._engine.archive_dao(), parent=self)
+        # The Archive tab (M3-A): session browser + static window view.
+        # Session discovery + per-session trees run on the browser loader's
+        # worker thread; the tab carries each session's root + archive.db
+        # explicitly so CLOSED sessions are readable with no live engine
+        # context (the M2-B NOTE in ROADMAP).
+        self._archive_tab = ArchiveTab(
+            self._archive_browser, self._base_archive_root, parent=self
+        )
         self._archive_tab.loadRequested.connect(self._on_archive_window_load_requested)
         self._archive_tab.unitChangeRequested.connect(self._on_archive_window_unit_change)
         self._archive_tab.hvsrRequested.connect(self._handoff_archive_to_hvsr)
+        # A started/ended session appears in the browser without a manual
+        # refresh. Queued: the emit can originate inside engine transitions.
+        self._engine.sessionChanged.connect(
+            self._archive_tab.refresh_sessions, Qt.ConnectionType.QueuedConnection
+        )
 
         # Detections is a master-detail splitter: the table on the left,
         # the "why did this fire?" detail pane on the right. The table's
@@ -1465,6 +1501,7 @@ class MainWindow(QMainWindow):
         t_end = view_end
         self._archive_load_detection = detection
         self._archive_view_window = (view_start, view_end)
+        db_path = self._engine.archive_db_path()
         self._archive_load_token = self._archive_loader.request(
             detection.device,
             detection.nslc,
@@ -1472,6 +1509,7 @@ class MainWindow(QMainWindow):
             t_start,
             t_end,
             str(self._engine.archive_root(detection.device)),
+            db_path=str(db_path) if db_path is not None else None,
         )
 
     def _apply_response_availability(self, detection: Detection) -> None:
@@ -1625,11 +1663,25 @@ class MainWindow(QMainWindow):
 
         Latest-wins: the loader supersedes any in-flight load; only the latest
         token's result is rendered. The read + spectrogram build run on the
-        loader's worker thread (rule 11). ``archive_root`` is resolved here on
-        the GUI thread and snapshotted into the request (rule 8).
+        loader's worker thread (rule 11). The archive root + index are
+        resolved here on the GUI thread and snapshotted into the request
+        (rule 8) — from the tab's SELECTED SESSION, so a closed session's
+        project root is read even though the live engine only exposes the
+        bare base root between sessions (rule 14 / the M2-B NOTE). The
+        engine context is only a fallback for a load with no session
+        selected (not reachable through the tab's UI; defensive).
         """
         if not isinstance(device, str) or not isinstance(group, dict):
             return
+        entry = self._archive_tab.selected_session_entry()
+        archive_root: str
+        db_path: str | None
+        if entry is not None:
+            archive_root, db_path = entry.session_root, entry.db_path
+        else:
+            engine_db = self._engine.archive_db_path()
+            archive_root = str(self._engine.archive_root(device))
+            db_path = str(engine_db) if engine_db is not None else None
         # Supersede any prior unit batch + clear the prior window's components
         # so an in-flight decon result for the old window can't land on the new.
         self._archive_window_decon = {}
@@ -1640,10 +1692,13 @@ class MainWindow(QMainWindow):
             {str(k): str(v) for k, v in group.items()},
             float(t_start_epoch),
             float(t_end_epoch),
-            str(self._engine.archive_root(device)),
+            archive_root,
+            db_path=db_path,
         )
 
     def _on_archive_window_loaded(self, payload: object) -> None:
+        from obspy import UTCDateTime
+
         if not isinstance(payload, ArchiveWindowResult):
             return
         if payload.token != self._archive_window_token:
@@ -1720,11 +1775,24 @@ class MainWindow(QMainWindow):
         """Switch to the HVSR tab, prefilled with the Archive selection.
 
         Prefill only — the user reviews the HVSR settings and clicks "Run on
-        archive". The interval round-trips exactly.
+        archive". The interval round-trips exactly. The browsed session's
+        root is remembered (keyed to the handed-off device) so the run
+        reads the SAME session-rooted archive — including closed sessions
+        the live engine roots cannot reach (M3-E seam, rule 14).
         """
         if not isinstance(device, str) or not isinstance(group, dict):
             return
         grp = {str(k): str(v) for k, v in group.items()}
+        entry = self._archive_tab.selected_session_entry()
+        if entry is not None:
+            self._hvsr_archive_ctx = (
+                device,
+                entry.session_root,
+                float(t_start_epoch),
+                float(t_end_epoch),
+            )
+        else:
+            self._hvsr_archive_ctx = None
         if self._central_tabs is not None:
             self._central_tabs.setCurrentWidget(self._hvsr_widget)
         self._hvsr_widget.prefill_archive(device, grp, float(t_start_epoch), float(t_end_epoch))
@@ -1908,19 +1976,48 @@ class MainWindow(QMainWindow):
         and hands it to the HVSR engine, which slices the windows and runs one
         off-thread compute. Returns the measurement id, or ``""`` when the
         range holds no gap-free 3-component window.
+
+        Root resolution (M3-E seam, rule 14): a run that follows an
+        Archive-tab hand-off reads the handed-off SESSION's root — the
+        only way to reach a closed session's data. The context is keyed
+        to the handed-off device AND interval (±1 s — the prefill
+        round-trips at second resolution), so any manual re-target of
+        the widget falls back to the live engine roots instead of
+        silently reading a stale session.
         """
+        from pathlib import Path
+
         from obspy import UTCDateTime
 
         from echosmonitor.core.hvsr import HvsrSettings
         from echosmonitor.storage.archive_reader import ArchiveReader
 
         assert isinstance(settings, HvsrSettings)
-        reader = ArchiveReader(self._engine.archive_root(device), self._engine.archive_dao())
+        t0 = UTCDateTime(str(t_start))
+        t1 = UTCDateTime(str(t_end))
+        ctx = self._hvsr_archive_ctx
+        if (
+            ctx is not None
+            and ctx[0] == device
+            and abs(float(t0.timestamp) - ctx[2]) < 1.0
+            and abs(float(t1.timestamp) - ctx[3]) < 1.0
+        ):
+            root = Path(ctx[1])
+        else:
+            root = self._engine.archive_root(device)
+        # No DAO: the reader's canonical SDS day-scan finds every file the
+        # writer lays down, and a DAO would open a connection the engine's
+        # per-context close() never reaches (the M2-B leak note — same
+        # class the archive loaders fixed). NOTE the slice read itself is
+        # the documented one-shot INLINE read on the calling thread
+        # (hvsr_engine.start_archive_measurement) — only the HVSR compute
+        # runs off-thread; this call does not change that.
+        reader = ArchiveReader(root)
         return self._hvsr_engine.start_archive_measurement(
             device,
             group,
-            UTCDateTime(str(t_start)),
-            UTCDateTime(str(t_end)),
+            t0,
+            t1,
             settings,
             reader,
         )
@@ -2063,10 +2160,21 @@ class MainWindow(QMainWindow):
         # thread reads the engine's ring buffers, so it must be joined
         # before the engine it reads from goes away.
         self._hvsr_engine.shutdown()
-        # Archive detail loader: its worker consults the engine's DAO
-        # (thread-safe, read-only), so join it before the engine tears down.
+        # Archive loaders: their workers hold per-request read-only DB
+        # connections and read SDS files; join them before the engine
+        # (and its writers) tear down. Sever the sessionChanged →
+        # refresh_sessions bridge FIRST (skill §3: disconnect at the
+        # join): engine.stop() below emits sessionChanged(None) queued,
+        # and a refresh dispatched after the join would lazily RESTART
+        # the just-joined browser thread mid-teardown — nothing joins it
+        # again and Qt aborts at exit (qt-concurrency-auditor F1).
+        if not self._archive_bridge_severed:
+            self._archive_bridge_severed = True
+            with contextlib.suppress(RuntimeError, TypeError):
+                self._engine.sessionChanged.disconnect(self._archive_tab.refresh_sessions)
         self._archive_loader.shutdown()
         self._archive_window_loader.shutdown()
+        self._archive_browser.shutdown()
         self._engine.stop()
         if self._live_tabs is not None:
             self._live_tabs.save_active_tab()

@@ -25,7 +25,7 @@ import numpy as np
 from obspy import Trace, UTCDateTime
 
 from echosmonitor.config.schema import ArchiveConfig
-from echosmonitor.core.models import StreamID, device_stream_key
+from echosmonitor.core.models import StreamID
 from echosmonitor.storage.archive_reader import ArchiveReader
 from echosmonitor.storage.dao import ArchiveDao
 from echosmonitor.storage.mseed_writer import MseedWriter
@@ -107,36 +107,56 @@ def test_window_reads_back_real_samples(qapp: Any, tmp_path: Path) -> None:
 
 
 def test_archive_tab_shows_real_extent_and_default_within(qtbot, qapp: Any, tmp_path: Path) -> None:
-    from PySide6.QtCore import QObject, Signal
+    """The M3-A browser flow over a REAL-writer archive: the session row's
+    coverage drives the extent text + default interval, both inside the
+    real recorded span (never a now→now+1year fallback)."""
+    import sqlite3
 
+    from echosmonitor.core.archive_browser_loader import ArchiveBrowserLoader
     from echosmonitor.gui.widgets.archive_tab import ArchiveTab
 
-    dao, _root = _archive_via_real_writer(qapp, tmp_path)
+    dao, root = _archive_via_real_writer(qapp, tmp_path)
+    # Make the written archive a browsable session: one row spanning the
+    # real data (the engine writes this row at start_recording time).
+    sid = dao.start_session("h", "v", "x", project_name="RealProj", devices=(_DEVICE,))
+    dao.end_session(sid)
+    dao.close()
+    conn = sqlite3.connect(root / "archive.db")
+    conn.execute(
+        "UPDATE sessions SET started_at=?, ended_at=? WHERE id=?",
+        (str(_T0 - 10), str(_T0 + _DUR + 10), sid),
+    )
+    conn.commit()
+    conn.close()
 
-    class _FakeEngine(QObject):
-        newStreamSeen = Signal(str, str)  # noqa: N815
-        devicesChanged = Signal()  # noqa: N815
-
-        def __init__(self) -> None:
-            super().__init__()
-            self._buffers: dict[str, object] = {}
-
-    engine = _FakeEngine()
-    for nslc in _GROUP.values():
-        engine._buffers[device_stream_key(_DEVICE, nslc)] = object()
-
-    tab = ArchiveTab(engine, dao)  # type: ignore[arg-type]
-    qtbot.addWidget(tab)
-
-    # The extent label shows the REAL recorded span, and Load is enabled.
-    assert "Archived:" in tab.extent_text_for_test()
-    assert "No archived data" not in tab.extent_text_for_test()
-    assert tab.load_enabled_for_test()
-
-    # The default interval falls strictly WITHIN the real extent (not a
-    # now→now+1year fallback).
-    extent = dao.archive_extent(_DEVICE, _GROUP["Z"])
+    ro_dao = ArchiveDao(root / "archive.db", read_only=True)
+    extent = ro_dao.archive_extent(_DEVICE, _GROUP["Z"])
+    ro_dao.close()
     assert extent is not None
     t_min, t_max = float(extent[0].timestamp), float(extent[1].timestamp)
-    ds, de = tab.interval_for_test()
-    assert t_min <= ds < de <= t_max + 1.0
+
+    browser = ArchiveBrowserLoader()
+    # ``root`` is an immediate child of tmp_path → discovery finds its DB.
+    tab = ArchiveTab(browser, tmp_path)
+    qtbot.addWidget(tab)
+    try:
+        qtbot.waitUntil(lambda: len(tab.session_rows_for_test()) >= 1, timeout=10_000)
+        assert tab.session_rows_for_test()[0][0] == "RealProj"
+        tab.select_session_for_test(0)
+        station = "XX.ECHOS.00.HH"
+        qtbot.waitUntil(
+            lambda: tab.station_strip_for_test(_DEVICE, station) is not None,
+            timeout=10_000,
+        )
+        assert tab.select_station_for_test(_DEVICE, station)
+
+        # The extent label shows the REAL recorded span, and Load is enabled.
+        assert "Archived (this session):" in tab.extent_text_for_test()
+        assert "No archived" not in tab.extent_text_for_test()
+        assert tab.load_enabled_for_test()
+
+        # The default interval falls strictly WITHIN the real extent.
+        ds, de = tab.interval_for_test()
+        assert t_min <= ds < de <= t_max + 1.0
+    finally:
+        browser.shutdown()
