@@ -51,18 +51,16 @@ _RESTART_STEP_NAMES = (
 
 # Required keys for full-body writes (read-modify-write contract): a POST
 # missing any of these is a partial body and gets a 400, like the firmware.
-_ACQUISITION_KEYS = frozenset({"osr", "gains"})
-_NETWORK_KEYS = frozenset({"mode", "ssid", "hostname"})
+# Key sets mirror the REAL wire contract pinned 2026-06-11 against
+# echos.local/pihw.local (fw 1aa72cbe).
+_ACQUISITION_KEYS = frozenset({"osr", "gain_ch0", "gain_ch1", "gain_ch2", "gain_ch3"})
 _SEEDLINK_KEYS = frozenset(
     {
         "port",
-        "ring_records",
-        "record_size",
-        "auth_enabled",
+        "ring_buffer_kb",
+        "auth_required",
+        "record_size_bytes",
         "emit_hn1",
-        "network",
-        "station",
-        "stationxml_profile",
     }
 )
 
@@ -115,38 +113,102 @@ class FakeEchosFirmware:
         # Last accepted POST body per path (for body-shape assertions).
         self.last_post_body: dict[str, dict[str, Any]] = {}
 
+        # Real /api/status shape (fw 1aa72cbe), values fake-friendly.
         self.status: dict[str, Any] = {
+            "state": "idle",
+            "samples_acquired": 244_232_566,
+            "missed_samples": 0,
+            "time_synchronized": True,
+            "gnss_time_valid": True,
+            "time_sync_type": "RMC+PPS+NTP",
+            "ntp_synchronized": True,
+            "wifi_mode": "station",
+            "wifi_connected": True,
+            "active_schedule_name": None,
+            "position": {
+                "latitude": 45.4,
+                "longitude": 11.9,
+                "altitude": 20.0,
+                "satellites": 9,
+                "quality": 2,
+            },
+            "pps": {"offset_us": -4, "period_us": 1_000_000, "pulse_count": 488_436,
+                    "pll_locked": True},
+            "free_heap": 29_372,
+            "version": "1.4.2",
             "firmware_version": "1.4.2",
-            "variant": "seedlink",
-            "uptime_s": 3600.5,
-            "gnss": {"fix": True, "satellites": 9, "pps_locked": True},
-            "wifi": {"mode": "sta", "ssid": "field-net", "rssi_dbm": -61, "ip": "192.168.1.50"},
+            "project_name": "Echos_lite_seedlink",
         }
-        self.acquisition: dict[str, Any] = {"osr": 64, "gains": [1, 1, 1, 8]}
+        self.acquisition: dict[str, Any] = {
+            "osr": 6,
+            "gain_ch0": 5,
+            "gain_ch1": 5,
+            "gain_ch2": 5,
+            "gain_ch3": 5,
+            "num_samples": 0,
+            "filename": "measurement",
+            "save_crc": False,
+            "trigger_mode": "pin",
+            "save_format": "bin",
+            "seed_metadata": {
+                "network": "XX",
+                "station": "ECH01",
+                "location": "00",
+                "channel": "HH",
+            },
+        }
         self.network: dict[str, Any] = {
-            "mode": "sta",
-            "ssid": "field-net",
-            "hostname": "echos",
-            "has_password": True,
+            "known_networks": [{"ssid": "field-net", "has_password": True}],
+            "ap_ssid": "ECHOS_AP",
+            "has_ap_password": True,
+            "mdns_hostname": "echos",
+            "ntp_enabled": True,
+            "ntp_server": "pool.ntp.org",
         }
         self.seedlink: dict[str, Any] = {
+            "ring_buffer_kb": 896,
+            "max_clients": 5,
             "port": 18000,
-            "ring_records": 2048,
-            "record_size": 512,
-            "auth_enabled": False,
+            "keep_queue_depth": 3,
+            "auth_required": False,
+            "record_size_bytes": 512,
             "emit_hn1": False,
-            "network": "XX",
-            "station": "ECH01",
-            "stationxml_profile": "default",
-            "has_password": False,
+            "stationxml": {
+                "sensor_sens": 21.94,
+                "pz_pole_re": -16.96,
+                "pz_pole_im": 22.62,
+                "norm_factor": 1.096586,
+                "adc_vref": 1.2,
+                "creation_date": "2026-01-01T00:00:00Z",
+            },
+            "source": "nvs",
+            "modifiable": [
+                "port",
+                "ring_buffer_kb",
+                "auth_required",
+                "record_size_bytes",
+                "emit_hn1",
+                "stationxml",
+            ],
+            "note": "max_clients + keep_queue_depth are compile-time.",
         }
+        # SeedLink status counters (served live from these knobs).
+        self.seedlink_uptime_ms = 3_600_500
+        self.ring_slots_used = 224
+        self.ring_slots_total = 1792
         self.clients: list[dict[str, Any]] = [
             {"slot": 0, "address": "192.168.1.10:54321", "connected_s": 120.0, "packets_sent": 4096}
         ]
         self.ota: dict[str, Any] = {
-            "running_partition": "ota_0",
-            "ota_state": "valid",
-            "app_version": "1.4.2",
+            "current_version": "1.4.2",
+            "new_version": "",
+            "state": "idle",
+            "progress_percent": 0,
+            "bytes_downloaded": 0,
+            "total_bytes": 0,
+            "error_message": "",
+            "is_running": False,
+            "running_partition": "ota_1",
         }
         self.stationxml = _STATIONXML
 
@@ -156,19 +218,22 @@ class FakeEchosFirmware:
         self.retry_after_s = 30
         self.retry_after_header = True
 
-        # 7-step in-place restart simulation.
+        # 7-step in-place restart simulation. Idle shape pinned against
+        # real firmware ({"state":"idle","applied":{}}); the in-progress
+        # ladder is the fake's own (real shape is write-gated).
         self.restart_state = "idle"
         self.restart_step = 0
         self.total_restart_steps = len(_RESTART_STEP_NAMES)
+        self.applied: dict[str, Any] = {}
         self.pending_seedlink: dict[str, Any] | None = None
         self.fail_restart_at_step: int | None = None
         self.restart_hangs = False
         self.restart_unreachable_polls = 0
 
-        # 3-phase calibration simulation.
-        self.cal_state = "idle"
-        self.cal_phase = 0
-        self.cal_total_phases = 3
+        # PGA-gain-ladder calibration simulation (real: 8 gains).
+        self.cal_phase = "idle"
+        self.cal_current_gain = 0
+        self.cal_total_gains = 8
 
         # Fault injection.
         self.flaky: dict[str, int] = {}
@@ -235,13 +300,25 @@ class FakeEchosFirmware:
             return httpx.Response(
                 200,
                 json={
-                    "uptime_s": 3600.0,
-                    "client_count": len(self.clients),
-                    "ring_used_pct": 12.5,
+                    "running": True,
+                    "init_ok": True,
+                    "uptime_ms": self.seedlink_uptime_ms,
+                    "active_clients": len(self.clients),
+                    "max_clients": 5,
+                    "effective_max_clients": 5,
+                    "current_sample_rate_sps": 500,
+                    "keep_queue_count": 0,
+                    "keep_queue_max": 3,
+                    "ring_slots_used": self.ring_slots_used,
+                    "ring_slots_total": self.ring_slots_total,
+                    "ring_head_seq": 6_797_477,
+                    "ring_oldest_seq": 6_795_685,
+                    "port": self.seedlink["port"],
+                    "heap_internal_floor_b": 3887,
                 },
             )
         if path == "/api/seedlink/clients":
-            return httpx.Response(200, json={"clients": self.clients})
+            return httpx.Response(200, json={"clients": self.clients, "count": len(self.clients)})
         if path == "/api/seedlink/config":
             return httpx.Response(200, json=self.seedlink)
         if path == "/api/seedlink/restart-status":
@@ -249,30 +326,24 @@ class FakeEchosFirmware:
         if path == "/api/calibrate/status":
             return self._calibration_status()
         if path == "/api/calibration":
+            done = self.cal_phase == "done"
+            channel = {
+                "offset_raw": 1387,
+                "offset_mv": 0.198,
+                "noise_rms_uv": 2.56,
+                "noise_bits": 17.05,
+            }
             return httpx.Response(
                 200,
                 json={
-                    "completed_at": "2026-06-10T12:00:00Z" if self.cal_state == "done" else None,
-                    "channels": [
-                        {
-                            "channel": "HHZ",
-                            "gain": 1.002,
-                            "offset_counts": 12.5,
-                            "noise_rms_counts": 3.1,
-                        },
-                        {
-                            "channel": "HHN",
-                            "gain": 0.998,
-                            "offset_counts": -4.0,
-                            "noise_rms_counts": 2.9,
-                        },
-                        {
-                            "channel": "HHE",
-                            "gain": 1.001,
-                            "offset_counts": 7.25,
-                            "noise_rms_counts": 3.0,
-                        },
-                    ],
+                    "valid": done,
+                    "timestamp": "2026-06-11T12:00:00Z" if done else "",
+                    "gains": [
+                        {"gain": 1, "channels": [channel] * 4},
+                        {"gain": 2, "channels": [channel] * 4},
+                    ]
+                    if done
+                    else [],
                 },
             )
         if path == "/api/stationxml":
@@ -305,33 +376,36 @@ class FakeEchosFirmware:
                 self.restart_state = "done"
                 if self.pending_seedlink is not None:
                     self.seedlink = {**self.seedlink, **self.pending_seedlink}
+                    self.applied = dict(self.pending_seedlink)
                     self.pending_seedlink = None
         step = min(max(self.restart_step, 1), self.total_restart_steps)
         return httpx.Response(
             200,
             json={
-                "state": self.restart_state if self.restart_state != "idle" else "idle",
+                "state": self.restart_state,
                 "step": self.restart_step,
                 "total_steps": self.total_restart_steps,
                 "step_name": _RESTART_STEP_NAMES[step - 1] if self.restart_step > 0 else "",
                 "error": None,
+                "applied": self.applied,
             },
         )
 
     def _calibration_status(self) -> httpx.Response:
-        if self.cal_state == "running":
-            self.cal_phase += 1
-            if self.cal_phase > self.cal_total_phases:
-                self.cal_state = "done"
-                self.cal_phase = self.cal_total_phases
+        if self.cal_phase == "sweep":
+            self.cal_current_gain += 1
+            if self.cal_current_gain > self.cal_total_gains:
+                self.cal_phase = "done"
+                self.cal_current_gain = self.cal_total_gains
         return httpx.Response(
             200,
             json={
-                "state": self.cal_state,
                 "phase": self.cal_phase,
-                "total_phases": self.cal_total_phases,
-                "progress_pct": round(100.0 * self.cal_phase / self.cal_total_phases, 1),
-                "error": None,
+                "current_gain": self.cal_current_gain,
+                "total_gains": self.cal_total_gains,
+                "progress_percent": round(
+                    100.0 * self.cal_current_gain / self.cal_total_gains, 1
+                ),
             },
         )
 
@@ -340,15 +414,6 @@ class FakeEchosFirmware:
     def _handle_post(self, path: str, request: httpx.Request) -> httpx.Response:
         if path == "/api/config":
             return self._accept_full_body(path, request, _ACQUISITION_KEYS, self.acquisition)
-        if path == "/api/network/config":
-            body = self._json_body(request)
-            if body is None or not _NETWORK_KEYS.issubset(body):
-                return httpx.Response(400, json={"error": "invalid_config"})
-            self.last_post_body[path] = body
-            has_password = self.network["has_password"] or "password" in body
-            self.network = {k: body[k] for k in _NETWORK_KEYS}
-            self.network["has_password"] = has_password
-            return httpx.Response(200, json={"status": "ok"})
         if path == "/api/seedlink/config":
             body = self._json_body(request)
             if body is None or not _SEEDLINK_KEYS.issubset(body):
@@ -366,8 +431,8 @@ class FakeEchosFirmware:
                 return httpx.Response(404, json={"error": "no_such_client"})
             return httpx.Response(200, json={"status": "disconnected"})
         if path == "/api/calibrate/full":
-            self.cal_state = "running"
-            self.cal_phase = 0
+            self.cal_phase = "sweep"
+            self.cal_current_gain = 0
             return httpx.Response(202, json={"status": "calibration_started"})
         if path == "/api/auth/password":
             body = self._json_body(request)

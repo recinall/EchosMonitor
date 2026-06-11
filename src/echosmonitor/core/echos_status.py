@@ -266,13 +266,15 @@ class EchosStatusWorker(QObject):
         return EchosDeviceSnapshot(
             device=target.name,
             firmware_version=status.firmware_version,
-            uptime_s=status.uptime_s,
-            gnss_fix=status.gnss.fix,
-            gnss_satellites=status.gnss.satellites,
-            pps_locked=status.gnss.pps_locked,
-            clients_connected=seedlink.client_count,
+            # /api/status carries no uptime; the SeedLink server's
+            # uptime_ms is the closest device-side proxy.
+            uptime_s=seedlink.uptime_s,
+            gnss_fix=status.gnss_time_valid,
+            gnss_satellites=status.position.satellites if status.position else 0,
+            pps_locked=status.pps.pll_locked if status.pps else False,
+            clients_connected=seedlink.active_clients,
             ring_used_pct=seedlink.ring_used_pct,
-            calibration_state=calibration.state,
+            calibration_state=calibration.phase,
             polled_at=time.monotonic(),
         )
 

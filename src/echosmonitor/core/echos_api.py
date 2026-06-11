@@ -28,11 +28,15 @@ Design decisions baked in (rules 2, 7, 15):
   in logs or exception messages (rule 15). Persistent storage
   (keyring / file fallback) is M1-B's job, not this module's.
 
-JSON contract provenance: the firmware's exact field names are not yet
-pinned against a real device — the wire contract is defined by the test
-fake (``tests/core/echos_fake.py``), derived from the skill. Models use
-``extra="ignore"`` so additive firmware fields cannot break parsing;
-verify field names against real firmware before M1-C relies on them.
+JSON contract provenance: the READ contract was pinned against real
+firmware (echos.local + pihw.local, fw 1aa72cbe, 2026-06-11) — every
+GET model mirrors observed bodies; the test fake serves the same
+shapes. Still unpinned because they are write-gated or unobserved:
+the restart-status in-progress shape, the calibration sweep ``phase``
+vocabulary, the seedlink client entry shape, and the network-config
+POST schema (hence no network setter). Read models use
+``extra="ignore"``; models that are POSTed back use ``extra="allow"``
+so unmodelled firmware fields survive the read-modify-write.
 """
 
 from __future__ import annotations
@@ -44,7 +48,7 @@ from typing import Literal, TypeVar
 
 import httpx
 import structlog
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from echosmonitor.core.exceptions import (
     EchosApiError,
@@ -97,147 +101,280 @@ _PASSWORD_MAX_LEN = 64
 
 
 class _FrozenModel(BaseModel):
-    """Base for all wire models: immutable, tolerant of additive fields."""
+    """Base for read-only wire models: immutable, additive-field tolerant."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
 
-class GnssStatus(_FrozenModel):
-    """GNSS block of ``GET /api/status``."""
+class _FrozenRoundTripModel(BaseModel):
+    """Base for models that are POSTed back (read-modify-write).
 
-    fix: bool
-    satellites: int
-    pps_locked: bool
+    ``extra="allow"`` so firmware fields this client does not model are
+    preserved through GET → ``model_copy`` → POST instead of being
+    silently dropped from the full-body write.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="allow")
 
 
-class WifiStatus(_FrozenModel):
-    """WiFi block of ``GET /api/status`` (credential-safe by contract)."""
+class DevicePosition(_FrozenModel):
+    """``position`` block of ``GET /api/status`` (GNSS-derived)."""
 
-    mode: Literal["sta", "ap"]
-    ssid: str
-    rssi_dbm: int
-    ip: str
+    latitude: float
+    longitude: float
+    altitude: float = 0.0
+    satellites: int = 0
+    quality: int = 0
+
+
+class PpsStatus(_FrozenModel):
+    """``pps`` block of ``GET /api/status``."""
+
+    offset_us: int = 0
+    period_us: int = 0
+    pulse_count: int = 0
+    pll_locked: bool = False
 
 
 class EchosStatus(_FrozenModel):
-    """System snapshot from ``GET /api/status``."""
+    """System snapshot from ``GET /api/status`` (pinned 2026-06-11)."""
 
+    state: str
     firmware_version: str
-    variant: str
-    uptime_s: float
-    gnss: GnssStatus
-    wifi: WifiStatus
+    project_name: str = ""
+    samples_acquired: int = 0
+    missed_samples: int = 0
+    time_synchronized: bool = False
+    gnss_time_valid: bool = False
+    time_sync_type: str = ""
+    ntp_synchronized: bool = False
+    wifi_mode: str = ""
+    wifi_connected: bool = False
+    position: DevicePosition | None = None
+    pps: PpsStatus | None = None
+    free_heap: int = 0
 
 
-class EchosAcquisitionConfig(_FrozenModel):
-    """Acquisition config from ``GET /api/config`` (OSR + per-channel gains).
+class SeedMetadata(_FrozenRoundTripModel):
+    """``seed_metadata`` block of the acquisition config."""
 
-    ``gains`` is ordered by channel index; length 3 (velocimeter only) or
-    4 (with HN1) depending on the hardware fit.
+    network: str = ""
+    station: str = ""
+    location: str = ""
+    channel: str = ""
+
+
+class EchosAcquisitionConfig(_FrozenRoundTripModel):
+    """Acquisition config from ``GET /api/config`` (pinned 2026-06-11).
+
+    ``osr`` is the ADC oversampling register setting (small integer, not
+    the literal ratio). Per-channel PGA gains are flat ``gain_ch0..3``
+    fields on the wire; :attr:`gains` is the ordered convenience view.
     """
 
     osr: int
-    gains: tuple[int, ...]
+    gain_ch0: int
+    gain_ch1: int
+    gain_ch2: int
+    gain_ch3: int
+    seed_metadata: SeedMetadata | None = None
+
+    @property
+    def gains(self) -> tuple[int, int, int, int]:
+        return (self.gain_ch0, self.gain_ch1, self.gain_ch2, self.gain_ch3)
+
+
+class KnownNetwork(_FrozenModel):
+    """One stored WiFi network (credential-safe: presence flag only)."""
+
+    ssid: str = ""
+    has_password: bool = False
 
 
 class EchosNetworkConfig(_FrozenModel):
-    """WiFi/network config from ``GET /api/network/config``.
+    """WiFi/network config from ``GET /api/network/config`` (pinned 2026-06-11).
 
-    ``has_password`` is read-only device state (the device never returns
-    the password itself); it is excluded from write bodies.
+    READ-ONLY in this client: the firmware's POST schema for this
+    endpoint is not yet pinned, and a guessed write can take a device
+    off the network (decision log 2026-06-11).
     """
 
-    mode: Literal["sta", "ap"]
-    ssid: str
-    hostname: str
-    has_password: bool = False
+    known_networks: tuple[KnownNetwork, ...] = ()
+    ap_ssid: str = ""
+    has_ap_password: bool = False
+    mdns_hostname: str = ""
+    ntp_enabled: bool = True
+    ntp_server: str = ""
 
 
 class SeedlinkServerStatus(_FrozenModel):
-    """Snapshot from ``GET /api/seedlink/status``."""
+    """Snapshot from ``GET /api/seedlink/status`` (pinned 2026-06-11).
 
-    uptime_s: float
-    client_count: int
-    ring_used_pct: float
+    ``ring_slots_used == ring_slots_total`` is the steady state once the
+    circular buffer has wrapped — it means "full history available",
+    not "overflowing".
+    """
+
+    running: bool = False
+    uptime_ms: int = 0
+    active_clients: int = 0
+    max_clients: int = 0
+    ring_slots_used: int = 0
+    ring_slots_total: int = 0
+    current_sample_rate_sps: float = 0.0
+    port: int = 18000
+
+    @property
+    def uptime_s(self) -> float:
+        return self.uptime_ms / 1000.0
+
+    @property
+    def ring_used_pct(self) -> float:
+        if self.ring_slots_total <= 0:
+            return 0.0
+        return 100.0 * self.ring_slots_used / self.ring_slots_total
 
 
 class SeedlinkClientInfo(_FrozenModel):
-    """One connected client from ``GET /api/seedlink/clients``."""
+    """One connected client from ``GET /api/seedlink/clients``.
 
-    slot: int
-    address: str
-    connected_s: float
-    packets_sent: int
+    UNPINNED: no live client was connected during the 2026-06-11 contract
+    smoke, so the entry shape is defensive — every field defaulted.
+    Re-pin when a real client entry is observed.
+    """
+
+    slot: int = 0
+    address: str = ""
+    connected_s: float = 0.0
+    packets_sent: int = 0
 
 
 class _SeedlinkClientList(_FrozenModel):
-    clients: tuple[SeedlinkClientInfo, ...]
+    clients: tuple[SeedlinkClientInfo, ...] = ()
+    count: int = 0
 
 
-class SeedlinkServerConfig(_FrozenModel):
-    """SeedLink server config from ``GET /api/seedlink/config``.
+class StationXmlProfile(_FrozenRoundTripModel):
+    """``stationxml`` block of the seedlink config (instrument response)."""
+
+    sensor_sens: float = 0.0
+    pz_pole_re: float = 0.0
+    pz_pole_im: float = 0.0
+    norm_factor: float = 0.0
+    adc_vref: float = 0.0
+    creation_date: str = ""
+
+
+# Read-only / informational keys stripped from the seedlink write body.
+# ``max_clients`` and ``keep_queue_depth`` are compile-time per the
+# device's own ``note``; ``source``/``modifiable``/``note`` are echoes.
+_SEEDLINK_WRITE_EXCLUDE = frozenset(
+    {"source", "modifiable", "note", "max_clients", "keep_queue_depth"}
+)
+
+
+class SeedlinkServerConfig(_FrozenRoundTripModel):
+    """SeedLink server config from ``GET /api/seedlink/config`` (pinned 2026-06-11).
 
     Writes go through :meth:`EchosApiClient.apply_seedlink_config`
-    (read-modify-write, full body, hot-reload). ``has_password`` is
-    read-only device state and is excluded from the write body.
+    (read-modify-write, full body minus ``_SEEDLINK_WRITE_EXCLUDE``,
+    hot-reload). Per the device's own ``note``: POST persists port /
+    ring_buffer_kb / auth_required / record_size_bytes to NVS; port,
+    ring and record size apply via the in-place restart; auth_required
+    hot-applies on the next HELLO.
     """
 
     port: int
-    ring_records: int
-    record_size: Literal[512, 4096]
-    auth_enabled: bool
-    emit_hn1: bool
-    network: str
-    station: str
-    stationxml_profile: str
-    has_password: bool = False
+    ring_buffer_kb: int
+    auth_required: bool = False
+    record_size_bytes: Literal[512, 4096] = 512
+    emit_hn1: bool = False
+    max_clients: int = 0  # compile-time, read-only
+    keep_queue_depth: int = 0  # compile-time, read-only
+    stationxml: StationXmlProfile | None = None
 
 
 class RestartStatus(_FrozenModel):
-    """Progress of the 7-step in-place restart (``GET /api/seedlink/restart-status``)."""
+    """``GET /api/seedlink/restart-status`` (idle shape pinned 2026-06-11).
 
-    state: Literal["idle", "in_progress", "done", "failed"]
-    step: int
-    total_steps: int
+    Observed at rest: ``{"state": "idle", "applied": {}}``. The
+    in-progress shape is WRITE-GATED (it only exists during a real
+    authenticated config apply) and not yet pinned — ``step`` /
+    ``total_steps`` / ``step_name`` are kept lenient for the test fake's
+    7-step ladder and for whatever the real firmware reports.
+    """
+
+    state: str
+    step: int = 0
+    total_steps: int = 0
     step_name: str = ""
     error: str | None = None
+    applied: dict[str, object] = Field(default_factory=dict)
+
+    @property
+    def is_done(self) -> bool:
+        # Provisional terminal heuristic until the real in-progress
+        # shape is pinned: an explicit "done", or back to "idle" with a
+        # non-empty ``applied`` echo of what the restart installed.
+        return self.state == "done" or (self.state == "idle" and bool(self.applied))
+
+    @property
+    def is_failed(self) -> bool:
+        return self.state in ("failed", "error")
 
 
 class CalibrationStatus(_FrozenModel):
-    """Progress of the 3-phase calibration sweep (``GET /api/calibrate/status``)."""
+    """``GET /api/calibrate/status`` (idle shape pinned 2026-06-11).
 
-    state: Literal["idle", "running", "done", "failed"]
-    phase: int
-    total_phases: int
-    progress_pct: float
-    error: str | None = None
+    The sweep walks the PGA gain ladder (``total_gains`` = 8 observed),
+    not a fixed 3-phase plan as first assumed. ``phase`` vocabulary
+    beyond "idle" is WRITE-GATED (visible only during a real sweep) —
+    treat it as an open string.
+    """
+
+    phase: str
+    current_gain: int = 0
+    total_gains: int = 0
+    progress_percent: float = 0.0
 
 
 class ChannelCalibration(_FrozenModel):
-    """Per-channel result block of ``GET /api/calibration``."""
+    """Per-channel block of one gain step in ``GET /api/calibration``."""
 
-    channel: str
-    gain: float
-    offset_counts: float
-    noise_rms_counts: float
+    offset_raw: int = 0
+    offset_mv: float = 0.0
+    noise_rms_uv: float = 0.0
+    noise_bits: float = 0.0
+
+
+class GainCalibration(_FrozenModel):
+    """One PGA gain step of the calibration sweep results."""
+
+    gain: int
+    channels: tuple[ChannelCalibration, ...] = ()
 
 
 class CalibrationResults(_FrozenModel):
-    """Latest calibration results (in-RAM on the device; lost on reboot)."""
+    """``GET /api/calibration`` (pinned 2026-06-11): per-gain, per-channel."""
 
-    completed_at: str | None
-    channels: tuple[ChannelCalibration, ...]
+    valid: bool = False
+    timestamp: str = ""
+    gains: tuple[GainCalibration, ...] = ()
 
 
 class OtaStatus(_FrozenModel):
-    """Partition / image state from ``GET /api/ota/status``."""
+    """``GET /api/ota/status`` (pinned 2026-06-11)."""
 
-    running_partition: str
-    ota_state: str
-    app_version: str
+    current_version: str = ""
+    new_version: str = ""
+    state: str = "idle"
+    progress_percent: float = 0.0
+    error_message: str = ""
+    is_running: bool = False
+    running_partition: str = ""
 
 
-_ModelT = TypeVar("_ModelT", bound=_FrozenModel)
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 # ----------------------------------------------------------------------
@@ -350,24 +487,13 @@ class EchosApiClient:
         """Write the FULL acquisition config (read-modify-write; never partial)."""
         await self._post("/api/config", body=config.model_dump())
 
-    # -- network config ---------------------------------------------------
+    # -- network config (READ-ONLY: write schema not yet pinned) -----------
 
     async def get_network_config(self) -> EchosNetworkConfig:
+        # No setter on purpose: the firmware's POST schema for
+        # /api/network/config is unverified, and a guessed write can take
+        # a device off the network (decision log 2026-06-11).
         return self._validate(EchosNetworkConfig, await self._get("/api/network/config"))
-
-    async def set_network_config(
-        self, config: EchosNetworkConfig, wifi_password: str | None = None
-    ) -> None:
-        """Write the FULL network config; ``wifi_password`` only when changing it.
-
-        ``has_password`` is device-computed state and is stripped from the
-        body; the WiFi password is write-only and never stored on this
-        object nor logged.
-        """
-        body = config.model_dump(exclude={"has_password"})
-        if wifi_password is not None:
-            body["password"] = wifi_password
-        await self._post("/api/network/config", body=body)
 
     # -- seedlink server ---------------------------------------------------
 
@@ -407,8 +533,11 @@ class EchosApiClient:
         cancellation propagates from the surrounding task).
 
         Returns the terminal ``RestartStatus``; callers branch on
-        ``state == "failed"`` (a device-reported restart failure is domain
-        state, not a transport error, so it does not raise).
+        ``is_failed`` (a device-reported restart failure is domain
+        state, not a transport error, so it does not raise). A 200
+        (instead of 202) means the firmware applied the change without a
+        restart (e.g. auth_required hot-applies) — synthesised as an
+        immediate ``done``.
 
         Raises:
             EchosTimeout: the restart did not reach a terminal state
@@ -416,11 +545,17 @@ class EchosApiClient:
         """
         started = time.monotonic()
         _log.info("echos_seedlink_reload_started", host=self._host, port=config.port)
-        await self._post(
+        body = config.model_dump()
+        for key in _SEEDLINK_WRITE_EXCLUDE:
+            body.pop(key, None)
+        response = await self._post(
             "/api/seedlink/config",
-            body=config.model_dump(exclude={"has_password"}),
-            expect=(202,),
+            body=body,
+            expect=(200, 202),
         )
+        if response.status_code == 200:
+            _log.info("echos_seedlink_reload_no_restart", host=self._host)
+            return RestartStatus(state="done", applied=body)
         while True:
             elapsed = time.monotonic() - started
             if elapsed > timeout_s:
@@ -439,7 +574,7 @@ class EchosApiClient:
             else:
                 if on_progress is not None:
                     on_progress(status)
-                if status.state in ("done", "failed"):
+                if status.is_done or status.is_failed:
                     _log.info(
                         "echos_seedlink_reload_finished",
                         host=self._host,
@@ -453,7 +588,7 @@ class EchosApiClient:
     # -- calibration -------------------------------------------------------
 
     async def start_calibration(self) -> None:
-        """Kick off the full 3-phase calibration sweep (poll status after)."""
+        """Kick off the full PGA-gain-ladder calibration sweep (poll after)."""
         await self._post("/api/calibrate/full", expect=(200, 202))
 
     async def get_calibration_status(self) -> CalibrationStatus:

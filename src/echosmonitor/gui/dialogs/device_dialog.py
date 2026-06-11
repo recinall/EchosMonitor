@@ -1029,7 +1029,6 @@ class DeviceDialog(QDialog):
     _loadRequested = Signal(object)  # noqa: N815
     _acqApplyRequested = Signal(object, object)  # noqa: N815
     _slApplyRequested = Signal(object, object)  # noqa: N815
-    _netApplyRequested = Signal(object, object, str)  # noqa: N815
     _calStartRequested = Signal(object)  # noqa: N815
     _calPollRequested = Signal(object)  # noqa: N815
     _pwChangeRequested = Signal(object, str)  # noqa: N815
@@ -1123,9 +1122,7 @@ class DeviceDialog(QDialog):
             lambda cfg: self._emit_to_worker(self._slApplyRequested, cfg)
         )
         self._sl_tab.portChanged.connect(self._on_server_port_changed)
-        self._net_tab.applyRequested.connect(
-            lambda cfg, pw: self._emit_to_worker(self._netApplyRequested, cfg, pw)
-        )
+        # NetworkTab is read-only (write schema unpinned) — no apply wiring.
         self._maint_tab.calibrateRequested.connect(
             lambda: self._emit_to_worker(self._calStartRequested)
         )
@@ -1268,7 +1265,6 @@ class DeviceDialog(QDialog):
         self._loadRequested.connect(self._worker.requestLoad, type=queued)
         self._acqApplyRequested.connect(self._worker.applyAcquisition, type=queued)
         self._slApplyRequested.connect(self._worker.applySeedlink, type=queued)
-        self._netApplyRequested.connect(self._worker.applyNetwork, type=queued)
         self._calStartRequested.connect(self._worker.startCalibration, type=queued)
         self._calPollRequested.connect(self._worker.pollCalibration, type=queued)
         self._pwChangeRequested.connect(self._worker.changePassword, type=queued)
@@ -1350,8 +1346,6 @@ class DeviceDialog(QDialog):
     def _on_applied(self, op: str) -> None:
         if op == "acquisition":
             self._acq_tab.on_applied()
-        elif op == "network":
-            self._net_tab.on_applied()
         elif op == "calibrate_start":
             self._maint_tab.on_calibration_started()
         elif op == "reboot":
@@ -1379,7 +1373,6 @@ class DeviceDialog(QDialog):
         owner = {
             "acquisition": (self._acq_tab,),
             "seedlink": (self._sl_tab,),
-            "network": (self._net_tab,),
             "calibrate_start": (self._maint_tab,),
             "calibrate_poll": (self._maint_tab,),
             "password": (self._maint_tab,),

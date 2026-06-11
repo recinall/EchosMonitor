@@ -77,11 +77,15 @@ async def test_get_status_typed(client: EchosApiClient) -> None:
     status = await client.get_status()
     assert isinstance(status, EchosStatus)
     assert status.firmware_version == "1.4.2"
-    assert status.variant == "seedlink"
-    assert status.gnss.satellites == 9
-    assert status.gnss.pps_locked is True
-    assert status.wifi.mode == "sta"
-    assert status.wifi.rssi_dbm == -61
+    assert status.project_name == "Echos_lite_seedlink"
+    assert status.state == "idle"
+    assert status.gnss_time_valid is True
+    assert status.position is not None
+    assert status.position.satellites == 9
+    assert status.position.latitude == 45.4
+    assert status.pps is not None
+    assert status.pps.pll_locked is True
+    assert status.wifi_connected is True
 
 
 async def test_get_status_ignores_additive_fields(
@@ -95,14 +99,19 @@ async def test_get_status_ignores_additive_fields(
 async def test_get_acquisition_config_typed(client: EchosApiClient) -> None:
     config = await client.get_acquisition_config()
     assert isinstance(config, EchosAcquisitionConfig)
-    assert config.osr == 64
-    assert config.gains == (1, 1, 1, 8)
+    assert config.osr == 6
+    assert config.gains == (5, 5, 5, 5)
+    assert config.seed_metadata is not None
+    assert config.seed_metadata.station == "ECH01"
 
 
 async def test_get_seedlink_status_and_clients(client: EchosApiClient) -> None:
     status = await client.get_seedlink_status()
     assert isinstance(status, SeedlinkServerStatus)
-    assert status.client_count == 1
+    assert status.running is True
+    assert status.active_clients == 1
+    assert status.uptime_s == pytest.approx(3600.5)
+    assert status.ring_used_pct == pytest.approx(12.5)
     clients = await client.get_seedlink_clients()
     assert len(clients) == 1
     assert isinstance(clients[0], SeedlinkClientInfo)
@@ -114,8 +123,12 @@ async def test_get_seedlink_config_typed(client: EchosApiClient) -> None:
     config = await client.get_seedlink_config()
     assert isinstance(config, SeedlinkServerConfig)
     assert config.port == 18000
-    assert config.record_size == 512
-    assert config.has_password is False
+    assert config.ring_buffer_kb == 896
+    assert config.record_size_bytes == 512
+    assert config.auth_required is False
+    assert config.max_clients == 5  # compile-time, read-only
+    assert config.stationxml is not None
+    assert config.stationxml.adc_vref == pytest.approx(1.2)
 
 
 async def test_get_stationxml_verbatim(fw: FakeEchosFirmware, client: EchosApiClient) -> None:
@@ -127,7 +140,21 @@ async def test_get_stationxml_verbatim(fw: FakeEchosFirmware, client: EchosApiCl
 async def test_get_ota_status_typed(client: EchosApiClient) -> None:
     ota = await client.get_ota_status()
     assert isinstance(ota, OtaStatus)
-    assert ota.running_partition == "ota_0"
+    assert ota.running_partition == "ota_1"
+    assert ota.current_version == "1.4.2"
+    assert ota.state == "idle"
+
+
+async def test_get_network_config_is_read_only_and_typed(client: EchosApiClient) -> None:
+    config = await client.get_network_config()
+    assert isinstance(config, EchosNetworkConfig)
+    assert config.known_networks[0].ssid == "field-net"
+    assert config.known_networks[0].has_password is True
+    assert config.ap_ssid == "ECHOS_AP"
+    assert config.mdns_hostname == "echos"
+    # The write schema is unpinned: the client deliberately has no setter
+    # (a guessed write can take a device off the network).
+    assert not hasattr(client, "set_network_config")
 
 
 # ----------------------------------------------------------------------
@@ -137,25 +164,15 @@ async def test_get_ota_status_typed(client: EchosApiClient) -> None:
 
 async def test_acquisition_roundtrip(fw: FakeEchosFirmware, client: EchosApiClient) -> None:
     config = await client.get_acquisition_config()
-    updated = config.model_copy(update={"osr": 128})
+    updated = config.model_copy(update={"osr": 7, "gain_ch0": 4})
     await client.set_acquisition_config(updated)
-    assert fw.acquisition == {"osr": 128, "gains": [1, 1, 1, 8]}
-    assert (await client.get_acquisition_config()).osr == 128
-
-
-async def test_network_write_strips_has_password(
-    fw: FakeEchosFirmware, client: EchosApiClient
-) -> None:
-    config = await client.get_network_config()
-    assert isinstance(config, EchosNetworkConfig)
-    await client.set_network_config(
-        config.model_copy(update={"ssid": "new-net"}), wifi_password="wifi-secret-1"
-    )
-    body = fw.last_post_body["/api/network/config"]
-    assert "has_password" not in body
-    assert body["password"] == "wifi-secret-1"
-    assert fw.network["ssid"] == "new-net"
-    assert fw.network["has_password"] is True
+    assert fw.acquisition["osr"] == 7
+    assert fw.acquisition["gain_ch0"] == 4
+    # extra="allow" round-trip: fields this client does not model survive
+    # the full-body write instead of being silently dropped.
+    assert fw.acquisition["trigger_mode"] == "pin"
+    assert fw.acquisition["seed_metadata"]["station"] == "ECH01"
+    assert (await client.get_acquisition_config()).osr == 7
 
 
 async def test_write_with_wrong_password_raises_auth_failed(fw: FakeEchosFirmware) -> None:
@@ -177,7 +194,7 @@ async def test_write_without_password_fails_locally(fw: FakeEchosFirmware) -> No
 
 async def test_reads_stay_public_without_password(fw: FakeEchosFirmware) -> None:
     anon = _make_client(fw, None)
-    assert (await anon.get_status()).variant == "seedlink"
+    assert (await anon.get_status()).project_name == "Echos_lite_seedlink"
     await anon.aclose()
 
 
@@ -250,7 +267,7 @@ async def test_missing_retry_after_defaults(fw: FakeEchosFirmware, client: Echos
 async def test_get_retries_then_succeeds(fw: FakeEchosFirmware, client: EchosApiClient) -> None:
     fw.flaky["/api/status"] = 2
     status = await client.get_status()
-    assert status.variant == "seedlink"
+    assert status.project_name == "Echos_lite_seedlink"
     assert len(fw.requests) == 3  # 1 attempt + 2 retries
 
 
@@ -316,16 +333,20 @@ async def test_hot_reload_seven_steps(fw: FakeEchosFirmware, client: EchosApiCli
         poll_interval_s=0.0,
         timeout_s=5.0,
     )
-    assert final.state == "done"
+    assert final.is_done
     assert [s.step for s in seen] == [1, 2, 3, 4, 5, 6, 7]
     assert all(s.state == "in_progress" for s in seen[:-1])
-    assert seen[-1].state == "done"
+    assert seen[-1].is_done
+    assert seen[-1].applied  # the device echoes what the restart installed
     # The new config is live on the device after the restart…
     assert fw.seedlink["port"] == 18001
-    # …and the POST body was full (read-modify-write) minus read-only state.
+    # …and the POST body was full (read-modify-write: unmodelled fields
+    # round-trip) minus the read-only / informational keys.
     body = fw.last_post_body["/api/seedlink/config"]
-    assert "has_password" not in body
-    assert body["station"] == "ECH01"
+    for read_only in ("source", "modifiable", "note", "max_clients", "keep_queue_depth"):
+        assert read_only not in body
+    assert body["ring_buffer_kb"] == 896
+    assert body["stationxml"]["adc_vref"] == pytest.approx(1.2)
 
 
 async def test_hot_reload_partial_body_rejected(fw: FakeEchosFirmware) -> None:
@@ -351,7 +372,7 @@ async def test_hot_reload_failure_is_returned_not_raised(
     final = await client.apply_seedlink_config(
         config, poll_interval_s=0.0, timeout_s=5.0
     )
-    assert final.state == "failed"
+    assert final.is_failed
     assert final.error == "simulated restart failure"
     # A failed restart must NOT apply the pending config.
     assert fw.seedlink["port"] == 18000
@@ -365,12 +386,12 @@ async def test_hot_reload_tolerates_transient_unreachable(
     fw.restart_unreachable_polls = 4
     config = await client.get_seedlink_config()
     final = await client.apply_seedlink_config(
-        config.model_copy(update={"ring_records": 4096}),
+        config.model_copy(update={"ring_buffer_kb": 1024}),
         poll_interval_s=0.0,
         timeout_s=5.0,
     )
-    assert final.state == "done"
-    assert fw.seedlink["ring_records"] == 4096
+    assert final.is_done
+    assert fw.seedlink["ring_buffer_kb"] == 1024
 
 
 async def test_hot_reload_poll_deadline_raises_timeout(
@@ -388,20 +409,24 @@ async def test_hot_reload_poll_deadline_raises_timeout(
 
 
 async def test_calibration_flow(fw: FakeEchosFirmware, client: EchosApiClient) -> None:
-    assert (await client.get_calibration_status()).state == "idle"
+    assert (await client.get_calibration_status()).phase == "idle"
     await client.start_calibration()
     seen: list[CalibrationStatus] = []
-    for _ in range(10):
+    for _ in range(12):
         status = await client.get_calibration_status()
         seen.append(status)
-        if status.state == "done":
+        if status.phase == "done":
             break
-    assert [s.phase for s in seen] == [1, 2, 3, 3]
-    assert seen[-1].state == "done"
+    # The sweep walks the 8-step PGA gain ladder, then reports done.
+    assert [s.current_gain for s in seen] == [1, 2, 3, 4, 5, 6, 7, 8, 8]
+    assert seen[-1].phase == "done"
+    assert seen[-1].progress_percent == pytest.approx(100.0)
     results = await client.get_calibration_results()
-    assert results.completed_at is not None
-    assert [c.channel for c in results.channels] == ["HHZ", "HHN", "HHE"]
-    assert results.channels[0].gain == pytest.approx(1.002)
+    assert results.valid is True
+    assert results.timestamp
+    assert [g.gain for g in results.gains] == [1, 2]
+    assert len(results.gains[0].channels) == 4
+    assert results.gains[0].channels[0].noise_bits == pytest.approx(17.05)
 
 
 # ----------------------------------------------------------------------

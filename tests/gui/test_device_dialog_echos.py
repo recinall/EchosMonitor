@@ -163,10 +163,11 @@ def test_server_tabs_track_echos_enablement(qtbot: Any, dialog: Any) -> None:
 
 def test_load_populates_all_tabs_and_channels(qtbot: Any, dialog: Any) -> None:
     _load(qtbot, dialog)
-    assert dialog._acq_tab._osr_combo.currentData() == 64
-    assert [s.value() for s in dialog._acq_tab._gain_spins] == [1, 1, 1, 8]
+    assert dialog._acq_tab._osr_spin.value() == 6
+    assert [s.value() for s in dialog._acq_tab._gain_spins] == [5, 5, 5, 5]
     assert dialog._sl_tab._port_spin.value() == 18000
-    assert dialog._net_tab._ssid_edit.text() == "field-net"
+    assert dialog._sl_tab._ring_spin.value() == 896
+    assert "field-net" in dialog._net_tab._networks_label.text()
     assert dialog._maint_tab._ota_version_label.text() == "1.4.2"
     assert dialog._form._use_channels_button.isEnabled()
     assert "stored" in dialog._form._credential_status_label.text()
@@ -179,11 +180,13 @@ def test_acquisition_roundtrip_acceptance(
     _load(qtbot, dialog)
     tab = dialog._acq_tab
     tab.confirm = lambda text: True  # the confirmation gate, auto-accepted
-    tab._osr_combo.setCurrentIndex(tab._osr_combo.findData(128))
+    tab._osr_spin.setValue(7)
     tab._gain_spins[0].setValue(4)
     tab._apply_button.click()
-    qtbot.waitUntil(lambda: fw.acquisition.get("osr") == 128, timeout=_DEADLINE_MS)
-    assert fw.acquisition["gains"][0] == 4
+    qtbot.waitUntil(lambda: fw.acquisition.get("osr") == 7, timeout=_DEADLINE_MS)
+    assert fw.acquisition["gain_ch0"] == 4
+    # Unmodelled firmware fields round-trip through the full-body write.
+    assert fw.acquisition["trigger_mode"] == "pin"
     qtbot.waitUntil(
         lambda: "applied" in tab._status_label.text().lower(), timeout=_DEADLINE_MS
     )
@@ -197,10 +200,10 @@ def test_seedlink_roundtrip_with_seven_step_restart_acceptance(
     tab = dialog._sl_tab
     tab.confirm = lambda text: True
     tab._port_spin.setValue(18001)
-    tab._ring_spin.setValue(4096)
+    tab._ring_spin.setValue(1024)
     tab._apply_button.click()
     qtbot.waitUntil(lambda: fw.seedlink.get("port") == 18001, timeout=_DEADLINE_MS)
-    assert fw.seedlink["ring_records"] == 4096
+    assert fw.seedlink["ring_buffer_kb"] == 1024
     assert fw.restart_state == "done"
     qtbot.waitUntil(
         lambda: "reloaded" in tab._status_label.text().lower(), timeout=_DEADLINE_MS
@@ -248,26 +251,21 @@ def test_lockout_disables_writes_with_countdown_banner(
     # and the client never hammers a locked device).
     assert not dialog._acq_tab._apply_button.isEnabled()
     assert not dialog._sl_tab._apply_button.isEnabled()
-    assert not dialog._net_tab._apply_button.isEnabled()
+    # NetworkTab has no mutating control at all (read-only by design).
     assert not dialog._maint_tab._reboot_button.isEnabled()
 
 
-def test_network_apply_passes_wifi_password_write_only(
-    qtbot: Any, dialog: Any, fw: FakeEchosFirmware
-) -> None:
+def test_network_tab_is_read_only(qtbot: Any, dialog: Any, fw: FakeEchosFirmware) -> None:
+    # The firmware's network POST schema is unpinned — the tab displays
+    # the credential-safe read and offers NO mutating control (decision
+    # log 2026-06-11). Zero POSTs to the endpoint, ever.
     _load(qtbot, dialog)
     tab = dialog._net_tab
-    tab.confirm = lambda text: True
-    tab._ssid_edit.setText("new-net")
-    tab._wifi_password_edit.setText("wifi-secret-9")
-    tab._apply_button.click()
-    qtbot.waitUntil(lambda: fw.network.get("ssid") == "new-net", timeout=_DEADLINE_MS)
-    body = fw.last_post_body["/api/network/config"]
-    assert body["password"] == "wifi-secret-9"
-    assert "has_password" not in body
-    qtbot.waitUntil(
-        lambda: tab._wifi_password_edit.text() == "", timeout=_DEADLINE_MS
-    )  # cleared after apply
+    assert not hasattr(tab, "_apply_button")
+    assert "ECHOS_AP" in tab._ap_label.text()
+    assert "echos.local" in tab._hostname_label.text()
+    assert "pool.ntp.org" in tab._ntp_label.text()
+    assert fw.post_count("/api/network/config") == 0
 
 
 def test_store_credential_through_dialog(qtbot: Any, dialog: Any) -> None:
@@ -295,29 +293,25 @@ def test_dialog_done_tears_worker_down(qtbot: Any, dialog: Any) -> None:
 # ----------------------------------------------------------------------
 
 
-def _cal(state: str, phase: int = 1) -> CalibrationStatus:
+def _cal(phase: str, current_gain: int = 1) -> CalibrationStatus:
     return CalibrationStatus(
-        state=state, phase=phase, total_phases=3, progress_pct=phase / 3 * 100.0
+        phase=phase,
+        current_gain=current_gain,
+        total_gains=8,
+        progress_percent=current_gain / 8 * 100.0,
     )
 
 
 def _device_state() -> EchosDeviceState:
     return EchosDeviceState(
         target=EchosPollTarget(name=_DEVICE, host="echos-test.local"),
-        acquisition=EchosAcquisitionConfig(osr=64, gains=(1, 1, 1)),
-        seedlink=SeedlinkServerConfig(
-            port=18000,
-            ring_records=2048,
-            record_size=512,
-            auth_enabled=False,
-            emit_hn1=False,
-            network="XX",
-            station="ECH01",
-            stationxml_profile="default",
+        acquisition=EchosAcquisitionConfig(
+            osr=6, gain_ch0=5, gain_ch1=5, gain_ch2=5, gain_ch3=5
         ),
-        network=EchosNetworkConfig(mode="sta", ssid="field-net", hostname="echos"),
-        ota=OtaStatus(running_partition="ota_0", ota_state="valid", app_version="1.4.2"),
-        calibration=_cal("idle", phase=0),
+        seedlink=SeedlinkServerConfig(port=18000, ring_buffer_kb=896),
+        network=EchosNetworkConfig(ap_ssid="ECHOS_AP", mdns_hostname="echos"),
+        ota=OtaStatus(current_version="1.4.2", running_partition="ota_1"),
+        calibration=_cal("idle", current_gain=0),
         channels=(),
         has_credentials=True,
     )
@@ -332,7 +326,7 @@ def test_late_calibration_status_after_done_cannot_resurrect_worker(
     _load(qtbot, dialog)
     dialog.done(0)
     assert dialog._worker is None
-    dialog._maint_tab.on_calibration_status(_cal("running"))  # late queued delivery
+    dialog._maint_tab.on_calibration_status(_cal("sweep"))  # late queued delivery
     assert not dialog._maint_tab._cal_poll_timer.isActive()
     qtbot.wait(1100)  # one poll-tick interval, had the timer restarted
     assert dialog._worker is None
@@ -343,7 +337,7 @@ def test_calibration_poll_failure_stops_timer(qtbot: Any, dialog: Any) -> None:
     # Audit F2: a dead device must not be polled at 1 Hz forever.
     _load(qtbot, dialog)
     tab = dialog._maint_tab
-    tab.on_calibration_status(_cal("running"))
+    tab.on_calibration_status(_cal("sweep"))
     assert tab._cal_poll_timer.isActive()
     tab.on_failed("calibrate_poll", "unreachable", "device gone")
     assert not tab._cal_poll_timer.isActive()
@@ -359,7 +353,7 @@ def test_calibration_poll_is_ping_pong_gated(qtbot: Any) -> None:
     tab._on_poll_tick()
     tab._on_poll_tick()  # gated: previous poll still outstanding
     assert len(emitted) == 1
-    tab.on_calibration_status(_cal("running"))  # response clears the gate
+    tab.on_calibration_status(_cal("sweep"))  # response clears the gate
     tab._on_poll_tick()
     assert len(emitted) == 2
 

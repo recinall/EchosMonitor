@@ -154,10 +154,12 @@ def _format_uptime(seconds: float) -> str:
 def _format_echos_text(snapshot: EchosDeviceSnapshot) -> str:
     """Compose the compact Echos column text for one device.
 
-    ``cal <state>`` appears only while a calibration is running or after
-    it failed — the attention states. ``idle`` is steady-state noise and
-    ``done`` persists in device RAM until reboot, so it would sit in the
-    column for days; both are visible in the tooltip instead.
+    ``cal <state>`` appears only while a calibration is in flight or
+    after a failure — the attention states. ``idle`` is steady-state
+    noise and ``done`` persists in device RAM until reboot, so it would
+    sit in the column for days; both are visible in the tooltip instead.
+    (The real firmware's in-sweep vocabulary is not pinned yet, so the
+    filter is an exclusion list, not an allowlist.)
     """
     gnss = f"GNSS {snapshot.gnss_satellites}sat" if snapshot.gnss_fix else "GNSS no fix"
     parts = [
@@ -167,7 +169,7 @@ def _format_echos_text(snapshot: EchosDeviceSnapshot) -> str:
         f"ring {snapshot.ring_used_pct:.0f}%",
         gnss,
     ]
-    if snapshot.calibration_state in ("running", "failed"):
+    if snapshot.calibration_state not in ("idle", "done"):
         parts.append(f"cal {snapshot.calibration_state}")
     return " · ".join(parts)
 

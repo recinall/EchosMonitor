@@ -243,12 +243,26 @@ acquisition + seedlink config works, including the simulated 7-step restart.
 **Met 2026-06-11** (see M1-D notes). M1 CLOSURE additionally gates on the
 real-device wire-contract smoke check below.
 
-- [ ] **M1 closure gate — real-device smoke check** (re-scoped from the
-      M1-C carry-forward; decision log 2026-06-11): the JSON field names
-      are pinned only by the test fake. Before M1 is declared closed (and
-      before any feature is trusted against real hardware), run a
-      read-only smoke against echos.local/pihw.local — user-mediated, the
-      devices must not be probed without the user (lockout risk).
+- [x] **M1 closure gate — real-device smoke check.** Done 2026-06-11
+      (user-authorized, read-only public GETs, no lockout exposure):
+      both echos.local and pihw.local (fw 1aa72cbe, project
+      Echos_lite_seedlink) answered identically; the fake-derived
+      contract was WRONG on 8/10 endpoints and was fully reconciled —
+      models, fake, status poller, dialog tabs and tests now mirror the
+      real wire shapes; final typed smoke = 11/11 endpoints validating
+      on BOTH devices. **M1 CLOSED.** Notable real-contract facts:
+      `/api/status` carries position+PPS (rule 16/M4 can use it) but no
+      uptime (SeedLink `uptime_ms` is the proxy); acquisition gains are
+      flat `gain_ch0..3` and OSR is a register index; the ring is sized
+      in kB; calibration is an 8-step PGA gain ladder, not 3 phases.
+      Still UNPINNED (write-gated or unobserved — revisit at first real
+      write / M6): restart-status in-progress shape (idle =
+      `{"state":"idle","applied":{}}` is pinned; client terminal
+      heuristic is provisional), calibration sweep `phase` vocabulary,
+      seedlink client entry shape, network-config POST schema (Network
+      tab is READ-ONLY until pinned — decision log), and the
+      `/api/auth/password` + reboot + disconnect + calibrate/full write
+      replies (skill-documented, not yet exercised on hardware).
 
 ## M2 — Session control (no autostart)
 
@@ -413,6 +427,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M1-D: `emit_hn1` lives on the **SeedLink tab**, not Acquisition as sketched | It is a `/api/seedlink/config` field; tabs group by write endpoint so one Apply = exactly one confirmed read-modify-write (and only the SeedLink Apply triggers the hot-reload restart). |
 | 2026-06-11 | M1-D accepted **against the fake firmware**; the real-device wire-contract check is re-scoped to an explicit **M1 closure gate** | The milestone's acceptance line is literally "against a fake firmware server"; the field-name pin against echos.local/pihw.local needs the user (lockout risk — never probe unsolicited) and now has its own unchecked item under M1. |
 | 2026-06-11 | M1-D: pytest-qt's `waitSignal` cleanup benignly emits "Timers cannot be stopped from another thread" on cross-thread signals | Do NOT chase this warning text in tests/logs; the real hazard (worker QTimer active at GC) is pinned by `test_shutdown_stops_worker_timer_via_release_barrier` instead. |
+| 2026-06-11 | M1 closure: **Network tab is read-only**; the client has NO `set_network_config` | The firmware's POST schema for `/api/network/config` is unverified and the real read shape (known_networks list + AP + NTP) differs wildly from the skill sketch; a guessed write can take a device off the LAN with button-B AP mode as the only recovery. Pin the schema from firmware sources before M6's wizard needs it. |
+| 2026-06-11 | M1 closure: POSTable models use `extra="allow"` and round-trip unmodelled fields; read models stay `extra="ignore"` | The real `/api/config` carries ~10 fields beyond OSR/gains (trigger_mode, schedule, seed_metadata…); a full-body read-modify-write that dropped them would silently reset device behaviour. |
+| 2026-06-11 | M1 closure: `RestartStatus` terminal heuristic is `state=="done"` OR (`"idle"` + non-empty `applied`); POST 200 (vs 202) = applied-without-restart | The real idle shape is `{"state":"idle","applied":{}}` and the in-progress shape is write-gated; the device note says auth_required hot-applies without restart. Provisional until the first real authenticated apply is observed. |
 
 ## Open questions (resolve before the milestone that needs them)
 

@@ -172,13 +172,8 @@ class EchosDeviceWorker(QObject):
         if final is not None:
             self.seedlinkApplied.emit(final)
 
-    @Slot(object, object, str)
-    def applyNetwork(self, target: object, config: object, wifi_password: str) -> None:  # noqa: N802
-        if not isinstance(target, EchosPollTarget) or not isinstance(config, EchosNetworkConfig):
-            return
-        result = self._run("network", self._apply_network(target, config, wifi_password or None))
-        if result is not None:
-            self.applied.emit("network")
+    # NOTE: no applyNetwork — the firmware's network POST schema is not
+    # pinned, so the client has no setter (decision log 2026-06-11).
 
     @Slot(object)
     def startCalibration(self, target: object) -> None:  # noqa: N802
@@ -330,13 +325,6 @@ class EchosDeviceWorker(QObject):
                 on_progress=self.restartProgress.emit,
                 poll_interval_s=self._restart_poll_interval_s,
             )
-
-    async def _apply_network(
-        self, target: EchosPollTarget, config: EchosNetworkConfig, wifi_password: str | None
-    ) -> bool:
-        async with self._factory(target, self._password_for(target)) as client:
-            await client.set_network_config(config, wifi_password)
-        return True
 
     async def _start_calibration(self, target: EchosPollTarget) -> bool:
         async with self._factory(target, self._password_for(target)) as client:

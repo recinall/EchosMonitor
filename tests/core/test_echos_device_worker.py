@@ -37,7 +37,6 @@ class _Trigger(QObject):
     loadRequested = Signal(object)  # noqa: N815
     acqRequested = Signal(object, object)  # noqa: N815
     slRequested = Signal(object, object)  # noqa: N815
-    netRequested = Signal(object, object, str)  # noqa: N815
     pwRequested = Signal(object, str)  # noqa: N815
     credRequested = Signal(str, str)  # noqa: N815
     rebootRequested = Signal(object)  # noqa: N815
@@ -90,7 +89,6 @@ def _spawn(
     trigger.loadRequested.connect(worker.requestLoad, type=queued)
     trigger.acqRequested.connect(worker.applyAcquisition, type=queued)
     trigger.slRequested.connect(worker.applySeedlink, type=queued)
-    trigger.netRequested.connect(worker.applyNetwork, type=queued)
     trigger.pwRequested.connect(worker.changePassword, type=queued)
     trigger.credRequested.connect(worker.storeCredential, type=queued)
     trigger.rebootRequested.connect(worker.requestReboot, type=queued)
@@ -114,11 +112,11 @@ def test_load_aggregates_device_state(
             trigger.loadRequested.emit(_target())
         (state,) = blocker.args
         assert isinstance(state, EchosDeviceState)
-        assert state.acquisition.osr == 64
+        assert state.acquisition.osr == 6
         assert state.seedlink.port == 18000
-        assert state.network.ssid == "field-net"
-        assert state.ota.app_version == "1.4.2"
-        assert state.calibration.state == "idle"
+        assert state.network.known_networks[0].ssid == "field-net"
+        assert state.ota.current_version == "1.4.2"
+        assert state.calibration.phase == "idle"
         assert state.has_credentials is True
         # Selector derivation source: NSLCs parsed from StationXML.
         assert state.channels == ("XX.ECH01..HHZ", "XX.ECH01..HHN", "XX.ECH01..HHE")
@@ -145,11 +143,12 @@ def test_apply_acquisition_roundtrip(
 ) -> None:
     worker, thread, trigger = _spawn(qtbot, credentials, _factory_for(fw))
     try:
-        config = EchosAcquisitionConfig(osr=128, gains=(2, 2, 2, 8))
+        config = EchosAcquisitionConfig(osr=7, gain_ch0=2, gain_ch1=2, gain_ch2=2, gain_ch3=8)
         with qtbot.waitSignal(worker.applied, timeout=_DEADLINE_MS) as blocker:
             trigger.acqRequested.emit(_target(), config)
         assert blocker.args == ["acquisition"]
-        assert fw.acquisition == {"osr": 128, "gains": [2, 2, 2, 8]}
+        assert fw.acquisition["osr"] == 7
+        assert fw.acquisition["gain_ch3"] == 8
     finally:
         _shutdown(worker, thread)
 
@@ -161,22 +160,13 @@ def test_apply_seedlink_streams_restart_progress(
     progress: list[object] = []
     worker.restartProgress.connect(progress.append)
     try:
-        config = SeedlinkServerConfig(
-            port=18001,
-            ring_records=4096,
-            record_size=512,
-            auth_enabled=False,
-            emit_hn1=False,
-            network="XX",
-            station="ECH01",
-            stationxml_profile="default",
-        )
+        config = SeedlinkServerConfig(port=18001, ring_buffer_kb=1024)
         with qtbot.waitSignal(worker.seedlinkApplied, timeout=_DEADLINE_MS) as blocker:
             trigger.slRequested.emit(_target(), config)
         (final,) = blocker.args
-        assert final.state == "done"
+        assert final.is_done
         assert fw.seedlink["port"] == 18001
-        assert fw.seedlink["ring_records"] == 4096
+        assert fw.seedlink["ring_buffer_kb"] == 1024
         qtbot.waitUntil(lambda: len(progress) >= 7, timeout=_DEADLINE_MS)
         assert [s.step for s in progress] == [1, 2, 3, 4, 5, 6, 7]
     finally:

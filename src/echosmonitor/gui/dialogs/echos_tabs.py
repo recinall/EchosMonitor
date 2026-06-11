@@ -42,7 +42,6 @@ from PySide6.QtWidgets import (
 from echosmonitor.core.echos_api import (
     CalibrationStatus,
     EchosAcquisitionConfig,
-    EchosNetworkConfig,
     RestartStatus,
     SeedlinkServerConfig,
 )
@@ -50,18 +49,19 @@ from echosmonitor.core.echos_device_worker import EchosDeviceState
 
 _log = structlog.get_logger(__name__)
 
-# Candidate OSR values offered in the combo. The loaded device value is
-# inserted if the firmware reports something outside this list, so the
-# UI never silently rewrites an unknown-but-valid setting.
-_OSR_CHOICES = (16, 32, 64, 128, 256)
+# OSR is the ADC oversampling REGISTER setting on this firmware (small
+# integer — 6 observed on real devices), not the literal ratio.
+_OSR_MIN = 0
+_OSR_MAX = 15
 
-# Per-channel PGA gain bounds (ADC PGA steps; firmware validates the
-# exact set — the spin keeps obviously-wrong values out).
-_GAIN_MIN = 1
-_GAIN_MAX = 128
+# Per-channel PGA gain register bounds (firmware validates the exact
+# set — the spin keeps obviously-wrong values out; 5 observed).
+_GAIN_MIN = 0
+_GAIN_MAX = 15
 
-_RING_MIN = 64
-_RING_MAX = 1_048_576
+# Ring buffer is sized in KB on the wire (896 kB observed).
+_RING_KB_MIN = 64
+_RING_KB_MAX = 8192
 
 # Calibration progress poll cadence while a sweep is running. GUI-thread
 # QTimer; each tick emits one queued request to the worker (never blocks).
@@ -168,16 +168,26 @@ class AcquisitionTab(_EchosTabBase):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self._osr_combo = QComboBox(self)
-        for osr in _OSR_CHOICES:
-            self._osr_combo.addItem(str(osr), userData=osr)
-        form.addRow("Oversampling (OSR):", self._osr_combo)
+        self._osr_spin = QSpinBox(self)
+        self._osr_spin.setRange(_OSR_MIN, _OSR_MAX)
+        self._osr_spin.setToolTip(
+            "ADC oversampling register setting (not the literal ratio); "
+            "the firmware validates the value."
+        )
+        form.addRow("Oversampling (OSR):", self._osr_spin)
 
-        self._gains_box = QWidget(self)
-        self._gains_layout = QHBoxLayout(self._gains_box)
-        self._gains_layout.setContentsMargins(0, 0, 0, 0)
+        gains_box = QWidget(self)
+        gains_layout = QHBoxLayout(gains_box)
+        gains_layout.setContentsMargins(0, 0, 0, 0)
+        # Four fixed channels on this firmware: gain_ch0..gain_ch3.
         self._gain_spins: list[QSpinBox] = []
-        form.addRow("Channel gains:", self._gains_box)
+        for index in range(4):
+            spin = QSpinBox(gains_box)
+            spin.setRange(_GAIN_MIN, _GAIN_MAX)
+            spin.setPrefix(f"ch{index}: ")
+            gains_layout.addWidget(spin)
+            self._gain_spins.append(spin)
+        form.addRow("Channel gains (PGA):", gains_box)
         layout.addLayout(form)
 
         self._apply_button = QPushButton("Apply acquisition config", self)
@@ -190,20 +200,9 @@ class AcquisitionTab(_EchosTabBase):
 
     def _populate(self, state: EchosDeviceState) -> None:
         config = state.acquisition
-        if self._osr_combo.findData(config.osr) < 0:
-            self._osr_combo.addItem(str(config.osr), userData=config.osr)
-        self._osr_combo.setCurrentIndex(self._osr_combo.findData(config.osr))
-        # Rebuild gain spins to match the channel count (3 or 4).
-        for spin in self._gain_spins:
-            spin.deleteLater()
-        self._gain_spins = []
-        for index, gain in enumerate(config.gains):
-            spin = QSpinBox(self._gains_box)
-            spin.setRange(_GAIN_MIN, _GAIN_MAX)
+        self._osr_spin.setValue(int(config.osr))
+        for spin, gain in zip(self._gain_spins, config.gains, strict=True):
             spin.setValue(int(gain))
-            spin.setPrefix(f"ch{index}: ")
-            self._gains_layout.addWidget(spin)
-            self._gain_spins.append(spin)
 
     def _refresh_enabled(self) -> None:
         self._apply_button.setEnabled(self._ready)
@@ -213,8 +212,11 @@ class AcquisitionTab(_EchosTabBase):
             return None
         return self._loaded_state.acquisition.model_copy(
             update={
-                "osr": int(self._osr_combo.currentData()),
-                "gains": tuple(int(s.value()) for s in self._gain_spins),
+                "osr": int(self._osr_spin.value()),
+                "gain_ch0": int(self._gain_spins[0].value()),
+                "gain_ch1": int(self._gain_spins[1].value()),
+                "gain_ch2": int(self._gain_spins[2].value()),
+                "gain_ch3": int(self._gain_spins[3].value()),
             }
         )
 
@@ -257,24 +259,21 @@ class SeedlinkTab(_EchosTabBase):
         self._port_spin.setRange(1, 65535)
         form.addRow("SeedLink port:", self._port_spin)
         self._ring_spin = QSpinBox(self)
-        self._ring_spin.setRange(_RING_MIN, _RING_MAX)
-        form.addRow("Ring size (records):", self._ring_spin)
+        self._ring_spin.setRange(_RING_KB_MIN, _RING_KB_MAX)
+        self._ring_spin.setSuffix(" kB")
+        form.addRow("Ring buffer:", self._ring_spin)
         self._record_combo = QComboBox(self)
         for size in (512, 4096):
             self._record_combo.addItem(str(size), userData=size)
-        form.addRow("Record size:", self._record_combo)
+        form.addRow("Record size (bytes):", self._record_combo)
         self._auth_check = QCheckBox("Require USER/PASSWORD on the SeedLink TCP port", self)
         form.addRow("Auth gate:", self._auth_check)
         self._hn1_check = QCheckBox("Emit the optional HN1 channel", self)
         form.addRow("HN1:", self._hn1_check)
-        self._network_edit = QLineEdit(self)
-        self._network_edit.setMaxLength(2)
-        form.addRow("Network code:", self._network_edit)
-        self._station_edit = QLineEdit(self)
-        self._station_edit.setMaxLength(5)
-        form.addRow("Station code:", self._station_edit)
-        self._profile_edit = QLineEdit(self)
-        form.addRow("StationXML profile:", self._profile_edit)
+        # Compile-time limits, shown read-only (device's own note: edit
+        # Kconfig + recompile to change).
+        self._limits_label = QLabel("—", self)
+        form.addRow("Limits (compile-time):", self._limits_label)
         layout.addLayout(form)
 
         self._apply_button = QPushButton("Apply + hot-reload server", self)
@@ -299,13 +298,13 @@ class SeedlinkTab(_EchosTabBase):
     def _populate(self, state: EchosDeviceState) -> None:
         config = state.seedlink
         self._port_spin.setValue(config.port)
-        self._ring_spin.setValue(config.ring_records)
-        self._record_combo.setCurrentIndex(self._record_combo.findData(config.record_size))
-        self._auth_check.setChecked(config.auth_enabled)
+        self._ring_spin.setValue(config.ring_buffer_kb)
+        self._record_combo.setCurrentIndex(self._record_combo.findData(config.record_size_bytes))
+        self._auth_check.setChecked(config.auth_required)
         self._hn1_check.setChecked(config.emit_hn1)
-        self._network_edit.setText(config.network)
-        self._station_edit.setText(config.station)
-        self._profile_edit.setText(config.stationxml_profile)
+        self._limits_label.setText(
+            f"max {config.max_clients} clients · keep-queue depth {config.keep_queue_depth}"
+        )
 
     def _refresh_enabled(self) -> None:
         self._apply_button.setEnabled(self._ready and self._pending_apply is None)
@@ -328,13 +327,10 @@ class SeedlinkTab(_EchosTabBase):
         return self._loaded_state.seedlink.model_copy(
             update={
                 "port": int(self._port_spin.value()),
-                "ring_records": int(self._ring_spin.value()),
-                "record_size": int(self._record_combo.currentData()),
-                "auth_enabled": self._auth_check.isChecked(),
+                "ring_buffer_kb": int(self._ring_spin.value()),
+                "record_size_bytes": int(self._record_combo.currentData()),
+                "auth_required": self._auth_check.isChecked(),
                 "emit_hn1": self._hn1_check.isChecked(),
-                "network": self._network_edit.text().strip(),
-                "station": self._station_edit.text().strip(),
-                "stationxml_profile": self._profile_edit.text().strip(),
             }
         )
 
@@ -378,7 +374,7 @@ class SeedlinkTab(_EchosTabBase):
         # during the multi-second restart.
         applied = self._pending_apply
         self._pending_apply = None
-        if final.state == "done":
+        if final.is_done:
             self._set_status("SeedLink server reloaded.", style=_STATUS_OK_STYLE)
             loaded = self._loaded_state
             if applied is not None and loaded is not None:
@@ -399,43 +395,50 @@ class SeedlinkTab(_EchosTabBase):
                 )
         else:
             self._set_status(
-                f"Restart FAILED at step {final.step}/{final.total_steps}: "
+                f"Restart FAILED ({final.state}, step {final.step}/{final.total_steps}): "
                 f"{final.error or 'unknown error'} — the device kept its old config.",
                 style=_STATUS_ERR_STYLE,
             )
-        self._restart_step_label.setVisible(final.state != "done")
-        self._restart_bar.setVisible(final.state != "done")
+        self._restart_step_label.setVisible(not final.is_done)
+        self._restart_bar.setVisible(not final.is_done)
         self._refresh_enabled()
 
 
 class NetworkTab(_EchosTabBase):
-    """WiFi / network config (credential-safe read; write-only password)."""
+    """WiFi / network state — READ-ONLY in this version.
 
-    applyRequested = Signal(object, str)  # noqa: N815  # EchosNetworkConfig, wifi password ("" = keep)
+    The firmware's POST schema for ``/api/network/config`` is not yet
+    pinned, and a guessed write can take a device off the network with
+    AP-mode-button recovery as the only way back (decision log
+    2026-06-11). Until the schema is verified against firmware sources,
+    this tab displays the credential-safe read and offers no Apply.
+    """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        self._mode_combo = QComboBox(self)
-        self._mode_combo.addItem("Station (join a WiFi network)", userData="sta")
-        self._mode_combo.addItem("Access point (device hosts its own)", userData="ap")
-        form.addRow("Mode:", self._mode_combo)
-        self._ssid_edit = QLineEdit(self)
-        form.addRow("SSID:", self._ssid_edit)
-        self._hostname_edit = QLineEdit(self)
-        form.addRow("Hostname:", self._hostname_edit)
-        self._wifi_password_edit = QLineEdit(self)
-        self._wifi_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._wifi_password_edit.setPlaceholderText("(unchanged)")
-        form.addRow("WiFi password:", self._wifi_password_edit)
-        self._has_password_label = QLabel("", self)
-        form.addRow("", self._has_password_label)
+        self._networks_label = QLabel("—", self)
+        self._networks_label.setWordWrap(True)
+        form.addRow("Known WiFi networks:", self._networks_label)
+        self._ap_label = QLabel("—", self)
+        form.addRow("Access point:", self._ap_label)
+        self._hostname_label = QLabel("—", self)
+        form.addRow("mDNS hostname:", self._hostname_label)
+        self._ntp_label = QLabel("—", self)
+        form.addRow("NTP:", self._ntp_label)
         layout.addLayout(form)
 
-        self._apply_button = QPushButton("Apply network config", self)
-        self._apply_button.clicked.connect(self._on_apply)
-        layout.addWidget(self._apply_button)
+        note = QLabel(
+            "Editing the network config from the app is disabled until the "
+            "firmware's write schema is verified — a wrong write can take "
+            "the device off the network (recovery: hold button B ≥ 5 s for "
+            "AP mode at http://192.168.4.1).",
+            self,
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("QLabel { color: #888; font-style: italic; }")
+        layout.addWidget(note)
         layout.addWidget(self._status_label)
         layout.addStretch(1)
         layout.addLayout(self._footer())
@@ -443,48 +446,21 @@ class NetworkTab(_EchosTabBase):
 
     def _populate(self, state: EchosDeviceState) -> None:
         config = state.network
-        self._mode_combo.setCurrentIndex(self._mode_combo.findData(config.mode))
-        self._ssid_edit.setText(config.ssid)
-        self._hostname_edit.setText(config.hostname)
-        self._wifi_password_edit.clear()
-        self._has_password_label.setText(
-            "A WiFi password is set on the device."
-            if config.has_password
-            else "No WiFi password set on the device."
+        networks = [
+            f"{n.ssid} ({'password set' if n.has_password else 'open'})"
+            for n in config.known_networks
+        ]
+        self._networks_label.setText("\n".join(networks) if networks else "(none stored)")
+        ap_pw = "password set" if config.has_ap_password else "open"
+        self._ap_label.setText(f"{config.ap_ssid} ({ap_pw})")
+        self._hostname_label.setText(f"{config.mdns_hostname}.local")
+        self._ntp_label.setText(
+            f"{config.ntp_server} (enabled)" if config.ntp_enabled else "disabled"
         )
 
     def _refresh_enabled(self) -> None:
-        self._apply_button.setEnabled(self._ready)
-
-    def edited_config(self) -> EchosNetworkConfig | None:
-        if self._loaded_state is None:
-            return None
-        return self._loaded_state.network.model_copy(
-            update={
-                "mode": str(self._mode_combo.currentData()),
-                "ssid": self._ssid_edit.text().strip(),
-                "hostname": self._hostname_edit.text().strip(),
-            }
-        )
-
-    @Slot()
-    def _on_apply(self) -> None:
-        config = self.edited_config()
-        if config is None or not self._write_enabled:
-            return
-        if not self.confirm(
-            "Write the network config to the device?\n\n"
-            "A wrong SSID/password can take the device off the network — "
-            "recovery is the AP-mode button (hold B ≥ 5 s)."
-        ):
-            return
-        self._set_status("Applying…", style=_STATUS_BUSY_STYLE)
-        self.applyRequested.emit(config, self._wifi_password_edit.text())
-
-    @Slot()
-    def on_applied(self) -> None:
-        self._wifi_password_edit.clear()
-        self._set_status("Network config applied.", style=_STATUS_OK_STYLE)
+        # Nothing mutating on this tab.
+        return
 
 
 class MaintenanceTab(_EchosTabBase):
@@ -509,13 +485,13 @@ class MaintenanceTab(_EchosTabBase):
         self._stopped = False
         layout = QVBoxLayout(self)
 
-        cal_box = QGroupBox("Calibration (3-phase full sweep)", self)
+        cal_box = QGroupBox("Calibration (full PGA-gain-ladder sweep)", self)
         cal_layout = QVBoxLayout(cal_box)
         self._cal_button = QPushButton("Start full calibration", cal_box)
         self._cal_button.clicked.connect(self._on_calibrate)
         cal_layout.addWidget(self._cal_button)
         self._cal_bar = QProgressBar(cal_box)
-        self._cal_bar.setRange(0, 3)
+        self._cal_bar.setRange(0, 100)
         self._cal_bar.setValue(0)
         cal_layout.addWidget(self._cal_bar)
         self._cal_state_label = QLabel("idle", cal_box)
@@ -571,9 +547,9 @@ class MaintenanceTab(_EchosTabBase):
         self.calibrationPollRequested.emit()
 
     def _populate(self, state: EchosDeviceState) -> None:
-        self._ota_version_label.setText(state.ota.app_version)
+        self._ota_version_label.setText(state.ota.current_version)
         self._ota_partition_label.setText(state.ota.running_partition)
-        self._ota_state_label.setText(state.ota.ota_state)
+        self._ota_state_label.setText(state.ota.state)
         self._render_calibration(state.calibration)
 
     def _refresh_enabled(self) -> None:
@@ -596,14 +572,14 @@ class MaintenanceTab(_EchosTabBase):
         super().on_failed(op, kind, message)
 
     def _render_calibration(self, status: CalibrationStatus) -> None:
-        self._cal_bar.setRange(0, status.total_phases)
-        self._cal_bar.setValue(status.phase)
+        self._cal_bar.setValue(int(status.progress_percent))
         self._cal_state_label.setText(
-            f"{status.state} — phase {status.phase}/{status.total_phases} "
-            f"({status.progress_pct:.0f}%)"
-            + (f" — {status.error}" if status.error else "")
+            f"{status.phase} — gain {status.current_gain}/{status.total_gains} "
+            f"({status.progress_percent:.0f}%)"
         )
-        if status.state == "running":
+        # The sweep-phase vocabulary beyond "idle" is not pinned yet, so
+        # anything that is neither at-rest nor terminal counts as active.
+        if status.phase not in ("idle", "done", "error", "failed"):
             if not self._cal_poll_timer.isActive() and not self._stopped:
                 self._cal_poll_timer.start()
         else:
