@@ -935,11 +935,27 @@ surfaced real problems — this milestone fixes them.
       `test_rectified_jittered_stream_is_contiguous_on_disk` (raw
       jitter fragments as negative control) and the engine wiring
       test (mutation-verified).
-- [ ] **C. App efficiency.** Profile CPU/GIL during 500 Hz × 3 ch
-      Monitor and Record (render path, spectrogram, PSD; the dev
-      machine also runs a live SeedTiLa production instance).
-      Acceptance: zero archive backpressure in steady-state recording
-      on this machine, with headroom for a second device.
+- [x] **C. App efficiency.** DONE 2026-06-12 (synthetic; real-device
+      confirmation rides item E). `scripts/profile_500hz.py` drives a
+      real engine+writer with field-shaped packets (500 Hz × 3 ch,
+      108-sample records, dead-host worker, the high-rate-load
+      pattern; headless — no render/PSD consumers attached, so the
+      figures are the science path only). Findings on this machine
+      (SeedTiLa prod running):
+      1 device = 7.0 % of one core, 2 devices = 14.3 %, flush ticks
+      sub-ms p99, archive in-flight high-water **1** at both loads —
+      zero steady-state backpressure with ample second-device
+      headroom; the field's steady drops were tick starvation (fixed
+      in A), never storage slowness. Hotspot found + fixed: obspy
+      `Stream.write(format="MSEED")` re-resolves its format plugin
+      via importlib.metadata per call (~3 ms/packet, 54 % of writer
+      CPU) — the writer now binds `_write_mseed` once and skips the
+      per-packet `trace.copy()` when no dtype cast is needed
+      (1-device CPU 7.0 % → 5.1 %). Per-packet records (≈108 samples
+      per 512-byte record, ~4.7× the optimal STEIM2 size) are KEPT:
+      coalescing across packets would trade the crash-tight
+      write-on-arrival discipline for archive size — revisit only if
+      field sessions make size hurt.
 - [ ] **D. Map satellite layer.** The Map tab must offer a satellite
       basemap (Esri World Imagery or equivalent). M4's decision
       avoided QtWebEngine — preferred approach: raster XYZ tiles
@@ -1095,6 +1111,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6 settings: `ui.theme` scope is the PLOTS (pyqtgraph background/foreground at bootstrap), not the widget chrome; all settings labeled "next launch" | Restyling every Qt widget is a large fragile surface for no field value (the chrome follows the system); pyqtgraph reads its config at item creation so a runtime switch would leave existing plots in the old colors — honest "next launch" beats a half-applied hot toggle. `ui.recent_detections_limit` stays out of the dialog until the M3 prefill that consumes it lands. |
 | 2026-06-12 | M6.5-A: the archive seam has **no engine-side queue and no drop point** — `_on_packet` posts each recorded packet straight to the storage thread; rule 5's bound becomes an **in-flight gauge** (sent − writer-acked) warn-logged + `archiveBackpressure`-signalled above `queue_max` (field kept, repurposed as the warn threshold) | The old bounded deque was drained only by the flush tick and the drain emitted per-entry anyway — pure added latency plus a drop hazard; a replay burst starves the tick (Qt posted-event flood) and drop-oldest ate 33 s of LIVE recorded data in the field. The archive is the science sink (ROADMAP A: correctness > liveness; rule 11 protects display, not this path); the physical bound is the device ring + live rate, and sustained writer slowness still trips the writer's own slow-IO pause valve. `DeviceStatus.archive_drops_total` removed (no readers; nothing can drop there now). |
 | 2026-06-12 | M6.5-B: gap-detector jitter tolerance is **absolute milliseconds** (`archive.jitter_tolerance_ms`, default 10, half-sample floor), and in-tolerance packets are **snapped onto the reconstructed grid** before archiving (`last_end` follows the grid, not the device stamps) | The field jitter is device clock wobble — a time property (±5.1 ms on echos.local), so a sample-scaled tolerance would be wrong at other rates and "≤ half a sample" (the ROADMAP sketch) was already in place and demonstrably too small. Snapping (not just suppressing the event) is what fixes the REAL damage — 17 on-disk segments/440 s that fragment reads and HVSR windows; `last_end` following the grid is what stops zero-mean jitter from emitting pairs forever. Honest cost, documented in code + schema: a real discontinuity ≤ tolerance is absorbed as ≤ 10 ms persistent timing bias (no `gaps` row) until the next over-tolerance event re-anchors — inside the device's own stamping noise, and irrelevant to single- and multi-station HVSR (no cross-station phase coherence used). Display/DSP keep the raw stamps; only the archive branch mutates, after every other consumer captured its values. |
+| 2026-06-12 | M6.5-C: the writer binds obspy's `_write_mseed` **directly** (one import) instead of `Stream.write(format="MSEED")`, and skips the per-packet `trace.copy()` on the no-cast hot path | The plugin dispatch inside `Stream.write` resolves the MSEED entry point via importlib.metadata on EVERY call — ~3 ms + an email-header parse per 108-sample packet, 54 % of the writer's CPU in the M6.5-C profile. `_write_mseed` IS the function the entry point resolves to, it accepts BytesIO, and it never mutates the input trace; the round-trip tests pin the private binding so an obspy upgrade fails the gate loudly. Per-packet records stay (crash-tight write-on-arrival; coalescing's ~4.7× size win is not worth the in-memory crash window until the field says size hurts). |
 | 2026-06-12 | M6.5-A: MseedWriter **terminal-signal invariant** — exactly one `writeOk` XOR `writeFailed` per `write_trace`; the paused-path drop emits `writeFailed` (was silent), the pause-TRIP write emits only its `writeOk` (the old `writeFailed("filesystem unresponsive")` on the success path is gone) | The in-flight gauge counts terminal acks against sends; a silent drop inflates the gauge forever (false backpressure), a double terminal injects spurious acks that mask real backpressure exactly when the filesystem struggles (both reviewers flagged the latter). The teardown close barrier logs inflight + elapsed (rule 7) since its wait now scales with the backlog. |
 
 ## Open questions (resolve before the milestone that needs them)

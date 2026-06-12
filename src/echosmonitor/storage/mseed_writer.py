@@ -62,6 +62,17 @@ import numpy as np
 import structlog
 from obspy import Stream, UTCDateTime
 from obspy.core.trace import Trace as _Trace
+
+# Direct binding of obspy's MSEED write entry point (M6.5-C). Going
+# through ``Stream.write(format="MSEED")`` re-resolves the format
+# plugin via importlib.metadata on EVERY call — ~3 ms and an
+# email-header parse per packet, which at the Echos packet rate
+# (108-sample records, ~14 packets/s/device at 500 Hz x 3 ch) was 54 %
+# of the writer's CPU in the M6.5-C profile. ``_write_mseed`` IS the
+# function that entry point resolves to; the round-trip tests in
+# tests/storage/test_mseed_writer.py pin the binding, so an obspy
+# upgrade that moves it fails the gate loudly instead of silently.
+from obspy.io.mseed.core import _write_mseed
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from echosmonitor.config.schema import ArchiveConfig
@@ -404,6 +415,13 @@ class MseedWriter(QObject):
         Raises :class:`_EncodingError` for unrecoverable type mismatches.
         """
         configured = self._cfg.encoding
+        # ``Stream.write`` used to reject masked arrays before plugin
+        # dispatch; the direct ``_write_mseed`` binding skips that
+        # check and would silently write fill garbage. Unreachable on
+        # the archive path (the writer never merges), but keep the
+        # defensive posture explicit.
+        if isinstance(trace.data, np.ma.MaskedArray):
+            raise _EncodingError("masked array cannot be archived")
         kind = trace.data.dtype.kind  # 'i', 'u', 'f', etc.
 
         chosen: str
@@ -448,13 +466,21 @@ class MseedWriter(QObject):
 
         # Build a one-trace Stream with the (possibly cast) data and
         # encode to a BytesIO. ObsPy's MiniSEED writer respects
-        # ``encoding`` and ``reclen`` exactly.
-        out_trace = trace.copy()
-        out_trace.data = data
+        # ``encoding`` and ``reclen`` exactly. Hot path (device already
+        # emits the configured dtype — the Echos int32/STEIM2 case):
+        # write the original trace directly; ``_write_mseed`` never
+        # mutates its input (pinned by the round-trip tests) and the
+        # writer is the trace's last consumer, so the per-packet
+        # ``trace.copy()`` deepcopy was pure overhead (M6.5-C profile).
+        if data is trace.data:
+            out_trace = trace
+        else:
+            out_trace = trace.copy()
+            out_trace.data = data
         buf = BytesIO()
-        Stream([out_trace]).write(
+        _write_mseed(
+            Stream([out_trace]),
             buf,
-            format="MSEED",
             encoding=chosen,
             reclen=self._cfg.record_length,
             byteorder=">",
