@@ -40,6 +40,11 @@ dependencies = [
     # OS keyring (Secret Service / Keychain / Credential Locker) with a
     # chmod-600 file fallback when no usable backend exists.
     "keyring>=25.0",
+    # mDNS discovery of Echos nodes (core/discovery.py, M6). Pure-python,
+    # no transitive weight, so it is a regular dependency; the milestone's
+    # "optional" is honoured at the FEATURE level — the import stays lazy
+    # and a stripped install degrades to manual device add.
+    "zeroconf>=0.132",
 ]
 
 # Dev tooling lives in a dependency-group (PEP 735), not an optional extra:

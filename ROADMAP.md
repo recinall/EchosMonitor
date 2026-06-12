@@ -776,7 +776,28 @@ rebuild port, no-data root surfacing.
       the log + `ArrayHvsrSummary.last_error`, not in the per-device rows.
 - [ ] First-run wizard rewritten for Echos (discover device on
       `192.168.4.1` AP / mDNS `*.local`, set admin password, add device).
-- [ ] mDNS discovery of Echos nodes on the LAN (optional, zeroconf).
+- [x] mDNS discovery of Echos nodes on the LAN (optional, zeroconf).
+      *Done 2026-06-12:* advert contract PINNED LIVE against fw 1aa72cbe —
+      the firmware advertises `ADS131M04-WebServer._http._tcp.local.` with
+      TXT `board=ESP32-S3` (pihw.local advertises NO http service: a
+      Pi-hosted node is added manually; discovery is a convenience, never
+      the only path). `core/discovery.py` `EchosDiscoveryWorker` (status-
+      poller canon: queued one-shot `discover`, plain-method stop with
+      threadsafe asyncio cancel): browse `_http._tcp` 4 s → advert cap 64
+      + dedup → name-hint-first resolves under a 10 s aggregate budget →
+      loose prefilter (`is_echos_candidate`) → CONFIRM via typed public
+      `GET /api/status` + `GET /api/seedlink/config` (credential-less —
+      lockout unreachable); confirmed nodes STREAM out as they land.
+      `DiscoveryDialog` (worker per dialog, latch-guarded teardown,
+      disconnect-after-join, join-timeout pairs retained in module-level
+      `_ABANDONED`) + DevicePanel "Discover…" toolbar action; "Add
+      device…" hands `DeviceDialog.add` an exact prefill (mDNS hostname,
+      PROBED SeedLink port, advertised REST port); configured hosts
+      (case/dot-normalized) are marked and locked. zeroconf is a regular
+      dependency, lazily imported (stripped install →
+      `discoveryFailed("unavailable")`). 17 tests (worker canon incl.
+      stop-mid-scan + streaming + off-GUI-thread; dialog incl. prefill,
+      double-teardown latch), key gates mutation-verified.
 - [x] Device clock/GNSS health surfaced (PPS lock from status poller).
       *Done 2026-06-12:* `ClockHealth` closed verdict (PPS > GNSS > NTP >
       HOLDOVER > UNSYNCED) derived on `EchosDeviceSnapshot` from the
@@ -900,6 +921,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6-0: a cycle where EVERY device's slice read raised announces the per-device errors as an empty-results `arrayUpdated`, never `arrayArchiveNoData` | "No archived data in that range" when the truth is N I/O failures sends the user hunting for a time-range mistake that does not exist; the errors ride the result so the table's per-device status column shows the real cause (reviewer finding on the first M6-0 cut). |
 | 2026-06-12 | M6-0: both HVSR engines' shutdown RETAINS abandoned worker/thread pairs whose bounded join timed out (drain retries on the next shutdown; no cap, count logged) | Dropping the last Python reference to a running QThread is a hard Qt abort (destroyed-while-running) — the mutation run literally crashed the interpreter. A cap is impossible without dropping a running reference, so the logged `abandoned=` count is the rule-5 observability compromise. |
 | 2026-06-12 | M6 clock health: `ClockHealth` derives from the `/api/status` BOOLEANS only; `time_sync_type` is display-only; `time_synchronized` alone = **HOLDOVER** (attention), never NTP | The firmware's sync-type string is an unpinned composite ("RMC+PPS+NTP" on fw 1aa72cbe) — branching on it would break on the next firmware wording. And a clock that was set once but has no live source is a free-running ESP32 crystal (seconds/day drift): reporting it as "NTP, network accuracy" is exactly the false-"synchronized" the model promises never to emit. |
+| 2026-06-12 | M6 discovery: mDNS advert is only a PREFILTER (loose substring/prefix on instance `ADS131M04` / TXT `board=ESP32*`); the typed public probe (`/api/status` + `/api/seedlink/config`) is the gate; both pinned LIVE against echos.local (fw 1aa72cbe) | The instance/TXT are firmware constants the next build could reword (and mDNS conflict-renames duplicates "name (2)"), so exact-matching would be brittle; a schema-validated credential-less probe cannot be spoofed by a printer and can never trip the auth lockout (rule 15). pihw.local proved the negative case: no `_http` advert → manual add stays first-class. |
+| 2026-06-12 | M6 discovery: `zeroconf` is a REGULAR dependency; the milestone's "optional" is honoured at the FEATURE level (lazy import → `discoveryFailed("unavailable")` on stripped installs) | An optional extra would keep the default `uv sync` gate from ever exercising the discovery tests; zeroconf is pure-python with one tiny dep (ifaddr), so the packaging cost is nil while testability wins. |
+| 2026-06-12 | M6 discovery: the add-device prefill uses the mDNS HOSTNAME (`echos.local`), not the resolved IP, as `DeviceConfig.host` | The hostname survives DHCP lease changes — the exact field failure mode of a seismometer that sits on a site LAN for weeks; the probed IP remains visible in the dialog row for debugging. |
 
 ## Open questions (resolve before the milestone that needs them)
 

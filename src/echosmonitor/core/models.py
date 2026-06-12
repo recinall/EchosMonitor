@@ -174,6 +174,32 @@ class EchosDeviceSnapshot:
         return ClockHealth.UNSYNCED
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveredEchos:
+    """One mDNS-discovered AND probe-confirmed Echos node (M6).
+
+    Produced by :class:`~echosmonitor.core.discovery.EchosDiscoveryWorker`:
+    the mDNS advert (instance/TXT) is only the candidate prefilter — every
+    field below the fold is confirmed by the typed PUBLIC probe
+    (``GET /api/status`` + ``GET /api/seedlink/config``), so a row in the
+    discovery dialog is always a real, reachable Echos node. Frozen:
+    crosses the worker→GUI boundary via a queued ``Signal(object)``.
+
+    ``hostname`` is the mDNS name (``echos.local``) — preferred for the
+    device config because it survives DHCP lease changes; ``address`` is
+    the resolved IPv4 the probe actually used.
+    """
+
+    instance: str  # mDNS instance name (e.g. "ADS131M04-WebServer")
+    hostname: str  # mDNS hostname, no trailing dot (e.g. "echos.local")
+    address: str  # IPv4 the probe used
+    http_port: int  # REST port from the advert
+    seedlink_port: int  # from /api/seedlink/config — the DeviceConfig.port
+    firmware_version: str  # from /api/status
+    project_name: str  # from /api/status
+    board: str  # TXT "board" (e.g. "ESP32-S3"), display-only
+
+
 # Separator used to namespace per-stream engine state by device. The same
 # NSLC arriving from two different SeedLink servers must not share a ring
 # buffer, coalescer, or chain — keying by ``f"{device}{DEVICE_KEY_SEP}{nslc}"``

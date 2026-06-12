@@ -136,6 +136,7 @@ _PAGE_EMPTY = 1
 # Toolbar action labels — pulled out so the test that asserts on them
 # stays robust against stylistic copy-edits.
 _ACTION_ADD = "+ Add device"
+_ACTION_DISCOVER = "Discover…"
 _ACTION_EDIT = "Edit"
 _ACTION_REMOVE = "Remove"
 _ACTION_RECONNECT = "Reconnect now"
@@ -294,11 +295,13 @@ class DevicePanel(QDockWidget):
         # UX since the actions are scoped to the tree's selection.
         self._toolbar.setMovable(False)
         self._action_add = QAction(_ACTION_ADD, self)
+        self._action_discover = QAction(_ACTION_DISCOVER, self)
         self._action_edit = QAction(_ACTION_EDIT, self)
         self._action_remove = QAction(_ACTION_REMOVE, self)
         self._action_reconnect = QAction(_ACTION_RECONNECT, self)
         for action in (
             self._action_add,
+            self._action_discover,
             self._action_edit,
             self._action_remove,
             self._action_reconnect,
@@ -369,6 +372,7 @@ class DevicePanel(QDockWidget):
 
         # Wiring -----------------------------------------------------
         self._action_add.triggered.connect(self._on_add_clicked)
+        self._action_discover.triggered.connect(self._on_discover_clicked)
         self._action_edit.triggered.connect(self._on_edit_clicked)
         self._action_remove.triggered.connect(self._on_remove_clicked)
         self._action_reconnect.triggered.connect(self._on_reconnect_clicked)
@@ -886,6 +890,21 @@ class DevicePanel(QDockWidget):
         from echosmonitor.gui.dialogs.device_dialog import DeviceDialog
 
         DeviceDialog.add(self, self._store, engine=self._engine)
+
+    @Slot()
+    def _on_discover_clicked(self) -> None:
+        """Open the mDNS discovery dialog (M6) — same store/engine wiring."""
+        if self._store is None:
+            _log.debug("device_panel_discover_no_store")
+            return
+        from echosmonitor.gui.dialogs.discovery_dialog import DiscoveryDialog
+
+        dialog = DiscoveryDialog(self, self._store, engine=self._engine)
+        dialog.exec()
+        # The worker/thread pair outlives the dialog only on the join-
+        # timeout path (module-level _ABANDONED holds it); the dialog
+        # itself must not pile up as a panel child per click.
+        dialog.deleteLater()
 
     @Slot()
     def _on_edit_clicked(self) -> None:
