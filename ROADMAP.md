@@ -556,9 +556,30 @@ at `storage/sds.py:130–168` has zero callers).
 
 Goal: a Map tab showing each device's position and live state.
 
-- [ ] **A. Position resolver** `core/positions.py`: StationXML lat/lon/elev
+- [x] **A. Position resolver** `core/positions.py`: StationXML lat/lon/elev
       via the M1 client, manual override wins, cached, refreshed on demand
-      (rule 16).
+      (rule 16). Done 2026-06-12.
+  - [x] source priority **override > StationXML > live GNSS** (decision
+        log) — pinned against the real devices first (read-only GETs,
+        user-authorized): the firmware embeds a 6-decimal *snapshot* of
+        the GNSS fix into StationXML, `/api/status` is the live fix.
+        Lat/lon 0/0 ("null island") = no-fix placeholder, treated as
+        absent. Every `ResolvedPosition` is tagged with its source.
+  - [x] `PositionResolver` facade (ArchiveDetailLoader owner canon) +
+        `_PositionWorker` (EchosStatusWorker canon: queued resolve slot,
+        `asyncio.run`, plain-method `stop()` with task-cancel nudge).
+        Public credential-less GETs only — can never trip the lockout.
+        ONE instance to be owned by MainWindow; Map tab (B) and M5 HVSR
+        both consume it. MainWindow wiring lands with B (first consumer).
+  - [x] failure vocabulary = `EchosErrorKind` + `"unavailable"` (device
+        answered but has no position anywhere / no source at all);
+        a failed refresh keeps the last known cached position.
+  - [x] reviewer findings (2 majors, 2 minors) fixed with behavioral
+        regression tests verified to fail pre-fix: `configure`/`refresh`
+        supersede in-flight sweeps (generation written even on empty
+        dispatch; rapid refreshes coalesce to one sweep); override path
+        pre-emit stop check; `shutdown()` is terminal (dispatch refused,
+        thread never restarted into a stopped worker).
 - [ ] **B. Map widget**: decision recorded here → tiles (QtWebEngine/Leaflet,
       offline-capable?) vs pyqtgraph scatter with background image. Markers:
       device name, state colour (Idle/Monitoring/Recording/Error), click →
@@ -694,6 +715,11 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-11 | M3-D: `list_sessions` reads `reindexed` behind a `pragma table_info` guard instead of requiring schema v5 | The M3-A browser opens every DB read-only WITHOUT migration (rule 8); an unconditional `SELECT reindexed` would break browsing every existing pre-v5 archive. The pragma costs one statement per (bounded) listing call. |
 | 2026-06-11 | M3-D: re-index targets are restricted to DIRECT CHILDREN of the base archive root; the active session's DB is refused at the main-window seam | Discovery only scans base-rooted project dirs (M3-A decision) — re-indexing anywhere else would "succeed" into invisibility; the picker therefore enforces the same scope. The ACTIVE session's `archive.db` is held open and written by the engine (rule 8) — re-indexing it would race the live writer; the guard compares against `engine.archive_db_path()` in the main window (rule 4: the widget and the loader never see the engine). Cross-process: the app-lifetime QLockFile (M2-C) already keeps other instances from recording under this root. |
 | 2026-06-11 | M3-D: the re-index worker reuses the M3-C serial-queue semantics (shutdown-only stop, queued clear re-arm); completion reports survive the auto-refresh via a one-shot notice | A re-index is an explicit action on a directory — supersede semantics would cancel work the user asked for; the stop/clear reasoning is identical to the export auditor finding. The tab's refresh used to overwrite the completion report within one event-loop turn (caught by the e2e test): the notice is consumed by exactly one `_populate_sessions` pass. |
+
+| 2026-06-12 | M4-A: position source priority is **override > StationXML > live GNSS** (`/api/status` `position`), source tagged on every result; lat/lon exactly 0/0 treated as absent | Rule 16 names StationXML canonical and the override as winner; the real-contract check (both devices, read-only) showed the firmware embeds a 6-decimal GNSS *snapshot* into StationXML — so live GNSS is a same-truth fallback for when StationXML is absent/unparseable/coordinate-less (e.g. document generated before first fix). 0/0 is the no-fix placeholder ("null island"), never a real deployment. |
+| 2026-06-12 | M4-A: an unreachable/timeout StationXML fetch fails fast WITHOUT trying `/api/status`; protocol-level failures DO fall back | A dead host would only burn a second HTTP timeout on the same socket; an endpoint-specific failure (404, bad body) says nothing about `/api/status`. Pinned by `test_unreachable_device_fails_fast_without_status_fallback`. |
+| 2026-06-12 | M4-A: `positionFailed` vocabulary = `EchosErrorKind` + **`"unavailable"`** (no position anywhere / no source at all); a no-REST no-override device is `unavailable`, not an error | "This device has no position" is honest domain state the Map tab must render (grey marker / absent), not a transport failure; widening the closed set beats overloading `protocol`. A failed refresh keeps the last known cached position — stale-but-labeled beats blank. |
+| 2026-06-12 | M4-A: `configure` AND `refresh` bump the latest-wins generation (written to the worker even when the dispatch set is empty); `refresh_device` deliberately does not; `shutdown()` is terminal | Both reviewers: an empty/fully-cached configure left the in-flight sweep fetching removed devices (results discarded but network work wasted), and N rapid refreshes queued N un-superseded full sweeps (rule 5 — the only unbounded seam in the file). A single-device refresh bumping the global generation would discard every other device's in-flight result to save one duplicate fetch. Regression tests verified to fail pre-fix. |
 
 ## Open questions (resolve before the milestone that needs them)
 
