@@ -64,7 +64,7 @@ def test_main_window_smoke(qtbot: QtBot) -> None:
     central = window.centralWidget()
     assert isinstance(central, QTabWidget)
     tab_texts = [central.tabText(i) for i in range(central.count())]
-    assert tab_texts == ["Detections", "Live", "PSD", "HVSR", "Archive", "Map"]
+    assert tab_texts == ["Detections", "Live", "PSD", "HVSR", "HVSR Array", "Archive", "Map"]
 
     # Closing must not raise even when QSettings is empty.
     window.close()

@@ -19,8 +19,10 @@ never needs a display.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
+import os
 import textwrap
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from echosmonitor.core.hvsr import HvsrResult
+    from echosmonitor.core.hvsr_array import ArrayHvsrResult
 
 # App version surfaced in the report header. Kept here (not imported from
 # pyproject at runtime) to avoid a packaging-metadata read on the GUI path.
@@ -321,6 +324,272 @@ def _pdf_page_numbers(plt: Any, pdf: Any, res: HvsrResult, ctx: ReportContext) -
         family="monospace",
         fontsize=9,
         linespacing=1.35,
+    )
+    fig.add_artist(plt.Line2D([0.07, 0.93], [0.045, 0.045], color="0.6", lw=0.8))
+    fig.text(
+        0.07,
+        0.03,
+        f"Generated {ctx.generated_at} by EchosMonitor v{APP_VERSION}",
+        ha="left",
+        va="bottom",
+        family="monospace",
+        fontsize=8,
+        color="0.35",
+    )
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------
+# Multi-station (array) report — M5-C
+# ----------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class ArrayReportContext:
+    """Host-supplied context for the array report.
+
+    ``group_by_device`` maps each device to its Z/N/E NSLCs (the widget's
+    start-time selection); per-station pages derive their single-station
+    :class:`ReportContext` from it.
+    """
+
+    group_by_device: dict[str, dict[str, str]]
+    period_label: str
+    generated_at: str
+
+
+_A0_ARRAY_NOTE = (
+    "A0 comparison ACROSS stations is response-sensitive (H/V cancels the "
+    "instrument response per station only); f0 comparison is not."
+)
+
+
+def _require_array_exportable(result: ArrayHvsrResult | None) -> ArrayHvsrResult:
+    if result is None:
+        raise HvsrExportError("no array HVSR result to export — run a measurement first")
+    if not any(r.n_windows_valid > 0 for r in result.results.values()):
+        raise HvsrExportError("no station with valid HVSR windows to export")
+    return result
+
+
+def _station_ctx(ctx: ArrayReportContext, device: str) -> ReportContext:
+    return ReportContext(
+        nslc_by_component=dict(ctx.group_by_device.get(device, {})),
+        period_label=ctx.period_label,
+        generated_at=ctx.generated_at,
+    )
+
+
+def array_result_to_dict(result: ArrayHvsrResult, ctx: ArrayReportContext) -> dict[str, object]:
+    """A JSON-serialisable dict: comparison scalars + geometry + full stations.
+
+    Each station with a result embeds its complete single-station structure
+    (:func:`result_to_dict`, schema ``echosmonitor.hvsr/1``) so the array
+    file is a superset — anything reproducible from a single-station export
+    is reproducible per station from this one.
+    """
+    geometry = result.geometry
+    return {
+        "schema": "echosmonitor.hvsr-array/1",
+        "app_version": APP_VERSION,
+        "generated_at": ctx.generated_at,
+        "period_label": ctx.period_label,
+        "provenance": result.provenance,
+        "settings": result.settings.model_dump(),
+        "devices": list(result.devices),
+        "errors": dict(result.errors),
+        "a0_note": _A0_ARRAY_NOTE,
+        "geometry": {
+            "positions": {
+                device: {
+                    "latitude": position.latitude,
+                    "longitude": position.longitude,
+                    "elevation_m": position.elevation_m,
+                    "source": position.source,
+                }
+                for device, position in geometry.positions.items()
+            },
+            "distances_m": {
+                f"{a}|{b}": round(meters, 3) for (a, b), meters in geometry.distances_m.items()
+            },
+            "unpositioned": list(result.unpositioned()),
+        },
+        "stations": {
+            device: result_to_dict(result.results[device], _station_ctx(ctx, device))
+            for device in result.devices
+            if device in result.results
+        },
+    }
+
+
+def export_hvsr_array_json(
+    result: ArrayHvsrResult | None, path: Path, ctx: ArrayReportContext
+) -> None:
+    """Write the full reproducible array result as JSON.
+
+    Atomic (the M3-C exports pattern): temp file in the same dir →
+    fsync → ``os.replace``, so a mid-write failure never leaves a
+    truncated file at the user's destination.
+    """
+    res = _require_array_exportable(result)
+    payload = array_result_to_dict(res, ctx)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def array_comparison_lines(result: ArrayHvsrResult, ctx: ArrayReportContext) -> list[str]:
+    """The comparison-page text block (pure, testable without rendering)."""
+    del ctx  # context rides the page header/footer, not this block
+    lines: list[str] = ["STATIONS"]
+    for device in result.devices:
+        r = result.results.get(device)
+        if r is None:
+            error = result.errors.get(device, "")
+            note = f"compute failed — {error}" if error else "no result (not enough windows)"
+            lines += _wrap_line(f"  {device:16}: {note}")
+            continue
+        if r.n_windows_valid == 0:
+            # A present result whose windows were ALL rejected: its f0/A0
+            # are honest NaN — say "no valid windows" instead of printing
+            # nan into a scientific report.
+            lines += _wrap_line(
+                f"  {device:16}: no valid windows "
+                f"(all {r.n_windows_total} rejected) — no f0 to report"
+            )
+            continue
+        period = (1.0 / r.f0_hz) if r.f0_hz > 0 else float("nan")
+        rel = "PASS" if r.reliability_passed else "FAIL"
+        cla = "PASS" if r.clarity_passed else "FAIL"
+        lines += _wrap_line(
+            f"  {device:16}: f0 {r.f0_hz:.4f} +/- {r.f0_sigma:.4f} Hz   "
+            f"T0 {period:.4f} s   A0 {r.a0:.3f}   "
+            f"windows {r.n_windows_valid}/{r.n_windows_total}   "
+            f"SESAME rel {rel} / clar {cla}"
+        )
+        lines += _wrap_line(f"  {'':16}  response: {r.same_response_detail}")
+    lines += ["", "A0 ACROSS STATIONS"]
+    lines += _wrap_line(f"  {_A0_ARRAY_NOTE}")
+
+    geometry = result.geometry
+    lines += ["", "GEOMETRY"]
+    if not geometry.positions:
+        lines.append("  no positioned stations")
+    for device in geometry.devices:
+        position = geometry.positions[device]
+        lines += _wrap_line(
+            f"  {device:16}: lat {position.latitude:.6f}  lon {position.longitude:.6f}  "
+            f"elev {position.elevation_m:.1f} m  (source: {position.source})"
+        )
+    unpositioned = result.unpositioned()
+    if unpositioned:
+        lines += _wrap_line("  no position: " + ", ".join(unpositioned))
+    if result.provenance == "archive":
+        # Rule 16 honesty: there is no archived position source — the
+        # snapshot is resolved at RUN time, which can differ from where a
+        # device stood during the recording.
+        lines += _wrap_line(
+            "  note: positions were resolved when this analysis ran, not when "
+            "the data was recorded — a device moved since the recording shows "
+            "its CURRENT coordinates."
+        )
+    if geometry.distances_m:
+        lines += ["", "INTER-STATION DISTANCES"]
+        for (a, b), meters in sorted(geometry.distances_m.items(), key=lambda kv: kv[1]):
+            lines += _wrap_line(f"  {a} - {b}: {meters:.1f} m")
+    return lines
+
+
+def write_hvsr_array_pdf(
+    result: ArrayHvsrResult | None, path: Path, ctx: ArrayReportContext
+) -> None:
+    """Render the array PDF: one comparison page, then per-station pages.
+
+    Station order is the measurement's start order. Stations without a
+    valid result appear on the comparison page (with their error / no-data
+    note) but get no per-station pages — there is nothing honest to plot.
+    """
+    res = _require_array_exportable(result)
+    import matplotlib
+
+    matplotlib.use("Agg")  # offline, no display
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    # Atomic: the array PDF has 1+2N pages of render surface — a mid-render
+    # failure must not leave a truncated PDF at the destination (rule 8).
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with PdfPages(str(tmp)) as pdf:
+            _pdf_page_array_comparison(plt, pdf, res, ctx)
+            for device in res.devices:
+                r = res.results.get(device)
+                if r is None or r.n_windows_valid == 0:
+                    continue
+                station_ctx = _station_ctx(ctx, device)
+                _pdf_page_plots(plt, pdf, r, station_ctx)
+                _pdf_page_numbers(plt, pdf, r, station_ctx)
+        with tmp.open("rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+def _pdf_page_array_comparison(
+    plt: Any, pdf: Any, res: ArrayHvsrResult, ctx: ArrayReportContext
+) -> None:
+    fig = plt.figure(figsize=(8.27, 11.69))  # A4 portrait
+    n_valid = sum(
+        1
+        for d in res.devices
+        if (r := res.results.get(d)) is not None and r.n_windows_valid > 0
+    )
+    fig.text(
+        0.5,
+        0.965,
+        f"HVSR array report — {len(res.devices)} stations "
+        f"({n_valid} with valid results)\n{ctx.period_label} ({res.provenance})",
+        ha="center",
+        va="top",
+        fontsize=12,
+        weight="bold",
+    )
+    # The N-curve overlay: per-station mean curves, NEVER a cross-station
+    # average (skill hvsr-array — that quantity is not defined).
+    ax = fig.add_axes((0.1, 0.58, 0.84, 0.32))
+    for device in res.devices:
+        r = res.results.get(device)
+        if r is None or r.n_windows_valid == 0:
+            continue  # an all-NaN curve would only fake a legend entry
+        mask = r.frequency > 0
+        line = ax.plot(r.frequency[mask], r.mean_curve[mask], lw=1.6, label=device)
+        if np.isfinite(r.f0_hz) and r.f0_hz > 0:
+            ax.axvline(r.f0_hz, color=line[0].get_color(), ls=":", lw=0.9, alpha=0.7)
+    ax.set_xscale("log")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("H/V amplitude")
+    ax.grid(True, which="both", alpha=0.25)
+    ax.legend(fontsize=8)
+
+    fig.text(
+        0.07,
+        0.52,
+        "\n".join(array_comparison_lines(res, ctx)),
+        ha="left",
+        va="top",
+        family="monospace",
+        fontsize=8,
+        linespacing=1.3,
     )
     fig.add_artist(plt.Line2D([0.07, 0.93], [0.045, 0.045], color="0.6", lw=0.8))
     fig.text(

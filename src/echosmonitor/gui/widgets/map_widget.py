@@ -25,9 +25,20 @@ not currently CONNECTED. Clicking a marker selects the device in the
 Devices dock (``deviceSelected``). Devices without a resolvable
 position are listed under the map with the failure kind — honest state,
 not an error dialog (decision log 2026-06-12).
+
+f0 overlay (M5-B): when an array HVSR measurement supplies per-device
+fundamental frequencies (``set_f0_overlay``), markers WITH an f0 are
+recoloured on a blue→red ramp over the overlay's log-frequency range —
+the spatial-variation view of site response. Devices without an f0
+keep their state colour (honest: not measured ≠ measured-low). The
+hover tip gains the f0 line and the toolbar gains a "Clear f0" button;
+the overlay persists across measurement stop (the result stays valid)
+until cleared or superseded by the next array run.
 """
 
 from __future__ import annotations
+
+import math
 
 import pyqtgraph as pg
 import structlog
@@ -67,11 +78,31 @@ _MARKER_SIZE = 14
 # Distance readout formatting threshold.
 _KM_THRESHOLD_M = 1000.0
 
+# f0 overlay ramp endpoints (low f0 → blue, high f0 → red). A manual
+# two-colour lerp over the log-frequency range: deterministic, no
+# colormap-API dependency, and the two ends match nothing else on the
+# map (state colours are grey/green/red/amber at full saturation).
+_F0_LOW_RGB = (40, 96, 192)
+_F0_HIGH_RGB = (208, 64, 64)
+
 
 def _format_distance(meters: float) -> str:
     if meters < _KM_THRESHOLD_M:
         return f"{meters:.1f} m"
     return f"{meters / 1000.0:.3f} km"
+
+
+def _f0_ramp_color(f0: float, f_lo: float, f_hi: float) -> str:
+    """Hex colour for ``f0`` on the blue→red log-frequency ramp."""
+    if f_hi <= f_lo:  # single-value overlay: midpoint
+        t = 0.5
+    else:
+        t = (math.log(f0) - math.log(f_lo)) / (math.log(f_hi) - math.log(f_lo))
+        t = min(1.0, max(0.0, t))
+    rgb = tuple(
+        round(lo + (hi - lo) * t) for lo, hi in zip(_F0_LOW_RGB, _F0_HIGH_RGB, strict=True)
+    )
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
 
 
 class MapWidget(QWidget):
@@ -96,6 +127,7 @@ class MapWidget(QWidget):
         self._failures: dict[str, str] = {}  # device -> PositionFailureKind
         self._acq_states: dict[str, AcquisitionState] = {}
         self._conn_states: dict[str, ConnState] = {}
+        self._f0_overlay: dict[str, float] = {}  # device -> f0 Hz (M5-B)
         self._labels: list[pg.TextItem] = []
 
         root = QVBoxLayout(self)
@@ -107,6 +139,11 @@ class MapWidget(QWidget):
         self._fit_button = QPushButton("Fit view", self)
         self._fit_button.clicked.connect(self._fit_view)
         toolbar.addWidget(self._fit_button)
+        self._clear_f0_button = QPushButton("Clear f₀", self)
+        self._clear_f0_button.setToolTip("Remove the array-HVSR f₀ colouring from the markers.")
+        self._clear_f0_button.clicked.connect(self.clear_f0_overlay)
+        self._clear_f0_button.setVisible(False)
+        toolbar.addWidget(self._clear_f0_button)
         toolbar.addStretch(1)
         self._status_label = QLabel("", self)
         toolbar.addWidget(self._status_label)
@@ -162,7 +199,13 @@ class MapWidget(QWidget):
         """
         self._devices = names
         keep = set(names)
-        for mapping in (self._positions, self._failures, self._acq_states, self._conn_states):
+        for mapping in (
+            self._positions,
+            self._failures,
+            self._acq_states,
+            self._conn_states,
+            self._f0_overlay,
+        ):
             for name in [n for n in mapping if n not in keep]:
                 del mapping[name]
         self._rebuild()
@@ -203,6 +246,28 @@ class MapWidget(QWidget):
         self._acq_states[device] = acq
         self._rebuild()
 
+    def set_f0_overlay(self, values: dict[str, float]) -> None:
+        """Replace the array-HVSR f₀ overlay (device → f₀ Hz; M5-B).
+
+        Only positive, finite values for configured devices are kept —
+        a device with no honest f₀ keeps its state colour rather than
+        being painted onto the ramp.
+        """
+        keep = set(self._devices)
+        self._f0_overlay = {
+            name: float(f0)
+            for name, f0 in values.items()
+            if name in keep and math.isfinite(f0) and f0 > 0.0
+        }
+        self._rebuild()
+
+    @Slot()
+    def clear_f0_overlay(self) -> None:
+        if not self._f0_overlay:
+            return
+        self._f0_overlay = {}
+        self._rebuild()
+
     @Slot(str, int)
     def on_device_state(self, device: str, state: int) -> None:
         try:
@@ -218,6 +283,9 @@ class MapWidget(QWidget):
     # Internals
     # ------------------------------------------------------------------
     def _marker_color(self, device: str) -> str:
+        f0 = self._f0_overlay.get(device)
+        if f0 is not None:
+            return _f0_ramp_color(f0, min(self._f0_overlay.values()), max(self._f0_overlay.values()))
         acq = self._acq_states.get(device, AcquisitionState.IDLE)
         if acq is AcquisitionState.IDLE:
             return _COLOR_IDLE
@@ -259,9 +327,13 @@ class MapWidget(QWidget):
 
         self._update_distances(positioned)
         self._update_unpositioned()
-        self._status_label.setText(
-            f"{len(positioned)} of {len(self._devices)} devices positioned"
-        )
+        status = f"{len(positioned)} of {len(self._devices)} devices positioned"
+        if self._f0_overlay:
+            f_lo = min(self._f0_overlay.values())
+            f_hi = max(self._f0_overlay.values())
+            status += f"   ·   f₀ overlay {f_lo:.2f} to {f_hi:.2f} Hz (blue→red)"
+        self._clear_f0_button.setVisible(bool(self._f0_overlay))
+        self._status_label.setText(status)
 
     def _update_distances(self, positioned: list[tuple[str, ResolvedPosition]]) -> None:
         # Same geometry shape M5 consumes (core.positions.station_geometry)
@@ -295,12 +367,16 @@ class MapWidget(QWidget):
         position = self._positions.get(data)
         if position is None:
             return data
-        return (
+        tip = (
             f"{data}\n"
             f"lat {position.latitude:.6f}, lon {position.longitude:.6f}\n"
             f"elev {position.elevation_m:.1f} m\n"
             f"source: {position.source}"
         )
+        f0 = self._f0_overlay.get(data)
+        if f0 is not None:
+            tip += f"\nf₀ = {f0:.2f} Hz (array HVSR)"
+        return tip
 
     def _on_spot_clicked(self, _scatter: object, points: object, _event: object = None) -> None:
         try:

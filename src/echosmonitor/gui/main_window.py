@@ -12,6 +12,7 @@ detach (Ctrl+Shift+N) layered on by M7.
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -70,6 +71,7 @@ from echosmonitor.core.archive_window_loader import (
 from echosmonitor.core.config_store import ConfigStore
 from echosmonitor.core.deconvolution_worker import DeconvolutionWorker
 from echosmonitor.core.echos_status import EchosStatusWorker
+from echosmonitor.core.hvsr_array import ArrayHvsrResult, HvsrArrayEngine
 from echosmonitor.core.hvsr_engine import HvsrEngine
 from echosmonitor.core.info_worker import InfoWorker
 from echosmonitor.core.models import EchosPollTarget
@@ -87,6 +89,7 @@ from echosmonitor.gui.widgets.detection_detail import (
 from echosmonitor.gui.widgets.detection_table import DetectionTable
 from echosmonitor.gui.widgets.device_panel import DevicePanel
 from echosmonitor.gui.widgets.dock_title_bar import DockTitleBar
+from echosmonitor.gui.widgets.hvsr_array_widget import HvsrArrayWidget
 from echosmonitor.gui.widgets.hvsr_widget import HvsrWidget
 from echosmonitor.gui.widgets.live_stack import LiveStack
 from echosmonitor.gui.widgets.live_tabs import LiveTabs
@@ -538,6 +541,11 @@ class MainWindow(QMainWindow):
         # provider so it can surface the same-response assumption.
         # Constructed AFTER ``_response_provider`` exists.
         self._hvsr_engine = HvsrEngine(self._engine, self._response_provider, parent=self)
+        # M5: the multi-device peer — its own dedicated compute thread,
+        # same best-effort contract (rule 11).
+        self._hvsr_array_engine = HvsrArrayEngine(
+            self._engine, self._response_provider, parent=self
+        )
 
         self._build_central()
         self._build_docks()
@@ -614,6 +622,15 @@ class MainWindow(QMainWindow):
         self._psd_widget = PsdWidget(engine=self._engine, parent=self)
         self._hvsr_widget = HvsrWidget(self._engine, self._hvsr_engine, parent=self)
         self._hvsr_widget.set_archive_request_handler(self._run_hvsr_archive)
+        # M5-B: multi-device HVSR. The geometry snapshot at measurement
+        # start comes from the ONE shared PositionResolver (rule 16).
+        self._hvsr_array_widget = HvsrArrayWidget(
+            self._engine,
+            self._hvsr_array_engine,
+            self._position_resolver.geometry,
+            parent=self,
+        )
+        self._hvsr_array_widget.set_archive_request_handler(self._run_hvsr_array_archive)
         # The Archive tab (M3-A): session browser + static window view.
         # Session discovery + per-session trees run on the browser loader's
         # worker thread; the tab carries each session's root + archive.db
@@ -668,6 +685,7 @@ class MainWindow(QMainWindow):
         self._central_tabs.addTab(self._live_tabs, "Live")
         self._central_tabs.addTab(self._psd_widget, "PSD")
         self._central_tabs.addTab(self._hvsr_widget, "HVSR")
+        self._central_tabs.addTab(self._hvsr_array_widget, "HVSR Array")
         self._central_tabs.addTab(self._archive_tab, "Archive")
         self._central_tabs.addTab(self._map_widget, "Map")
         self._central_tabs.setCurrentWidget(self._detections_splitter)
@@ -1433,6 +1451,29 @@ class MainWindow(QMainWindow):
         self._engine.deviceStateChanged.connect(self._map_widget.on_device_state)
         self._push_position_queries()
         self._store.configChanged.connect(self._push_position_queries)
+        # M5-B: array-HVSR f0 → map overlay. A new array run clears the
+        # previous overlay (stale colouring must not blend with fresh
+        # results); the overlay itself persists across stop — the last
+        # result stays valid until cleared or superseded.
+        self._hvsr_array_engine.arrayUpdated.connect(self._on_array_hvsr_updated)
+        self._hvsr_array_engine.arrayMeasurementStarted.connect(self._on_array_hvsr_started)
+
+    def _on_array_hvsr_started(self, _measurement_id: str, _summary: object) -> None:
+        self._map_widget.clear_f0_overlay()
+
+    def _on_array_hvsr_updated(self, payload: object) -> None:
+        """Colour the map markers by each station's f0 (M5-B, rule 4 guard)."""
+        if not isinstance(payload, ArrayHvsrResult):
+            return
+        overlay = {
+            device: result.f0_hz
+            for device, result in payload.results.items()
+            if result.n_windows_valid > 0 and math.isfinite(result.f0_hz) and result.f0_hz > 0
+        }
+        # Unconditional: each cycle is self-contained (ArrayHvsrResult
+        # contract), so a no-f0 cycle honestly clears the colouring rather
+        # than letting a previous cycle's colours linger over fresh errors.
+        self._map_widget.set_f0_overlay(overlay)
 
     def _push_position_queries(self) -> None:
         """Rebuild the position-resolver query set from config (M4, rule 16).
@@ -2297,6 +2338,53 @@ class MainWindow(QMainWindow):
             reader,
         )
 
+    def _run_hvsr_array_archive(
+        self,
+        groups: dict[str, dict[str, str]],
+        t_start: object,
+        t_end: object,
+        settings: object,
+        geometry: object,
+    ) -> str:
+        """Run the ARRAY analysis over an archived range (M5-D).
+
+        Root resolution (rule 14): when a session is selected in the
+        Archive tab, every checked device reads from that SESSION's root
+        (one shared reader — the per-device SDS trees live below it);
+        otherwise each device falls back to its live engine root. The
+        Archive-tab selection is the pull-based counterpart of the
+        single-station hand-off context — the user picks the session
+        first, then runs the array over it.
+        """
+        from pathlib import Path
+
+        from obspy import UTCDateTime
+
+        from echosmonitor.core.hvsr import HvsrSettings
+        from echosmonitor.core.positions import StationGeometry
+        from echosmonitor.storage.archive_reader import ArchiveReader
+
+        assert isinstance(settings, HvsrSettings)
+        assert isinstance(geometry, StationGeometry)
+        t0 = UTCDateTime(str(t_start))
+        t1 = UTCDateTime(str(t_end))
+        entry = self._archive_tab.selected_session_entry() if self._archive_tab else None
+        readers: dict[str, ArchiveReader] = {}
+        if entry is not None:
+            shared = ArchiveReader(Path(entry.session_root))
+            readers = dict.fromkeys(groups, shared)
+            _log.info(
+                "hvsr_array_archive_session_root",
+                session_root=str(entry.session_root),
+                devices=sorted(groups),
+            )
+        else:
+            for device in groups:
+                readers[device] = ArchiveReader(self._engine.archive_root(device))
+        return self._hvsr_array_engine.start_archive_measurement(
+            groups, t0, t1, settings, geometry, readers
+        )
+
     def _on_detection_markers(self, detection: object) -> None:
         """Draw markers for a newly-recorded detection on its trace + the
         wall-clock spectrogram (C1/C2)."""
@@ -2435,10 +2523,11 @@ class MainWindow(QMainWindow):
         self._decon_thread.quit()
         if not self._decon_thread.wait(_DECON_THREAD_JOIN_MS):
             _log.warning("decon_thread_join_timeout")
-        # Shut the HVSR engine down BEFORE the streaming engine: its worker
-        # thread reads the engine's ring buffers, so it must be joined
-        # before the engine it reads from goes away.
+        # Shut the HVSR engines down BEFORE the streaming engine: their
+        # worker threads read the engine's ring buffers, so they must be
+        # joined before the engine they read from goes away.
         self._hvsr_engine.shutdown()
+        self._hvsr_array_engine.shutdown()
         # Archive loaders: their workers hold per-request read-only DB
         # connections and read SDS files; join them before the engine
         # (and its writers) tear down. Sever the sessionChanged →

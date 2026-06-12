@@ -183,3 +183,62 @@ def test_main_window_map_integration(qtbot: QtBot) -> None:
     window._device_panel.select_device("ghost")
     assert window._device_panel._selected_device_name() == "generic-dev"
     window.close()
+
+
+# ----------------------------------------------------------------------
+# f0 overlay (M5-B)
+# ----------------------------------------------------------------------
+def test_f0_overlay_colors_ramp_and_tip(qtbot: QtBot) -> None:
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.on_position(_resolved("dev-b", _POS_B))
+    widget.set_f0_overlay({"dev-a": 0.5, "dev-b": 5.0})
+    # Ramp endpoints: lowest f0 = blue end, highest = red end.
+    assert widget._spot_color_for_test("dev-a") == "#2860c0"
+    assert widget._spot_color_for_test("dev-b") == "#d04040"
+    # The hover tip carries the f0 line; the status mentions the overlay.
+    assert "f₀ = 0.50 Hz" in widget._spot_tip(0, 0, "dev-a")
+    assert "f₀ overlay" in widget._status_text_for_test()
+    # isHidden ignores hidden ancestors (the widget is never show()n here),
+    # so it pins the explicit setVisible toggle.
+    assert not widget._clear_f0_button.isHidden()
+    # Clearing restores the acquisition-state colour and hides the button.
+    widget.clear_f0_overlay()
+    assert widget._spot_color_for_test("dev-a") == _COLOR_IDLE
+    assert "f₀ overlay" not in widget._status_text_for_test()
+    assert widget._clear_f0_button.isHidden()
+
+
+def test_f0_overlay_single_value_is_midpoint(qtbot: QtBot) -> None:
+    widget = _widget(qtbot, ("dev-a",))
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.set_f0_overlay({"dev-a": 2.0})
+    assert widget._spot_color_for_test("dev-a") == "#7c5080"
+
+
+def test_f0_overlay_ignores_unknown_and_nonpositive(qtbot: QtBot) -> None:
+    widget = _widget(qtbot, ("dev-a",))
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.set_f0_overlay({"dev-a": -1.0, "ghost": 2.0})
+    assert widget._f0_overlay == {}
+    assert widget._spot_color_for_test("dev-a") == _COLOR_IDLE
+
+
+def test_f0_overlay_device_without_f0_keeps_state_color(qtbot: QtBot) -> None:
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.on_position(_resolved("dev-b", _POS_B))
+    widget.on_acquisition_state("dev-b", int(AcquisitionState.MONITORING))
+    widget.on_device_state("dev-b", int(ConnState.CONNECTED))
+    widget.set_f0_overlay({"dev-a": 2.0})
+    # Not measured ≠ measured-low: dev-b keeps its state colour.
+    assert widget._spot_color_for_test("dev-b") == _COLOR_MONITORING
+    assert widget._spot_color_for_test("dev-a") == "#7c5080"
+
+
+def test_set_devices_prunes_f0_overlay(qtbot: QtBot) -> None:
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.set_f0_overlay({"dev-a": 2.0})
+    widget.set_devices(("dev-b",))
+    assert widget._f0_overlay == {}

@@ -25,6 +25,7 @@ import time
 import numpy as np
 import pytest
 from obspy import UTCDateTime
+from PySide6.QtCore import Qt
 
 from echosmonitor.core import hvsr as hvsr_mod
 from echosmonitor.core.hvsr import HvsrResult, HvsrSettings, SesameCriterion
@@ -293,6 +294,56 @@ def test_stop_joins_within_bound_during_slow_cycle(qtbot, monkeypatch) -> None:
     assert calls == [_DEV_A], "stop must abort the cycle at the per-device boundary"
 
 
+def test_restart_after_join_timeout_rebuilds_worker(qtbot, monkeypatch) -> None:
+    """Auditor F2: a stop whose bounded join times out leaves the thread
+    finishing an uninterruptible compute with a quit() pending; once that
+    slot returns, exec() exits DISCARDING queued events (the recorded
+    postmortem race) and nothing restarts the thread — a new measurement
+    dispatched into it hangs in COMPUTING forever. _boot_worker must
+    detect the poisoned thread and rebuild, so the new run's compute
+    actually lands."""
+    import echosmonitor.core.hvsr_array as hvsr_array_mod
+
+    calls: list[str] = []
+
+    def _compute(self: hvsr_mod.HvsrAccumulator) -> HvsrResult:
+        calls.append(self._device)
+        if len(calls) == 1:
+            time.sleep(2.0)  # the uninterruptible first compute
+        return _dummy_result(self._device)
+
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", _compute)
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    try:
+        first = hv.start_measurement({_DEV_A: _group("STA")}, _settings(), _geometry())
+        _seed_windows(hv, _DEV_A, 3)
+        m = hv._measurement
+        assert m is not None
+        hv._request_recompute(m, force=True)
+        qtbot.waitUntil(lambda: bool(calls), timeout=2000)  # compute in flight
+        # Force the join to time out while the 2 s compute is still running.
+        monkeypatch.setattr(hvsr_array_mod, "_THREAD_JOIN_MS", 50)
+        hv.stop_measurement()
+        assert hv._join_timed_out
+        monkeypatch.setattr(hvsr_array_mod, "_THREAD_JOIN_MS", 8000)
+        # Immediate restart: must rebuild (the old thread is still busy)
+        # and the new run's forced compute must land, not hang.
+        second = hv.start_measurement({_DEV_A: _group("STA")}, _settings(), _geometry())
+        assert second != first
+        assert hv._abandoned, "expected the poisoned worker/thread to be abandoned"
+        _seed_windows(hv, _DEV_A, 3)
+        m2 = hv._measurement
+        assert m2 is not None
+        with qtbot.waitSignal(hv.arrayUpdated, timeout=5000) as blocker:
+            hv._request_recompute(m2, force=True)
+        result = blocker.args[0]
+        assert isinstance(result, ArrayHvsrResult)
+        assert result.measurement_id == second
+    finally:
+        hv.shutdown()  # drains the abandoned thread (bounded)
+    assert not hv._abandoned
+
+
 def test_start_stop_start_cycle(qtbot, monkeypatch) -> None:
     """The engine survives stop and computes again on a fresh measurement."""
     monkeypatch.setattr(
@@ -341,6 +392,48 @@ def test_window_override_targets_one_device(qtbot, monkeypatch) -> None:
         hv.shutdown()
 
 
+def test_worker_drops_superseded_cycle(qtbot, monkeypatch) -> None:
+    """Latest-wins token (skill §2): a stale queued compute from a stopped
+    run dies at the first check instead of burning a full N-device cycle
+    ahead of the new run's first honest result (auditor F3).
+
+    The worker slot is called directly (deterministic — the real path is a
+    posted event surviving quit() and dispatching on the next thread start).
+    """
+    from echosmonitor.core.hvsr_array import _ArrayComputeRequest
+
+    calls: list[str] = []
+
+    def _compute(self: hvsr_mod.HvsrAccumulator) -> HvsrResult:
+        calls.append(self._device)
+        return _dummy_result(self._device)
+
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", _compute)
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    mid = hv.start_measurement(_DEVICES, _settings(), _geometry())
+    try:
+        _seed_windows(hv, _DEV_A, 3)
+        m = hv._measurement
+        assert m is not None
+        emitted: list[object] = []
+        # Direct: the slot must run inside the compute() call itself, not on
+        # a later event-loop turn (the assertions are immediate).
+        hv._worker.computed.connect(emitted.append, Qt.ConnectionType.DirectConnection)
+        snapshot = m.stations[_DEV_A].accumulator.snapshot()
+        # A request from a DEAD measurement: dropped before any compute runs.
+        hv._worker.compute(_ArrayComputeRequest("hvsr-array-999", ((_DEV_A, snapshot),)))
+        assert calls == [] and emitted == []
+        # The live measurement's request still computes and announces.
+        hv._worker.compute(_ArrayComputeRequest(mid, ((_DEV_A, snapshot),)))
+        assert calls == [_DEV_A] and len(emitted) == 1
+        # After stop the token is cleared: even the old live id is dead.
+        hv.stop_measurement()
+        hv._worker.compute(_ArrayComputeRequest(mid, ((_DEV_A, snapshot),)))
+        assert calls == [_DEV_A] and len(emitted) == 1
+    finally:
+        hv.shutdown()
+
+
 def test_geometry_rides_result_and_unpositioned_is_explicit(qtbot, monkeypatch) -> None:
     """The start-time geometry snapshot is carried verbatim (rule 16)."""
     monkeypatch.setattr(
@@ -364,6 +457,78 @@ def test_geometry_rides_result_and_unpositioned_is_explicit(qtbot, monkeypatch) 
         hv.shutdown()
 
 
+def _archive_windows(n: int) -> list[tuple]:
+    rng = np.random.default_rng(4)
+    return [
+        (
+            rng.standard_normal(50),
+            rng.standard_normal(50),
+            rng.standard_normal(50),
+            UTCDateTime(i * _WL),
+            _FS,
+        )
+        for i in range(n)
+    ]
+
+
+def test_archive_run_one_shot_and_per_device_independent(qtbot, monkeypatch) -> None:
+    """M5-D: devA has archived windows, devB none — one forced cycle runs,
+    devA computes (provenance archive), devB stays selected with no result,
+    the measurement ends IDLE and the live timer never starts."""
+    monkeypatch.setattr(
+        hvsr_mod.HvsrAccumulator, "compute", lambda self: _dummy_result(self._device)
+    )
+    monkeypatch.setattr(
+        hvsr_mod,
+        "slice_archive_windows",
+        lambda reader, device, *a, **k: _archive_windows(3) if device == _DEV_A else [],
+    )
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    try:
+        with qtbot.waitSignal(hv.arrayUpdated, timeout=5000) as blocker:
+            mid = hv.start_archive_measurement(
+                _DEVICES,
+                UTCDateTime(0),
+                UTCDateTime(10),
+                _settings(),
+                _geometry(),
+                {_DEV_A: object(), _DEV_B: object()},  # type: ignore[dict-item]
+            )
+        assert mid
+        result = blocker.args[0]
+        assert isinstance(result, ArrayHvsrResult)
+        assert result.measurement_id == mid
+        assert result.provenance == "archive"
+        assert set(result.results) == {_DEV_A}
+        assert result.devices == (_DEV_A, _DEV_B)
+        m = hv._measurement
+        assert m is not None
+        assert m.state is HvsrState.IDLE  # one-shot: cycle done, idle
+        assert not hv._timer.isActive()  # archive runs never tick
+        # The accumulators are archive-provenance.
+        assert m.stations[_DEV_A].accumulator._provenance == "archive"
+    finally:
+        hv.shutdown()
+
+
+def test_archive_run_with_no_windows_anywhere_returns_empty(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(hvsr_mod, "slice_archive_windows", lambda *a, **k: [])
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    try:
+        mid = hv.start_archive_measurement(
+            _DEVICES,
+            UTCDateTime(0),
+            UTCDateTime(10),
+            _settings(),
+            _geometry(),
+            {_DEV_A: object(), _DEV_B: object()},  # type: ignore[dict-item]
+        )
+        assert mid == ""
+        assert hv.active_measurement() is None
+    finally:
+        hv.shutdown()
+
+
 def test_window_counts_track_totals_and_valid(qtbot, monkeypatch) -> None:
     monkeypatch.setattr(
         hvsr_mod.HvsrAccumulator, "compute", lambda self: _dummy_result(self._device)
@@ -371,7 +536,7 @@ def test_window_counts_track_totals_and_valid(qtbot, monkeypatch) -> None:
     ring = _FakeRingEngine()
     hv = HvsrArrayEngine(ring, None)  # type: ignore[arg-type]
     counts: list[dict[str, tuple[int, int]]] = []
-    hv.arrayWindowCounts.connect(lambda c: counts.append(dict(c)))
+    hv.arrayWindowCounts.connect(lambda _id, c: counts.append(dict(c)))
     hv.start_measurement(_DEVICES, _settings(), _geometry())
     try:
         with qtbot.waitSignal(hv.arrayUpdated, timeout=5000):

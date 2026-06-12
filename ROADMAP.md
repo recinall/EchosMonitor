@@ -654,13 +654,98 @@ array methods (SPAC/FK) are explicitly OUT of scope unless re-planned.
       race) could silently drop the one-shot archive compute — fixed with
       the FIFO stale-stop→clear→compute ordering + deterministic
       regression test (`test_archive_start_survives_stale_queued_stop`).
-- [ ] **B. UI**: device multi-select; overlay of N H/V curves; per-device f0
-      table (f0, σ, A0, SESAME verdicts); map overlay colouring markers by
-      f0 (uses M4) — the spatial-variation view.
-- [ ] **C. Report**: multi-station PDF/JSON export (extend
-      `storage/hvsr_report.py`): one section per station + the comparison
-      page with the geometry (positions, distances).
-- [ ] **D. Archive mode**: same analysis over a recorded session.
+- [x] **B. UI**: Done 2026-06-12. NEW `gui/widgets/hvsr_array_widget.py`
+      as its own "HVSR Array" central tab (the single-station tab stays
+      untouched): checkable (device, station) rows (duplicate-device
+      selection refused — the array is keyed by device, rule 16), ONE
+      shared settings row (skill `hvsr-array`), N mean-curve overlay one
+      colour per device with optional faint per-window curves (drawn as
+      ONE NaN-separated item per device — auditor F2: per-window items
+      would stall the GUI thread on long runs), per-device table (f0±σ,
+      T0, A0, windows, SESAME rel/clar with criterion tooltips, response
+      verdict verbatim, error). A0 annotated response-sensitive in three
+      places; "no position" note from the geometry diff. Map: blue→red
+      log-f0 ramp overlay (`set_f0_overlay`) — only devices with an
+      honest f0 are recoloured, others keep state colour; Clear-f₀
+      button; overlay persists across stop, cleared on the next array
+      start; an all-error cycle clears it (no stale colours over fresh
+      errors). MainWindow owns `HvsrArrayEngine`, injects
+      `PositionResolver.geometry` (rule 16), shuts the array engine down
+      before the streaming engine. Hardening from review (auditor
+      F3/F4): `_ArrayWorker` latest-wins `_active_id` token kills stale
+      queued cycles instantly; `arrayWindowCounts` now carries the
+      measurement id. Known accepted costs (auditor F1/F5, both
+      precedent-class): `responses_identical` runs ×N on the GUI thread
+      at start (cheap when no response metadata is configured — the
+      Echos norm); an interactive stop mid-compute can block up to the
+      8 s bounded join. Tests: `tests/gui/test_hvsr_array_widget.py`,
+      f0-overlay cases in `test_map_widget.py`, MainWindow route via the
+      REAL engine signals, smoke tab list updated consciously.
+- [x] **C. Report**: Done 2026-06-12 (landed with B — the export glue
+      lives in B's new widget). `storage/hvsr_report.py` gains
+      `ArrayReportContext`, `array_result_to_dict` /
+      `export_hvsr_array_json` (schema `echosmonitor.hvsr-array/1`; each
+      station embeds its FULL single-station `echosmonitor.hvsr/1`
+      structure, so the array file is a superset), pure
+      `array_comparison_lines` and `write_hvsr_array_pdf`: ONE comparison
+      page (N mean-curve overlay — never a cross-station average — + the
+      f0/SESAME/response table + GEOMETRY block: positions with source,
+      sorted inter-station distances, unpositioned diff, A0
+      response-sensitivity note) then the existing per-station renderers
+      reused per valid station. Stations without a valid result appear on
+      the comparison page only. Widget: Save report…/Export JSON… gated
+      on ≥1 valid station. Tests:
+      `tests/storage/test_hvsr_array_report.py`.
+- [x] **D. Archive mode**: Done 2026-06-12.
+      `HvsrArrayEngine.start_archive_measurement(devices, t0, t1,
+      settings, geometry, readers)`: per-device
+      `slice_archive_windows` (windows stay per-device independent — a
+      gappy device just contributes fewer; no-window devices stay
+      selected but never enter the compute), archive-provenance
+      accumulators, ONE forced off-thread cycle ending IDLE (one-shot),
+      live timer never started; returns `""` when no device has a
+      gap-free 3C window. Slicing is the documented one-shot INLINE read
+      on the calling thread (M3-E precedent). Widget: archive from/to
+      row + "Run on archive" driving a host-injected handler (the widget
+      stays free of ArchiveReader construction); `_live_running` split
+      from `_measurement_id` so an archive run is never a LIVE
+      measurement (decision-log constraint upheld). Root seam (rule 14):
+      `MainWindow._run_hvsr_array_archive` — a session selected in the
+      Archive tab roots EVERY checked device at that SESSION root (one
+      shared reader; the pull-based counterpart of the single-station
+      hand-off ctx), else per-device `engine.archive_root`. Tests: core
+      one-shot/per-device-independent/no-windows; widget handler
+      contract + no-data message; MainWindow root resolution both ways.
+      Review round (code-reviewer APPROVE, auditor PASS w/ follow-ups):
+      auditor F2 FIXED (mutation-verified) — a stop whose bounded join
+      times out leaves the thread finishing an uninterruptible compute
+      with `quit()` pending; exec() then exits discarding queued events
+      (the postmortem race) and a new measurement dispatched into it
+      hung forever. `_boot_worker` now detects the poisoned thread,
+      severs + abandons the (worker, thread) pair and rebuilds fresh;
+      `shutdown()` drains abandoned threads bounded
+      (`test_restart_after_join_timeout_rebuilds_worker`). Also from
+      review: slicing loop got an elapsed/per-device-counts log (rule
+      7); the engine's pre-return counts emit (dead toward its only
+      consumer) replaced by widget-side seeding from
+      `active_measurement()`; archive report GEOMETRY block carries the
+      "positions resolved at RUN time, not recording time" honesty note
+      (no archived position source exists); reentrant `_on_stopped`
+      inside the archive click pinned by test. **Follow-ups (recorded,
+      not blocking)**: (1) move the ×N inline archive slicing onto a
+      one-shot worker (auditor F1 — the M3-E ×1 precedent's budget
+      changed; the elapsed log is the interim observability); (2)
+      `HvsrEngine` shares the pre-rebuild join-timeout skeleton flaw —
+      port the poisoned-thread rebuild; (3) surface WHICH root was
+      searched in the widget's no-data message (a stale Archive-tab
+      session selection reads as "no data" with no hint).
+
+**M5 CLOSED 2026-06-12** — array engine (A), UI + map f0 overlay (B),
+multi-station report (C), archive mode (D); gate at close: 1059 passed /
+5 perf-deselected, ruff + mypy --strict clean. Open question 5 resolved
+(per-device independent windows). Follow-ups carried into M6: array
+archive slicing onto a worker (auditor F1), HvsrEngine poisoned-thread
+rebuild port, no-data root surfacing.
 
 ## M6 — Hardening & polish
 
@@ -770,6 +855,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M4-A: `configure` AND `refresh` bump the latest-wins generation (written to the worker even when the dispatch set is empty); `refresh_device` deliberately does not; `shutdown()` is terminal | Both reviewers: an empty/fully-cached configure left the in-flight sweep fetching removed devices (results discarded but network work wasted), and N rapid refreshes queued N un-superseded full sweeps (rule 5 — the only unbounded seam in the file). A single-device refresh bumping the global generation would discard every other device's in-flight result to save one duplicate fetch. Regression tests verified to fail pre-fix. |
 | 2026-06-12 | M4-B (open question 4): the Map tab is a **pyqtgraph scatter in a local east/north metre frame** — no tile stack, no QtWebEngine, no new dependency | The fleet is a handful of nodes deployed metres-to-km apart for array work: the user needs *relative geometry* (who is where, how far — exactly what M5 consumes), not basemap context. pyqtgraph is offline-by-construction (field laptops) and is the stack every other tab ships; CLAUDE.md already prefers this. The frame is metres E/N of the positioned-device centroid, aspect-locked 1:1 so the on-screen shape IS the array shape; absolute lat/lon/elev/source live in the marker hover tip. Revisit web tiles only on a real field need, as an isolated optional widget. |
 | 2026-06-12 | M4-B: position resolution runs from launch (configure on every configChanged), like the M1-C status poller | Rule 13's "nothing starts without the user" governs *acquisition* (the engine); positions are passive credential-less fleet metadata, the same sanctioned class as the status poller. The Map tab also works before any device is started — which is when the field user is placing instruments. |
+| 2026-06-12 | M5-D: the array archive run roots at the Archive tab's **currently selected session** (pull-based, one shared reader for all checked devices); with no selection each device falls back to its live `engine.archive_root` | The single-station hand-off ctx (M3-E) is push-based and keyed to one device + interval; an array run spans N devices, and the selected session's root is the only honest reach into a CLOSED session's per-device SDS trees (rule 14). The user flow is explicit: pick the session in the Archive tab, then run the array over it. |
 | 2026-06-12 | M5-A (open question 5): array windowing is **per-device independent** — each device accumulates its own gap-free disjoint windows (own `last_window_end` cursor); the common-window gate (accept only when ALL devices cover the same span) is a deferred optional toggle | Skill `hvsr-array`: independent windows degrade gracefully (a flaky device just contributes fewer windows; it can never collapse the whole array's throughput) and stay honest — curves remain comparable because the interval and the one shared settings panel are identical across stations. Common windows buy stricter comparability at the cost of throughput hostage-taking by the weakest device; revisit on a real field need and surface per-device rejection reasons then. |
 
 ## Open questions (resolve before the milestone that needs them)

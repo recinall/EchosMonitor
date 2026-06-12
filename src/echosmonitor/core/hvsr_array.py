@@ -40,11 +40,13 @@ This module imports no ``hvsrpy`` (the boundary lives in
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import numpy as np
 import structlog
 from obspy.core.utcdatetime import UTCDateTime
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
@@ -62,6 +64,7 @@ from echosmonitor.core.positions import StationGeometry
 if TYPE_CHECKING:
     from echosmonitor.core.response import ResponseProvider
     from echosmonitor.core.streaming_engine import StreamingEngine
+    from echosmonitor.storage.archive_reader import ArchiveReader
 
 _log = structlog.get_logger(__name__)
 
@@ -187,19 +190,28 @@ class _ArrayWorker(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._stop = False
+        # Latest-wins token (skill §2): the engine writes the live
+        # measurement id GIL-atomically; a stale queued compute (its posted
+        # event can survive quit() and dispatch on the next thread start)
+        # dies at the first check instead of burning a full N-device cycle
+        # ahead of the new run's first honest result.
+        self._active_id = ""
+
+    def _superseded(self, request: _ArrayComputeRequest) -> bool:
+        return self._stop or request.measurement_id != self._active_id
 
     @Slot(object)
     def compute(self, request: object) -> None:
         if not isinstance(request, _ArrayComputeRequest):  # defensive (type-erased)
             return
-        if self._stop:
+        if self._superseded(request):
             return
         t0 = time.monotonic()
         results: dict[str, HvsrResult] = {}
         errors: dict[str, str] = {}
         for device, accumulator in request.accumulators:
-            if self._stop:
-                return  # stopped mid-cycle — do not announce a partial cycle
+            if self._superseded(request):
+                return  # stopped/superseded mid-cycle — do not announce
             try:
                 results[device] = accumulator.compute()
             except Exception as exc:  # never crash the worker thread
@@ -210,8 +222,8 @@ class _ArrayWorker(QObject):
                     error=str(exc),
                 )
                 errors[device] = str(exc)
-        if self._stop:
-            return  # stopped after the last device — do not announce
+        if self._superseded(request):
+            return  # stopped/superseded after the last device — do not announce
         elapsed = (time.monotonic() - t0) * 1000.0
         self.computed.emit(_ArrayComputeResult(request.measurement_id, results, errors, elapsed))
 
@@ -236,8 +248,8 @@ class HvsrArrayEngine(QObject):
     arrayMeasurementStarted = Signal(str, object)  # id, ArrayHvsrSummary  # noqa: N815
     arrayMeasurementStopped = Signal(str)  # id  # noqa: N815
     arrayUpdated = Signal(object)  # ArrayHvsrResult  # noqa: N815
-    # Live accumulation progress: {device: (n_valid, n_total)}.
-    arrayWindowCounts = Signal(object)  # noqa: N815
+    # Live accumulation progress: id, {device: (n_valid, n_total)}.
+    arrayWindowCounts = Signal(str, object)  # noqa: N815
     arrayStateChanged = Signal(str, str)  # id, state.value  # noqa: N815
     arrayBackpressure = Signal(str, int)  # id, skipped  # noqa: N815
 
@@ -257,24 +269,47 @@ class HvsrArrayEngine(QObject):
         self._provider = provider
         self._measurement: _ArrayMeasurement | None = None
         self._seq = 0
+        # Set when a stop's bounded join timed out: the thread is still
+        # finishing an uninterruptible compute with a quit() pending, and
+        # once that slot returns exec() exits DISCARDING queued events (the
+        # recorded postmortem race) — a new measurement dispatched into it
+        # would hang forever. _boot_worker rebuilds in that case.
+        self._join_timed_out = False
+        # Abandoned (worker, thread) pairs kept alive until shutdown so a
+        # still-running QThread object is never garbage-collected.
+        self._abandoned: list[tuple[_ArrayWorker, QThread]] = []
 
-        self._worker = _ArrayWorker()
-        self._array_thread = QThread()
-        self._array_thread.setObjectName("hvsr-array-worker")
-        self._worker.moveToThread(self._array_thread)
-
-        # Worker → engine: QueuedConnection so the slot runs on the GUI thread.
-        self._worker.computed.connect(self._on_computed, Qt.ConnectionType.QueuedConnection)
-        # Engine → worker: QueuedConnection so the slot body runs on the worker.
-        self._computeRequested.connect(self._worker.compute, Qt.ConnectionType.QueuedConnection)
-        self._stopRequested.connect(self._worker.request_stop, Qt.ConnectionType.QueuedConnection)
-        self._clearStopRequested.connect(
-            self._worker.clear_stop, Qt.ConnectionType.QueuedConnection
-        )
+        self._worker, self._array_thread = self._make_worker()
 
         # GUI-thread pull timer (live mode). Interval set per measurement.
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def _make_worker(self) -> tuple[_ArrayWorker, QThread]:
+        worker = _ArrayWorker()
+        thread = QThread()
+        thread.setObjectName("hvsr-array-worker")
+        worker.moveToThread(thread)
+        # Worker → engine: QueuedConnection so the slot runs on the GUI thread.
+        worker.computed.connect(self._on_computed, Qt.ConnectionType.QueuedConnection)
+        # Engine → worker: QueuedConnection so the slot body runs on the worker.
+        self._computeRequested.connect(worker.compute, Qt.ConnectionType.QueuedConnection)
+        self._stopRequested.connect(worker.request_stop, Qt.ConnectionType.QueuedConnection)
+        self._clearStopRequested.connect(worker.clear_stop, Qt.ConnectionType.QueuedConnection)
+        return worker, thread
+
+    def _disconnect_worker(self, worker: _ArrayWorker) -> None:
+        """Sever an abandoned worker so it can never announce or receive."""
+        worker._stop = True
+        worker._active_id = ""
+        for signal, slot in (
+            (worker.computed, self._on_computed),
+            (self._computeRequested, worker.compute),
+            (self._stopRequested, worker.request_stop),
+            (self._clearStopRequested, worker.clear_stop),
+        ):
+            with contextlib.suppress(RuntimeError, TypeError):
+                signal.disconnect(slot)
 
     # ------------------------------------------------------------------
     # Public API
@@ -297,6 +332,115 @@ class HvsrArrayEngine(QObject):
             ValueError: empty selection, or a group missing a Z/N/E entry —
                 caller (UI) bugs, surfaced loudly on the GUI thread.
         """
+        self._validate_selection(devices)
+        self.stop_measurement()
+        self._seq += 1
+        measurement_id = f"hvsr-array-{self._seq}"
+        stations = self._build_stations(devices, settings, UTCDateTime(), provenance="live")
+        m = _ArrayMeasurement(
+            measurement_id=measurement_id,
+            stations=stations,
+            settings=settings,
+            geometry=geometry,
+            live=True,
+        )
+        self._measurement = m
+        self._boot_worker(measurement_id)
+        self._set_state(m, HvsrState.ACCUMULATING)
+        self.arrayMeasurementStarted.emit(measurement_id, self._summary(m))
+        # Tick fast enough to notice a full fresh window promptly; the capture
+        # cadence itself is gated on data availability, not the timer rate.
+        interval_ms = max(100, int(settings.window_length_s / 4.0 * 1000.0))
+        self._timer.setInterval(interval_ms)
+        self._timer.start()
+        return measurement_id
+
+    def start_archive_measurement(
+        self,
+        devices: Mapping[str, Mapping[str, str]],
+        t_start: UTCDateTime,
+        t_end: UTCDateTime,
+        settings: HvsrSettings,
+        geometry: StationGeometry,
+        readers: Mapping[str, ArchiveReader],
+    ) -> str:
+        """Run the array analysis over an archived ``[t_start, t_end]`` (M5-D).
+
+        Mirrors the single-station archive flow: slicing is a deliberate
+        one-shot INLINE read on the calling thread (a user action over a
+        bounded range, not the live data path — rule 11 does not apply),
+        per device via :func:`~echosmonitor.core.hvsr.slice_archive_windows`
+        (windows stay per-device independent — a device with gaps just
+        contributes fewer windows); then ONE forced off-thread cycle.
+        ``readers`` maps each device to its (possibly shared, session-rooted
+        — rule 14) :class:`ArchiveReader`. Returns the measurement id, or
+        ``""`` when NO device has a gap-free 3C window (caller surfaces
+        "no data"). Devices with no windows stay selected (they appear on
+        the comparison page as "no result") but never enter the compute.
+        """
+        from echosmonitor.core.hvsr import slice_archive_windows
+
+        self._validate_selection(devices)
+        self.stop_measurement()
+        t0 = time.monotonic()
+        windows_by_device: dict[
+            str, list[tuple[np.ndarray, np.ndarray, np.ndarray, UTCDateTime, float]]
+        ] = {}
+        for device, group in devices.items():
+            reader = readers.get(device)
+            if reader is None:
+                _log.warning("hvsr_array_archive_no_reader", device=device)
+                continue
+            windows = slice_archive_windows(
+                reader, device, dict(group), t_start, t_end, settings
+            )
+            if windows:
+                windows_by_device[device] = windows
+            else:
+                _log.info("hvsr_array_archive_no_windows", device=device)
+        # Rule 7 observability: the inline read budget scales with N devices
+        # and the user-chosen range (the ROADMAP follow-up tracks moving it
+        # onto a one-shot worker).
+        _log.info(
+            "hvsr_array_archive_sliced",
+            elapsed_ms=round((time.monotonic() - t0) * 1000.0, 1),
+            windows={device: len(w) for device, w in windows_by_device.items()},
+            devices=len(devices),
+        )
+        if not windows_by_device:
+            return ""
+        self._seq += 1
+        measurement_id = f"hvsr-array-{self._seq}"
+        stations = self._build_stations(devices, settings, t_start, provenance="archive")
+        for device, windows in windows_by_device.items():
+            accumulator = stations[device].accumulator
+            for window in windows:
+                try:
+                    accumulator.add_window(*window)
+                except Exception as exc:
+                    _log.warning(
+                        "hvsr_array_archive_add_window_failed", device=device, error=str(exc)
+                    )
+        if not any(s.accumulator.n_windows for s in stations.values()):
+            return ""
+        m = _ArrayMeasurement(
+            measurement_id=measurement_id,
+            stations=stations,
+            settings=settings,
+            geometry=geometry,
+            live=False,
+        )
+        self._measurement = m
+        self._boot_worker(measurement_id)
+        self._set_state(m, HvsrState.ACCUMULATING)
+        # No counts emit here: it would fire before the caller learns the
+        # id and be dropped by the widget's id guard — the caller seeds
+        # counts from active_measurement() instead (reviewer F3).
+        self.arrayMeasurementStarted.emit(measurement_id, self._summary(m))
+        self._request_recompute(m, force=True)  # single off-thread cycle
+        return measurement_id
+
+    def _validate_selection(self, devices: Mapping[str, Mapping[str, str]]) -> None:
         if not devices:
             raise ValueError("array HVSR needs at least one device")
         for device, group in devices.items():
@@ -306,15 +450,20 @@ class HvsrArrayEngine(QObject):
                 raise ValueError(
                     f"device {device!r} group must be exactly Z/N/E, got {sorted(group)}"
                 )
-        self.stop_measurement()
-        self._seq += 1
-        measurement_id = f"hvsr-array-{self._seq}"
-        now = UTCDateTime()
+
+    def _build_stations(
+        self,
+        devices: Mapping[str, Mapping[str, str]],
+        settings: HvsrSettings,
+        t: UTCDateTime,
+        *,
+        provenance: Provenance,
+    ) -> dict[str, _Station]:
         stations: dict[str, _Station] = {}
         for device, group in devices.items():
             # The counts-honesty layer runs PER DEVICE (skill hvsr-array);
             # each verdict rides that device's HvsrResult verbatim.
-            same_response, detail = responses_identical(self._provider, device, dict(group), now)
+            same_response, detail = responses_identical(self._provider, device, dict(group), t)
             nslc_ref = group.get("Z") or next(iter(group.values()))
             station_key = ".".join(nslc_ref.split(".")[:2])
             stations[device] = _Station(
@@ -326,30 +475,30 @@ class HvsrArrayEngine(QObject):
                     same_response_detail=detail,
                     device=device,
                     station_key=station_key,
-                    provenance="live",
+                    provenance=provenance,
                 ),
                 same_response=same_response,
             )
-        m = _ArrayMeasurement(
-            measurement_id=measurement_id,
-            stations=stations,
-            settings=settings,
-            geometry=geometry,
-            live=True,
-        )
-        self._measurement = m
+        return stations
+
+    def _boot_worker(self, measurement_id: str) -> None:
+        if self._join_timed_out:
+            # The prior stop's join timed out: the thread is (probably)
+            # still inside an uninterruptible compute with a quit() pending.
+            # Dispatching into it would be silently discarded when exec()
+            # exits (auditor F2). One brief second chance, else abandon the
+            # poisoned pair and rebuild fresh.
+            if self._array_thread.isRunning() and not self._array_thread.wait(100):
+                _log.warning("hvsr_array_worker_rebuilt_after_join_timeout")
+                self._disconnect_worker(self._worker)
+                self._abandoned.append((self._worker, self._array_thread))
+                self._worker, self._array_thread = self._make_worker()
+            self._join_timed_out = False
         if not self._array_thread.isRunning():
             self._array_thread.start()
         self._clearStopRequested.emit()  # reset a stop flag from a prior run
         self._worker._stop = False
-        self._set_state(m, HvsrState.ACCUMULATING)
-        self.arrayMeasurementStarted.emit(measurement_id, self._summary(m))
-        # Tick fast enough to notice a full fresh window promptly; the capture
-        # cadence itself is gated on data availability, not the timer rate.
-        interval_ms = max(100, int(settings.window_length_s / 4.0 * 1000.0))
-        self._timer.setInterval(interval_ms)
-        self._timer.start()
-        return measurement_id
+        self._worker._active_id = measurement_id  # latest-wins token (skill §2)
 
     def set_window_override(
         self, measurement_id: str, device: str, window_id: int, accepted: bool
@@ -382,11 +531,13 @@ class HvsrArrayEngine(QObject):
         # the next per-device boundary; the queued request_stop is a
         # belt-and-suspenders for the idle-worker case.
         self._worker._stop = True
+        self._worker._active_id = ""  # supersede any queued/in-flight cycle
         self._stopRequested.emit()
         if self._array_thread.isRunning():
             self._array_thread.quit()
             if not self._array_thread.wait(_THREAD_JOIN_MS):
                 _log.warning("hvsr_array_thread_join_timeout", measurement=m.measurement_id)
+                self._join_timed_out = True  # next boot rebuilds if still stuck
         self._set_state(m, HvsrState.IDLE)
         stopped_id = m.measurement_id
         self._measurement = None
@@ -398,11 +549,20 @@ class HvsrArrayEngine(QObject):
         return None if m is None else self._summary(m)
 
     def shutdown(self) -> None:
-        """Tear down for app exit — stop the measurement and the thread."""
+        """Tear down for app exit — stop the measurement and every thread."""
         self.stop_measurement()
         if self._array_thread.isRunning():
             self._array_thread.quit()
             self._array_thread.wait(_THREAD_JOIN_MS)
+        # Drain any threads abandoned by a poisoned-thread rebuild: their
+        # severed workers can no longer announce, but a still-running
+        # QThread must be joined (bounded) before the process exits.
+        for _worker, thread in self._abandoned:
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(_THREAD_JOIN_MS):
+                    _log.warning("hvsr_array_abandoned_thread_join_timeout")
+        self._abandoned.clear()
 
     # ------------------------------------------------------------------
     # Internal — live accumulation
@@ -445,7 +605,7 @@ class HvsrArrayEngine(QObject):
             any_added = True
         if not any_added:
             return
-        self.arrayWindowCounts.emit(self._window_counts(m))
+        self.arrayWindowCounts.emit(m.measurement_id, self._window_counts(m))
         self._request_recompute(m, force=False)
 
     def _request_recompute(self, m: _ArrayMeasurement, *, force: bool) -> None:
@@ -489,7 +649,7 @@ class HvsrArrayEngine(QObject):
             station = m.stations.get(device)
             if station is not None:
                 station.n_windows_valid = result.n_windows_valid
-        self.arrayWindowCounts.emit(self._window_counts(m))
+        self.arrayWindowCounts.emit(m.measurement_id, self._window_counts(m))
         self.arrayUpdated.emit(
             ArrayHvsrResult(
                 measurement_id=m.measurement_id,
@@ -503,11 +663,9 @@ class HvsrArrayEngine(QObject):
             )
         )
         if not m.live:
-            # Stage-D forward reference: today the only constructor path is
-            # start_measurement (live=True), so this branch is unreachable
-            # until the archive mode lands. Archive runs are one-shot: the
-            # single cycle is done; stay selectable for manual override
-            # (which re-dispatches), but the measurement is otherwise idle.
+            # Archive runs are one-shot (M5-D): the single cycle is done;
+            # stay selectable for manual override (which re-dispatches),
+            # but the measurement is otherwise idle.
             self._set_state(m, HvsrState.IDLE)
         elif m.state is HvsrState.COMPUTING:
             self._set_state(m, HvsrState.ACCUMULATING)
