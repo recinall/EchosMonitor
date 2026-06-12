@@ -71,6 +71,46 @@ def test_active_calibration_appears_in_column(qtbot: Any) -> None:
     assert "Calibration: done" in panel._echos_tooltip_for_test("echos-field-01")
 
 
+def test_clock_health_token_in_column(qtbot: Any) -> None:
+    """M6: the clock verdict is first-class column health, not tooltip
+    trivia — one token per closed ClockHealth state, with the "(!)"
+    attention suffix on the unsynced state."""
+    panel = _make_panel(qtbot)
+    panel.on_echos_snapshot(_snapshot())  # gnss fix + pps locked
+    assert "clk PPS" in panel._echos_text_for_test("echos-field-01")
+    panel.on_echos_snapshot(_snapshot(pps_locked=False))
+    assert "clk GNSS" in panel._echos_text_for_test("echos-field-01")
+    panel.on_echos_snapshot(
+        _snapshot(gnss_fix=False, gnss_satellites=0, pps_locked=False, ntp_synchronized=True)
+    )
+    assert "clk NTP" in panel._echos_text_for_test("echos-field-01")
+    panel.on_echos_snapshot(
+        _snapshot(gnss_fix=False, gnss_satellites=0, pps_locked=False, time_synchronized=True)
+    )
+    assert "clk hold (!)" in panel._echos_text_for_test("echos-field-01")
+    panel.on_echos_snapshot(_snapshot(gnss_fix=False, gnss_satellites=0, pps_locked=False))
+    assert "clk none (!)" in panel._echos_text_for_test("echos-field-01")
+
+
+def test_clock_health_tooltip_detail(qtbot: Any) -> None:
+    """M6: the tooltip carries the verdict sentence, the firmware's
+    free-form sync string verbatim, and the PPS offset when locked."""
+    panel = _make_panel(qtbot)
+    panel.on_echos_snapshot(_snapshot(time_sync_type="RMC+PPS+NTP", pps_offset_us=-4))
+    tooltip = panel._echos_tooltip_for_test("echos-field-01")
+    assert "PPS locked" in tooltip
+    assert "sync RMC+PPS+NTP" in tooltip
+    assert "PPS offset -4" in tooltip
+    panel.on_echos_snapshot(_snapshot(gnss_fix=False, gnss_satellites=0, pps_locked=False))
+    tooltip = panel._echos_tooltip_for_test("echos-field-01")
+    assert "NOT SYNCHRONIZED" in tooltip
+    assert "PPS offset" not in tooltip  # offset is meaningless unlocked
+    panel.on_echos_snapshot(
+        _snapshot(gnss_fix=False, gnss_satellites=0, pps_locked=False, time_synchronized=True)
+    )
+    assert "holdover" in panel._echos_tooltip_for_test("echos-field-01")
+
+
 def test_no_gnss_fix_is_explicit(qtbot: Any) -> None:
     panel = _make_panel(qtbot)
     panel.on_echos_snapshot(_snapshot(gnss_fix=False, gnss_satellites=0, pps_locked=False))

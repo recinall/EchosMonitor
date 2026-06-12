@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from echosmonitor.core.models import ConnState, DeviceStatus, StreamID, StreamSelector
+from echosmonitor.core.models import (
+    ClockHealth,
+    ConnState,
+    DeviceStatus,
+    EchosDeviceSnapshot,
+    StreamID,
+    StreamSelector,
+)
 
 
 def test_stream_id_nslc_property() -> None:
@@ -46,3 +53,49 @@ def test_device_status_defaults() -> None:
     assert s.last_error is None
     assert s.packets_received == 0
     assert s.bytes_received == 0
+
+
+def _clock_snapshot(**overrides: object) -> EchosDeviceSnapshot:
+    base: dict[str, object] = {
+        "device": "echos-field-01",
+        "firmware_version": "1.4.2",
+        "uptime_s": 60.0,
+        "gnss_fix": False,
+        "gnss_satellites": 0,
+        "pps_locked": False,
+        "clients_connected": 0,
+        "ring_used_pct": 0.0,
+        "calibration_state": "idle",
+        "polled_at": 1.0,
+    }
+    base.update(overrides)
+    return EchosDeviceSnapshot(**base)  # type: ignore[arg-type]
+
+
+def test_clock_health_verdict_ladder() -> None:
+    """M6: the closed verdict derives from booleans only, best → worst.
+
+    ``time_sync_type`` is a free-form firmware composite ("RMC+PPS+NTP")
+    and must never influence the verdict.
+    """
+    assert _clock_snapshot(gnss_fix=True, pps_locked=True).clock_health() is ClockHealth.PPS
+    assert _clock_snapshot(gnss_fix=True).clock_health() is ClockHealth.GNSS
+    assert _clock_snapshot(ntp_synchronized=True).clock_health() is ClockHealth.NTP
+    # time_synchronized ALONE is holdover (clock set once, every live
+    # source gone, crystal drifting) — never reported as NTP (reviewer
+    # finding: that would claim a source/accuracy the device never said).
+    assert _clock_snapshot(time_synchronized=True).clock_health() is ClockHealth.HOLDOVER
+    assert _clock_snapshot().clock_health() is ClockHealth.UNSYNCED
+    # PPS lock without GNSS time is a transient — never reported as PPS.
+    assert _clock_snapshot(pps_locked=True).clock_health() is ClockHealth.UNSYNCED
+    # The free-form string alone proves nothing.
+    assert _clock_snapshot(time_sync_type="RMC+PPS+NTP").clock_health() is ClockHealth.UNSYNCED
+
+
+def test_clock_fields_default_pessimistic() -> None:
+    """Constructors that predate M6 can only ever err toward UNSYNCED."""
+    snapshot = _clock_snapshot()
+    assert snapshot.time_synchronized is False
+    assert snapshot.ntp_synchronized is False
+    assert snapshot.time_sync_type == ""
+    assert snapshot.pps_offset_us == 0

@@ -777,7 +777,20 @@ rebuild port, no-data root surfacing.
 - [ ] First-run wizard rewritten for Echos (discover device on
       `192.168.4.1` AP / mDNS `*.local`, set admin password, add device).
 - [ ] mDNS discovery of Echos nodes on the LAN (optional, zeroconf).
-- [ ] Device clock/GNSS health surfaced (PPS lock from status poller).
+- [x] Device clock/GNSS health surfaced (PPS lock from status poller).
+      *Done 2026-06-12:* `ClockHealth` closed verdict (PPS > GNSS > NTP >
+      HOLDOVER > UNSYNCED) derived on `EchosDeviceSnapshot` from the
+      `/api/status` sync BOOLEANS only (`time_sync_type` is a free-form
+      firmware composite — display-only); snapshot carries
+      `time_synchronized`/`ntp_synchronized`/`time_sync_type`/
+      `pps_offset_us` with pessimistic defaults. DevicePanel Echos column
+      shows the token (`clk PPS` … `clk hold (!)` / `clk none (!)` as
+      attention states); tooltip carries the honest accuracy sentence +
+      firmware sync string + PPS offset when locked. HOLDOVER exists
+      because `time_synchronized` alone (clock set once, all live sources
+      lost, crystal drifting) must never read as "NTP, network accuracy"
+      (reviewer MAJOR on the first cut). Tests at models/poller/panel
+      layers, verdict ladder mutation-verified.
 - [ ] Settings dialog (archive root, theme, display caps).
 - [ ] Docs: user manual for the field workflow (deploy → configure →
       record → HVSR → report).
@@ -886,6 +899,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6-0: during an archive cycle the worker OWNS the stations' accumulators; the engine/UI read only engine-side `_Station.n_windows_total`, and `set_window_override` + `_request_recompute` are pending-gated | The accumulators are filled in place on the worker (snapshotting N devices' window lists would double memory for nothing); the ownership convention plus the pending-first gate removes every cross-thread accumulator touch instead of blessing "GIL-safe" racy reads. Known cost: a second override during a post-slice pending recompute is dropped (warn-logged) — `slice_inflight` flag if it ever matters. |
 | 2026-06-12 | M6-0: a cycle where EVERY device's slice read raised announces the per-device errors as an empty-results `arrayUpdated`, never `arrayArchiveNoData` | "No archived data in that range" when the truth is N I/O failures sends the user hunting for a time-range mistake that does not exist; the errors ride the result so the table's per-device status column shows the real cause (reviewer finding on the first M6-0 cut). |
 | 2026-06-12 | M6-0: both HVSR engines' shutdown RETAINS abandoned worker/thread pairs whose bounded join timed out (drain retries on the next shutdown; no cap, count logged) | Dropping the last Python reference to a running QThread is a hard Qt abort (destroyed-while-running) — the mutation run literally crashed the interpreter. A cap is impossible without dropping a running reference, so the logged `abandoned=` count is the rule-5 observability compromise. |
+| 2026-06-12 | M6 clock health: `ClockHealth` derives from the `/api/status` BOOLEANS only; `time_sync_type` is display-only; `time_synchronized` alone = **HOLDOVER** (attention), never NTP | The firmware's sync-type string is an unpinned composite ("RMC+PPS+NTP" on fw 1aa72cbe) — branching on it would break on the next firmware wording. And a clock that was set once but has no live source is a free-running ESP32 crystal (seconds/day drift): reporting it as "NTP, network accuracy" is exactly the false-"synchronized" the model promises never to emit. |
 
 ## Open questions (resolve before the milestone that needs them)
 

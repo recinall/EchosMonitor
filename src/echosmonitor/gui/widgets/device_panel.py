@@ -40,7 +40,12 @@ from PySide6.QtWidgets import (
 )
 
 from echosmonitor.core.exceptions import ConfigError
-from echosmonitor.core.models import AcquisitionState, ConnState, EchosDeviceSnapshot
+from echosmonitor.core.models import (
+    AcquisitionState,
+    ClockHealth,
+    ConnState,
+    EchosDeviceSnapshot,
+)
 
 if TYPE_CHECKING:
     from echosmonitor.core.config_store import ConfigStore
@@ -165,6 +170,29 @@ def _format_uptime(seconds: float) -> str:
     return f"{s // 86400}d"
 
 
+# Compact clock-health tokens for the Echos column (M6). UNSYNCED carries
+# the same "(!)" attention suffix the Stats column uses for archive errors.
+_CLOCK_TOKENS = {
+    ClockHealth.PPS: "clk PPS",
+    ClockHealth.GNSS: "clk GNSS",
+    ClockHealth.NTP: "clk NTP",
+    ClockHealth.HOLDOVER: "clk hold (!)",
+    ClockHealth.UNSYNCED: "clk none (!)",
+}
+
+# One honest sentence per verdict for the tooltip (M6): what the clock
+# discipline means for the recorded timestamps.
+_CLOCK_DETAILS = {
+    ClockHealth.PPS: "GNSS-disciplined, PPS locked — sample-accurate timestamps",
+    ClockHealth.GNSS: "GNSS time, PPS not locked — second-accurate timestamps",
+    ClockHealth.NTP: "NTP-synchronized (no GNSS) — network-accuracy timestamps",
+    ClockHealth.HOLDOVER: (
+        "previously synchronized, all time sources lost — clock in holdover, drifting"
+    ),
+    ClockHealth.UNSYNCED: "NOT SYNCHRONIZED — timestamps unreliable",
+}
+
+
 def _format_echos_text(snapshot: EchosDeviceSnapshot) -> str:
     """Compose the compact Echos column text for one device.
 
@@ -174,6 +202,9 @@ def _format_echos_text(snapshot: EchosDeviceSnapshot) -> str:
     sit in the column for days; both are visible in the tooltip instead.
     (The real firmware's in-sweep vocabulary is not pinned yet, so the
     filter is an exclusion list, not an allowlist.)
+
+    The clock token (M6) is always present: on a seismic node the clock
+    discipline is first-class health, not tooltip trivia.
     """
     gnss = f"GNSS {snapshot.gnss_satellites}sat" if snapshot.gnss_fix else "GNSS no fix"
     parts = [
@@ -182,6 +213,7 @@ def _format_echos_text(snapshot: EchosDeviceSnapshot) -> str:
         f"{snapshot.clients_connected} cli",
         f"ring {snapshot.ring_used_pct:.0f}%",
         gnss,
+        _CLOCK_TOKENS[snapshot.clock_health()],
     ]
     if snapshot.calibration_state not in ("idle", "done"):
         parts.append(f"cal {snapshot.calibration_state}")
@@ -195,9 +227,16 @@ def _format_echos_tooltip(snapshot: EchosDeviceSnapshot) -> str:
         else "GNSS: no fix"
     )
     pps = "locked" if snapshot.pps_locked else "not locked"
+    clock_line = f"Clock: {_CLOCK_DETAILS[snapshot.clock_health()]}"
+    if snapshot.time_sync_type:
+        # Free-form firmware string ("RMC+PPS+NTP") — shown verbatim.
+        clock_line += f" · sync {snapshot.time_sync_type}"
+    if snapshot.pps_locked:
+        clock_line += f" · PPS offset {snapshot.pps_offset_us} µs"
     return (
         f"Firmware {snapshot.firmware_version} · up {_format_uptime(snapshot.uptime_s)}\n"
         f"{gnss_line} · PPS {pps}\n"
+        f"{clock_line}\n"
         f"SeedLink clients: {snapshot.clients_connected} · "
         f"ring {snapshot.ring_used_pct:.1f}% used\n"
         f"Calibration: {snapshot.calibration_state}"

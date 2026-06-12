@@ -8,7 +8,7 @@ the SeedLink client.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 if TYPE_CHECKING:
@@ -95,11 +95,32 @@ class EchosPollTarget:
     poll_interval_s: float = 5.0
 
 
+class ClockHealth(StrEnum):
+    """Closed clock-discipline verdict for a device's timestamps (M6).
+
+    Declared best → worst — declaration order ONLY: do not compare
+    members (StrEnum compares as strings, and string order does not
+    follow severity). On a seismic node the timestamps are only as
+    trustworthy as the clock discipline: GNSS with a locked PPS PLL is
+    sample-accurate; GNSS time without PPS is second-accurate; NTP is
+    network-accuracy; HOLDOVER means the clock was set once but every
+    live source is gone (an ESP32 crystal free-runs at tens of ppm —
+    seconds/day drift), and UNSYNCED means the record times were never
+    set at all. The last two are attention states the UI must shout.
+    """
+
+    PPS = "pps"  # GNSS time valid AND the PPS PLL is locked
+    GNSS = "gnss"  # GNSS time valid, PPS not locked
+    NTP = "ntp"  # the device REPORTS NTP-synchronized (no GNSS)
+    HOLDOVER = "holdover"  # synchronized once, all live sources lost — drifting
+    UNSYNCED = "unsynced"  # no time source at all
+
+
 @dataclass(frozen=True, slots=True)
 class EchosDeviceSnapshot:
     """One successful Echos status poll (worker → GUI wire payload).
 
-    Aggregates ``GET /api/status`` (firmware, uptime, GNSS),
+    Aggregates ``GET /api/status`` (firmware, uptime, GNSS, clock sync),
     ``GET /api/seedlink/status`` (clients, ring) and
     ``GET /api/calibrate/status`` (calibration state) into the flat,
     Qt-free shape the DevicePanel's Echos column renders. Frozen so a
@@ -108,6 +129,10 @@ class EchosDeviceSnapshot:
 
     ``polled_at`` is ``time.monotonic()`` at poll completion — for
     staleness arithmetic on the GUI side, not wall-clock display.
+
+    The clock fields (M6) default to their pessimistic values so the
+    derived :meth:`clock_health` can only ever err toward UNSYNCED, never
+    toward a false "synchronized".
     """
 
     device: str
@@ -120,6 +145,33 @@ class EchosDeviceSnapshot:
     ring_used_pct: float
     calibration_state: str
     polled_at: float
+    # --- clock sync (M6: /api/status time block) ----------------------
+    time_synchronized: bool = False
+    ntp_synchronized: bool = False
+    # Free-form firmware string ("RMC+PPS+NTP" on fw 1aa72cbe) — display
+    # only, NEVER branched on (the vocabulary is not pinned).
+    time_sync_type: str = ""
+    pps_offset_us: int = 0
+
+    def clock_health(self) -> ClockHealth:
+        """Derive the closed clock verdict from the sync booleans.
+
+        ``gnss_fix`` mirrors the firmware's ``gnss_time_valid`` (the
+        poller maps it 1:1); ``time_sync_type`` is deliberately ignored
+        here — it is an unpinned composite string.
+        """
+        if self.gnss_fix and self.pps_locked:
+            return ClockHealth.PPS
+        if self.gnss_fix:
+            return ClockHealth.GNSS
+        if self.ntp_synchronized:
+            return ClockHealth.NTP
+        if self.time_synchronized:
+            # The clock WAS set, but no live source backs it now: holdover,
+            # not "NTP" — claiming network accuracy here would be the false
+            # "synchronized" this model promises never to report.
+            return ClockHealth.HOLDOVER
+        return ClockHealth.UNSYNCED
 
 
 # Separator used to namespace per-stream engine state by device. The same

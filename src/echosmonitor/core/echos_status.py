@@ -276,6 +276,12 @@ class EchosStatusWorker(QObject):
             ring_used_pct=seedlink.ring_used_pct,
             calibration_state=calibration.phase,
             polled_at=time.monotonic(),
+            # Clock sync (M6): booleans drive the ClockHealth verdict;
+            # time_sync_type is a free-form firmware string, display-only.
+            time_synchronized=status.time_synchronized,
+            ntp_synchronized=status.ntp_synchronized,
+            time_sync_type=status.time_sync_type,
+            pps_offset_us=status.pps.offset_us if status.pps else 0,
         )
 
 

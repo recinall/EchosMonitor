@@ -24,7 +24,7 @@ from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, Signal
 
 from echosmonitor.core.echos_api import EchosApiClient
 from echosmonitor.core.echos_status import EchosStatusWorker
-from echosmonitor.core.models import EchosDeviceSnapshot, EchosPollTarget
+from echosmonitor.core.models import ClockHealth, EchosDeviceSnapshot, EchosPollTarget
 from tests.core.echos_fake import FakeEchosFirmware
 
 _SNAPSHOT_DEADLINE_MS = 5000
@@ -116,6 +116,12 @@ def test_snapshot_crosses_real_thread(qtbot: Any) -> None:
         assert snapshot.clients_connected == 1
         assert snapshot.ring_used_pct == 12.5
         assert snapshot.calibration_state == "idle"
+        # Clock sync (M6) — mapped 1:1 from the fake's pinned real shapes.
+        assert snapshot.time_synchronized is True
+        assert snapshot.ntp_synchronized is True
+        assert snapshot.time_sync_type == "RMC+PPS+NTP"
+        assert snapshot.pps_offset_us == -4
+        assert snapshot.clock_health() is ClockHealth.PPS
         assert snapshot.polled_at > 0.0
     finally:
         _shutdown(worker, thread)
