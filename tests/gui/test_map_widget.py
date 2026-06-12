@@ -408,3 +408,116 @@ def test_shutdown_basemap_without_toggle_is_noop(qtbot: QtBot) -> None:
     widget = _widget(qtbot, ("dev-a",))
     widget.shutdown_basemap()  # never toggled: no thread, must not raise
     assert widget._tile_thread is None
+
+
+def test_single_device_satellite_view_is_not_degenerate(qtbot: QtBot, monkeypatch) -> None:
+    """First real Satellite use: ONE positioned device auto-ranges the
+    view to a degenerate ~0 m span, so requested tiles were invisible
+    ('la tendina map NON visualizza la mappa satellitare'). Toggling the
+    basemap must leave the viewport showing the imagery extent."""
+    widget = _widget(qtbot, ("dev-a",))
+    _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    (x0, x1), (y0, y1) = widget._plot.getPlotItem().getViewBox().viewRange()
+    assert (x1 - x0) > 100.0 and (y1 - y0) > 100.0, (
+        f"viewport still degenerate after Satellite toggle: {(x0, x1, y0, y1)}"
+    )
+
+
+def test_tile_arrival_rescues_view_collapsed_after_request(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    """pyqtgraph's auto-range collapses a single-marker view at PAINT
+    time — i.e. AFTER `_update_basemap`'s request-time rescue ran. The
+    arrival of an accepted tile must re-rescue the viewport."""
+    widget = _widget(qtbot, ("dev-a",))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    # Simulate the post-request auto-range collapse.
+    view_box = widget._plot.getPlotItem().getViewBox()
+    view_box.setRange(xRange=(-1e-12, 1e-12), yRange=(-1e-12, 1e-12), padding=0.0)
+    req = requests[-1]
+    x, y = req.tiles[0]
+    widget._on_tile_ready(
+        TileResult(
+            generation=req.generation,
+            zoom=req.zoom,
+            x=x,
+            y=y,
+            image=np.zeros((256, 256, 4), dtype=np.uint8),
+        )
+    )
+    (x0, x1), _y = view_box.viewRange()
+    assert (x1 - x0) > 100.0, f"tile arrival did not rescue the collapsed view: {(x0, x1)}"
+    # A healthy, user-chosen viewport inside the imagery is left alone
+    # (compare before/after — the aspect lock reshapes requested ranges,
+    # so absolute values are not stable to assert on).
+    view_box.setRange(xRange=(-50.0, 50.0), yRange=(-50.0, 50.0), padding=0.0)
+    healthy = view_box.viewRange()
+    widget._on_tile_ready(
+        TileResult(
+            generation=req.generation,
+            zoom=req.zoom,
+            x=x + 1,
+            y=y,
+            image=np.zeros((256, 256, 4), dtype=np.uint8),
+        )
+    )
+    assert view_box.viewRange() == healthy, "healthy viewport was disturbed"
+
+
+def test_fit_view_floors_span_for_single_device(qtbot: QtBot) -> None:
+    from echosmonitor.gui.widgets.map_widget import _FIT_MIN_SPAN_M
+
+    widget = _widget(qtbot, ("dev-a",))
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._fit_view()
+    (x0, x1), (y0, y1) = widget._plot.getPlotItem().getViewBox().viewRange()
+    assert (x1 - x0) >= _FIT_MIN_SPAN_M * 0.99
+    assert (y1 - y0) >= _FIT_MIN_SPAN_M * 0.99
+
+
+def test_tile_orientation_north_is_up_when_rendered(qtbot: QtBot, monkeypatch) -> None:
+    """Pin the row-flip: a tile whose NORTH half is red and SOUTH half
+    is blue must render red-on-top. Sampled from an actual offscreen
+    render of the plot, not from item internals."""
+    from PySide6.QtGui import QColor
+
+    widget = _widget(qtbot, ("dev-a",))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.resize(400, 400)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    req = requests[-1]
+    x, y = req.tiles[0]
+    image = np.zeros((256, 256, 4), dtype=np.uint8)
+    image[:, :, 3] = 255
+    image[:128, :, 0] = 255  # rows 0..127 = tile's NORTH half → red
+    image[128:, :, 2] = 255  # south half → blue
+    widget._on_tile_ready(
+        TileResult(generation=req.generation, zoom=req.zoom, x=x, y=y, image=image)
+    )
+    # Frame exactly this tile, render, and sample above/below centre.
+    item = widget._tile_items[(req.zoom, x, y)]
+    rect = item.mapRectToParent(item.boundingRect())
+    view_box = widget._plot.getPlotItem().getViewBox()
+    view_box.setRange(
+        xRange=(rect.left(), rect.right()),
+        yRange=(rect.top(), rect.bottom()),
+        padding=0.0,
+    )
+    widget.show()
+    qtbot.waitExposed(widget)
+    pixmap = widget._plot.grab()
+    img = pixmap.toImage()
+    cx = img.width() // 2
+    upper = QColor(img.pixel(cx, int(img.height() * 0.30)))
+    lower = QColor(img.pixel(cx, int(img.height() * 0.70)))
+    assert upper.red() > 200 and upper.blue() < 60, (
+        f"north half not on top: upper pixel {upper.name()}"
+    )
+    assert lower.blue() > 200 and lower.red() < 60, (
+        f"south half not at bottom: lower pixel {lower.name()}"
+    )

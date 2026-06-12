@@ -105,6 +105,12 @@ _KM_THRESHOLD_M = 1000.0
 # Basemap layering + sizing. Tiles sit below everything the map draws
 # (scatter spots default to zValue 0, labels likewise).
 _TILE_Z_VALUE = -10.0
+# Minimum span "Fit view" may produce. A single positioned device is a
+# lone point at the frame origin: pyqtgraph's autoRange collapses the
+# view to a degenerate (~0 m) range — the pixel-sized marker still
+# shows, but anything data-sized (grid, basemap tiles) becomes
+# invisible. Found on the first real Satellite use (M6.5-E checklist).
+_FIT_MIN_SPAN_M = 50.0
 # Margin factor applied around the array extent when choosing the
 # basemap coverage, and the floor for a degenerate (single-station)
 # extent so one node still gets a recognisable patch of imagery.
@@ -189,6 +195,10 @@ class MapWidget(QWidget):
         # f0 overlay, connection flaps) must not blank + refetch it.
         # Cleared on batch failure so the next rebuild retries.
         self._last_basemap_key: tuple[object, ...] | None = None
+        # East/north extent (e0, n0, e1, n1) of the last-requested
+        # basemap; used to rescue a degenerate or elsewhere-pointing
+        # view so requested imagery is never invisible.
+        self._basemap_extent: tuple[float, float, float, float] | None = None
 
         root = QVBoxLayout(self)
 
@@ -441,7 +451,24 @@ class MapWidget(QWidget):
             self._unpositioned_label.setText("")
 
     def _fit_view(self) -> None:
-        self._plot.getPlotItem().getViewBox().autoRange()
+        view_box = self._plot.getPlotItem().getViewBox()
+        view_box.autoRange()
+        # Floor each axis independently: a single-device array
+        # autoRanges to a degenerate point and everything data-sized
+        # vanishes. Per-axis (not a square snap) so a wide-but-flat
+        # array can never be zoomed AWAY from by its own Fit button;
+        # the 1:1 aspect lock reconciles the final shape.
+        (x0, x1), (y0, y1) = view_box.viewRange()
+        if (x1 - x0) < _FIT_MIN_SPAN_M or (y1 - y0) < _FIT_MIN_SPAN_M:
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            half_x = max(x1 - x0, _FIT_MIN_SPAN_M) / 2.0
+            half_y = max(y1 - y0, _FIT_MIN_SPAN_M) / 2.0
+            view_box.setRange(
+                xRange=(cx - half_x, cx + half_x),
+                yRange=(cy - half_y, cy + half_y),
+                padding=0.0,
+            )
 
     # ------------------------------------------------------------------
     # M6.5-D — satellite basemap
@@ -454,6 +481,7 @@ class MapWidget(QWidget):
                 self._tile_fetcher.supersede(self._tile_generation)
             self._clear_tiles()
             self._last_basemap_key = None
+            self._basemap_extent = None
             self._attribution_label.setVisible(False)
             return
         self._attribution_label.setText(ATTRIBUTION)
@@ -527,6 +555,18 @@ class MapWidget(QWidget):
             return
         self._clear_tiles()
         self._last_basemap_key = basemap_key
+        # Extent of the imagery patch in the local frame: the padded
+        # span centred on the array bounding box.
+        centre_e = (max(e for e, _ in east_north) + min(e for e, _ in east_north)) / 2.0
+        centre_n = (max(n for _, n in east_north) + min(n for _, n in east_north)) / 2.0
+        half_span = span_m / 2.0
+        self._basemap_extent = (
+            centre_e - half_span,
+            centre_n - half_span,
+            centre_e + half_span,
+            centre_n + half_span,
+        )
+        self._ensure_view_shows_basemap()
         # A fresh request always restores the credit line: a stale
         # "imagery unavailable" note must never caption tiles that DO
         # arrive (Esri usage terms).
@@ -548,6 +588,35 @@ class MapWidget(QWidget):
                 tiles=tuple(tiles),
             )
         )
+
+    def _ensure_view_shows_basemap(self) -> None:
+        """Rescue the viewport when requested imagery would be invisible.
+
+        Two ways the user can request a basemap and see nothing (the
+        first real Satellite use hit case 1): (1) a single positioned
+        device autoRanges the view to a degenerate ~0 m span — tiles
+        are data-sized, so an infinitely-zoomed view shows none of
+        them; (2) the user panned/zoomed somewhere that doesn't
+        intersect the imagery patch. In both cases snap the view to
+        the basemap extent; otherwise leave the user's viewport alone.
+        """
+        if self._basemap_extent is None:
+            return
+        view_box = self._plot.getPlotItem().getViewBox()
+        (x0, x1), (y0, y1) = view_box.viewRange()
+        east_0, north_0, east_1, north_1 = self._basemap_extent
+        # "Degenerate" covers both the auto-range-collapsed single-point
+        # view (~1e-153 m) and the never-ranged ViewBox default ([0, 1],
+        # width exactly 1.0 — strictly-less-than 1.0 missed it). No
+        # legitimate imagery viewport is narrower than a couple metres.
+        degenerate = (x1 - x0) <= 2.0 or (y1 - y0) <= 2.0
+        outside = x1 < east_0 or x0 > east_1 or y1 < north_0 or y0 > north_1
+        if degenerate or outside:
+            view_box.setRange(
+                xRange=(east_0, east_1),
+                yRange=(north_0, north_1),
+                padding=0.05,
+            )
 
     @Slot(object)
     def _on_tile_ready(self, payload: object) -> None:
@@ -578,6 +647,13 @@ class MapWidget(QWidget):
         if previous is not None:
             self._plot.getPlotItem().removeItem(previous)
         self._tile_items[key] = item
+        # The request-time rescue can be undone between request and
+        # arrival: pyqtgraph's auto-range (enabled until the first
+        # explicit setRange) collapses a single-marker view at PAINT
+        # time, after `_update_basemap` checked it. Re-check now that
+        # imagery is actually on screen; a healthy user viewport is
+        # left untouched.
+        self._ensure_view_shows_basemap()
 
     @Slot(int, str)
     def _on_tile_batch_failed(self, generation: int, reason: str) -> None:
@@ -627,7 +703,11 @@ class MapWidget(QWidget):
         # keeps a still-running fetch from posting events into a widget
         # that is being destroyed as the app exits.
         if fetcher is not None:
-            for signal in (fetcher.tileReady, fetcher.batchDone, fetcher.batchFailed):
+            # Only the two directions the widget actually connects;
+            # disconnecting a never-connected signal is a libpyside
+            # RuntimeWarning, not an exception, so suppress won't hide
+            # the noise.
+            for signal in (fetcher.tileReady, fetcher.batchFailed):
                 with contextlib.suppress(RuntimeError, TypeError):
                     signal.disconnect()
         if not joined:
