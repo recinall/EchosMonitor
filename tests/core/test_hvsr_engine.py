@@ -284,6 +284,57 @@ def test_windows_accumulate_and_are_disjoint(qtbot, tmp_path) -> None:
         engine.stop()
 
 
+def test_archive_start_survives_stale_queued_stop(qtbot, tmp_path, monkeypatch) -> None:
+    """A stale queued request_stop must not drop the one-shot archive compute.
+
+    ``QThread.quit()`` can preempt the queued ``request_stop`` a prior stop
+    posted (the recorded postmortem race), leaving the stale stop parked in
+    the worker's event queue; on the next thread start it dispatches FIRST
+    and re-sets the flag. ``start_archive_measurement`` must post a queued
+    ``clear_stop`` AFTER starting the thread, so FIFO order is
+    stale-stop → clear → compute and the one-shot compute survives. The
+    stale stop is posted deterministically here (the real race is a rare
+    flake): emitted while the thread is parked, it dispatches on restart
+    exactly like a raced one.
+    """
+    sample = _dummy_result()
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", lambda self: sample)
+    rng = np.random.default_rng(1)
+    windows = [
+        (
+            rng.standard_normal(50),
+            rng.standard_normal(50),
+            rng.standard_normal(50),
+            UTCDateTime(i),
+            100.0,
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(hvsr_mod, "slice_archive_windows", lambda *a, **k: windows)
+    engine = StreamingEngine(_cfg(200.0, tmp_path / "arch"))
+    hv = HvsrEngine(engine, None)
+    try:
+        # A prior live run leaves the thread joined…
+        hv.start_measurement(_DEVICE, _GROUP, HvsrSettings(window_length_s=0.5))
+        hv.stop_measurement()
+        # …with (deterministically) a stale request_stop parked in the
+        # stopped worker's queue.
+        hv._stopRequested.emit()
+        with qtbot.waitSignal(hv.hvsrUpdated, timeout=5000):
+            mid = hv.start_archive_measurement(
+                _DEVICE,
+                _GROUP,
+                UTCDateTime(0),
+                UTCDateTime(10),
+                HvsrSettings(window_length_s=0.5),
+                object(),  # reader unused: the slicer is patched
+            )
+        assert mid, "archive measurement must start (windows exist)"
+    finally:
+        hv.shutdown()
+        engine.stop()
+
+
 def test_stop_joins_within_bound_during_slow_compute(qtbot, tmp_path, monkeypatch) -> None:
     """Stop interrupts an in-flight slow compute and returns promptly (rule 7)."""
     monkeypatch.setattr(

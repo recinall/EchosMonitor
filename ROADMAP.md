@@ -619,17 +619,41 @@ device gets its own accumulator/curve (hvsrpy owns the physics, never
 re-implemented); the array layer adds comparison and spatial context. True
 array methods (SPAC/FK) are explicitly OUT of scope unless re-planned.
 
-- [ ] **A. `core/hvsr_array.py`**: drive N `HvsrAccumulator`s from N devices'
-      ring buffers on the existing worker pattern; common time windows
-      (windows accepted only when all selected devices have gap-free
-      coverage — or per-device independent windows; decide, record here).
-      Audit: confirmed seams/blockers — `HvsrEngine` holds exactly one
-      `_Measurement` (`core/hvsr_engine.py:219`); `HvsrAccumulator` is
-      cleanly per-device (`core/hvsr.py:255`), so the array layer is
-      N accumulators + orchestration; the widget's
-      `three_component_groups()` (`hvsr_widget.py:113–139`) is already
-      multi-device-aware; `responses_identical` (`core/hvsr.py:718–745`)
-      generalizes per device.
+- [x] **A. `core/hvsr_array.py`**: Done 2026-06-12. `HvsrArrayEngine` =
+      N `HvsrAccumulator`s + orchestration on the exact `HvsrEngine`
+      skeleton (one worker thread, pending≤1 with skip+throttled log,
+      bounded join). Windowing: **per-device independent** (open question 5
+      resolved — see decision log); the shared disjoint-window capture was
+      extracted to module-level `capture_disjoint_window()` in
+      `core/hvsr_engine.py` and is called once per device per tick, each
+      station carrying its own `last_window_end` cursor. One compute
+      request per cycle runs the eligible (≥3 windows live, ≥1 forced)
+      devices' snapshots SERIALLY on the worker, stop-flag checked between
+      devices; a per-device compute failure lands in
+      `ArrayHvsrResult.errors` and never blocks the other devices.
+      `ArrayHvsrResult` is frozen and self-contained per cycle (devices,
+      results, errors, geometry snapshot, settings, provenance);
+      `unpositioned()` exposes the rule-16 "no position" diff.
+      `responses_identical` runs per device; same-fs across devices NOT
+      required (per-accumulator internal check only). Tests:
+      `tests/core/test_hvsr_array.py` (independent windows, bounded
+      in-flight, failure isolation, bounded stop during busy cycle,
+      start→stop→start, per-device override, geometry/unpositioned).
+      Audit confirmed: `HvsrEngine` holds exactly one `_Measurement`;
+      `HvsrAccumulator` is cleanly per-device; the widget's
+      `three_component_groups()` is already multi-device-aware.
+      Review fixes (both reviewers, mutation-verified failing pre-fix):
+      the stop test asserts on recorded compute invocations (devB never
+      runs after a stop during devA's compute) instead of elapsed time;
+      groups must be exactly Z/N/E (an extra component would make the 3C
+      capture silently never-ready); `ArrayHvsrResult` maps are
+      `Mapping`-typed so consumers can't mutate a frozen cycle. Auditor
+      F1 (HIGH, pre-existing): `HvsrEngine.start_archive_measurement`
+      restarted the thread WITHOUT the queued `clear_stop`, so a stale
+      queued `request_stop` surviving `quit()` (the recorded postmortem
+      race) could silently drop the one-shot archive compute — fixed with
+      the FIFO stale-stop→clear→compute ordering + deterministic
+      regression test (`test_archive_start_survives_stale_queued_stop`).
 - [ ] **B. UI**: device multi-select; overlay of N H/V curves; per-device f0
       table (f0, σ, A0, SESAME verdicts); map overlay colouring markers by
       f0 (uses M4) — the spatial-variation view.
@@ -746,6 +770,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M4-A: `configure` AND `refresh` bump the latest-wins generation (written to the worker even when the dispatch set is empty); `refresh_device` deliberately does not; `shutdown()` is terminal | Both reviewers: an empty/fully-cached configure left the in-flight sweep fetching removed devices (results discarded but network work wasted), and N rapid refreshes queued N un-superseded full sweeps (rule 5 — the only unbounded seam in the file). A single-device refresh bumping the global generation would discard every other device's in-flight result to save one duplicate fetch. Regression tests verified to fail pre-fix. |
 | 2026-06-12 | M4-B (open question 4): the Map tab is a **pyqtgraph scatter in a local east/north metre frame** — no tile stack, no QtWebEngine, no new dependency | The fleet is a handful of nodes deployed metres-to-km apart for array work: the user needs *relative geometry* (who is where, how far — exactly what M5 consumes), not basemap context. pyqtgraph is offline-by-construction (field laptops) and is the stack every other tab ships; CLAUDE.md already prefers this. The frame is metres E/N of the positioned-device centroid, aspect-locked 1:1 so the on-screen shape IS the array shape; absolute lat/lon/elev/source live in the marker hover tip. Revisit web tiles only on a real field need, as an isolated optional widget. |
 | 2026-06-12 | M4-B: position resolution runs from launch (configure on every configChanged), like the M1-C status poller | Rule 13's "nothing starts without the user" governs *acquisition* (the engine); positions are passive credential-less fleet metadata, the same sanctioned class as the status poller. The Map tab also works before any device is started — which is when the field user is placing instruments. |
+| 2026-06-12 | M5-A (open question 5): array windowing is **per-device independent** — each device accumulates its own gap-free disjoint windows (own `last_window_end` cursor); the common-window gate (accept only when ALL devices cover the same span) is a deferred optional toggle | Skill `hvsr-array`: independent windows degrade gracefully (a flaky device just contributes fewer windows; it can never collapse the whole array's throughput) and stay honest — curves remain comparable because the interval and the one shared settings panel are identical across stations. Common windows buy stricter comparability at the cost of throughput hostage-taking by the weakest device; revisit on a real field need and surface per-device rejection reasons then. |
 
 ## Open questions (resolve before the milestone that needs them)
 
@@ -761,6 +786,8 @@ launch on a clean machine of each OS and complete the M2 happy path
 4. ~~M4: tile stack choice (offline requirement? QtWebEngine weight?)~~
    **Resolved 2026-06-12: pyqtgraph scatter, local E/N metre frame, no
    tiles, no QtWebEngine** (see decision log).
-5. M5: common-window vs per-device windows for array HVSR (see M5-A).
+5. ~~M5: common-window vs per-device windows for array HVSR (see M5-A).~~
+   **Resolved 2026-06-12: per-device independent windows** (see decision
+   log; the common-window gate is a deferred optional toggle).
 6. M7: signing — is a Windows cert / Apple Developer account available, or
    do we ship unsigned with documented bypass instructions?

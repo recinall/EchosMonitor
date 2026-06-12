@@ -50,6 +50,8 @@ from echosmonitor.core.hvsr import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from echosmonitor.core.response import ResponseProvider
     from echosmonitor.core.streaming_engine import StreamingEngine
     from echosmonitor.storage.archive_reader import ArchiveReader
@@ -143,6 +145,78 @@ class _Measurement:
     # captured once ``latest`` has advanced a full window length past it, so
     # captured windows are disjoint (non-overlapping).
     last_window_end: UTCDateTime | None = None
+
+
+# One captured 3C window, ready for ``HvsrAccumulator.add_window``.
+WindowCapture = tuple[np.ndarray, np.ndarray, np.ndarray, UTCDateTime, float]
+
+
+def capture_disjoint_window(
+    engine: StreamingEngine,
+    device: str,
+    group: Mapping[str, str],
+    window_length_s: float,
+    last_window_end: UTCDateTime | None,
+    *,
+    log_key: str,
+) -> tuple[WindowCapture, UTCDateTime] | None:
+    """Capture the next non-overlapping 3C window, or ``None`` if not ready.
+
+    ``read_recent`` only ever returns the LAST ``window_length_s`` of each
+    component (ending at that component's ``latest``). Successive windows are
+    made disjoint by only capturing once the common ``latest`` has advanced a
+    full window length past ``last_window_end``. Returns the captured window
+    plus the new ``last_window_end`` to carry into the next call.
+
+    Shared per-station primitive: :class:`HvsrEngine` uses it for the single
+    measurement; the M5 array engine calls it once per device per tick (each
+    device carries its own ``last_window_end`` — windows are per-device
+    independent, see skill ``hvsr-array``).
+    """
+    wl = window_length_s
+    samples: dict[str, np.ndarray] = {}
+    fs_ref = 0.0
+    latests: list[UTCDateTime] = []
+    for comp, nslc in group.items():
+        arr, fs, latest = engine.read_recent(device, nslc, wl)
+        if arr.size == 0 or fs <= 0 or latest is None:
+            return None  # a component is not yet streaming — wait
+        samples[comp] = arr
+        fs_ref = fs
+        latests.append(latest)
+    if len(samples) != 3 or fs_ref <= 0:
+        return None
+    common_latest = min(latests)
+    min_len = min(int(a.shape[0]) for a in samples.values())
+    need = int(wl * fs_ref * _MIN_WINDOW_FILL)
+    if min_len < max(1, need):
+        return None  # not enough samples for a full window yet
+
+    if last_window_end is None:
+        # First window: capture as soon as a full window exists.
+        pass
+    elif float(common_latest - last_window_end) < wl:
+        return None  # no full fresh disjoint window yet
+    elif float(common_latest - last_window_end) > 2.0 * wl:
+        # Fell behind / ring scrolled: we cannot recover the missed span
+        # from a read_recent-only ring. We capture the freshest full
+        # window [common_latest-wl, common_latest] (real, disjoint samples)
+        # and the returned ``common_latest`` IS the resync — the missed
+        # interval is dropped, never overlapped or fabricated (rule 7
+        # honesty). HVSR windows need not be contiguous, only disjoint, so
+        # the dropped span is sound; the warning is the observable trace
+        # that a gap occurred.
+        _log.warning(
+            "hvsr_window_gap",
+            measurement=log_key,
+            gap_s=round(float(common_latest - last_window_end), 1),
+        )
+
+    za = samples["Z"][-min_len:].astype(np.float64, copy=False)
+    na = samples["N"][-min_len:].astype(np.float64, copy=False)
+    ea = samples["E"][-min_len:].astype(np.float64, copy=False)
+    t_start = common_latest - (min_len - 1) / fs_ref
+    return (za, na, ea, t_start, fs_ref), common_latest
 
 
 class _HvsrWorker(QObject):
@@ -343,6 +417,11 @@ class HvsrEngine(QObject):
         self._measurement = m
         if not self._hvsr_thread.isRunning():
             self._hvsr_thread.start()
+        # Queued clear AFTER start: a prior stop's queued request_stop can
+        # survive quit() un-dispatched (the postmortem race) and would re-set
+        # the flag on restart, silently dropping the one-shot compute below.
+        # FIFO ordering guarantees stale-stop → clear → compute.
+        self._clearStopRequested.emit()
         self._worker._stop = False
         self._set_state(m, HvsrState.ACCUMULATING)
         self.hvsrMeasurementStarted.emit(measurement_id, self._summary(m))
@@ -425,61 +504,20 @@ class HvsrEngine(QObject):
                 self.hvsrPsdReady.emit(psds)
         self._request_recompute(m, force=False)
 
-    def _capture_disjoint_window(
-        self, m: _Measurement
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, UTCDateTime, float] | None:
-        """Capture the next non-overlapping window, or ``None`` if not ready.
-
-        ``read_recent`` only ever returns the LAST ``window_length_s`` of each
-        component (ending at that component's ``latest``). We make successive
-        windows disjoint by only capturing once the common ``latest`` has
-        advanced a full window length past the previous window's end.
-        """
-        wl = m.settings.window_length_s
-        samples: dict[str, np.ndarray] = {}
-        fs_ref = 0.0
-        latests: list[UTCDateTime] = []
-        for comp, nslc in m.group.items():
-            arr, fs, latest = self._engine.read_recent(m.device, nslc, wl)
-            if arr.size == 0 or fs <= 0 or latest is None:
-                return None  # a component is not yet streaming — wait
-            samples[comp] = arr
-            fs_ref = fs
-            latests.append(latest)
-        if len(samples) != 3 or fs_ref <= 0:
+    def _capture_disjoint_window(self, m: _Measurement) -> WindowCapture | None:
+        """Capture the next non-overlapping window via the shared primitive."""
+        captured = capture_disjoint_window(
+            self._engine,
+            m.device,
+            m.group,
+            m.settings.window_length_s,
+            m.last_window_end,
+            log_key=m.measurement_id,
+        )
+        if captured is None:
             return None
-        common_latest = min(latests)
-        min_len = min(int(a.shape[0]) for a in samples.values())
-        need = int(wl * fs_ref * _MIN_WINDOW_FILL)
-        if min_len < max(1, need):
-            return None  # not enough samples for a full window yet
-
-        if m.last_window_end is None:
-            # First window: capture as soon as a full window exists.
-            pass
-        elif float(common_latest - m.last_window_end) < wl:
-            return None  # no full fresh disjoint window yet
-        elif float(common_latest - m.last_window_end) > 2.0 * wl:
-            # Fell behind / ring scrolled: we cannot recover the missed span
-            # from a read_recent-only ring. We capture the freshest full
-            # window [common_latest-wl, common_latest] (real, disjoint samples)
-            # and the ``m.last_window_end = common_latest`` below IS the
-            # resync — the missed interval is dropped, never overlapped or
-            # fabricated (rule 7 honesty). HVSR windows need not be contiguous,
-            # only disjoint, so the dropped span is sound; the warning is the
-            # observable trace that a gap occurred.
-            _log.warning(
-                "hvsr_window_gap",
-                measurement=m.measurement_id,
-                gap_s=round(float(common_latest - m.last_window_end), 1),
-            )
-
-        za = samples["Z"][-min_len:].astype(np.float64, copy=False)
-        na = samples["N"][-min_len:].astype(np.float64, copy=False)
-        ea = samples["E"][-min_len:].astype(np.float64, copy=False)
-        t_start = common_latest - (min_len - 1) / fs_ref
-        m.last_window_end = common_latest
-        return za, na, ea, t_start, fs_ref
+        window, m.last_window_end = captured
+        return window
 
     def _request_recompute(self, m: _Measurement, *, force: bool) -> None:
         """Dispatch a recompute, or skip if one is in flight (rule 11)."""
