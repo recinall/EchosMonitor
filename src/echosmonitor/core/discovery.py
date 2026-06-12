@@ -178,6 +178,62 @@ class EchosDiscoveryWorker(QObject):
             return
         self.discoveryFinished.emit(confirmed)
 
+    @Slot(str, int)
+    def probe_host(self, host: str, http_port: int) -> None:
+        """One-shot MANUAL probe of a user-entered host (M6 wizard).
+
+        Covers the two non-mDNS paths: a factory-fresh device in AP mode
+        (``192.168.4.1``) and nodes that do not advertise (Pi-hosted).
+        Same typed public gate as the scan, but a failure IS surfaced —
+        the user explicitly asked about this host, so
+        ``discoveryFailed(kind, …)`` carries the transport verdict.
+        """
+        if self._stop_flag:
+            return
+        host = host.strip().rstrip(".")
+        if not host:
+            return
+        _log.info("echos_discovery_manual_probe", host=host, http_port=http_port)
+        candidate = _Candidate(
+            instance=host,
+            # A .local name doubles as the stable config host; a raw IP
+            # gives the prefill nothing better than the address itself.
+            hostname=host if host.casefold().endswith(".local") else "",
+            address=host,
+            http_port=int(http_port),
+            board="",
+        )
+        try:
+            device = asyncio.run(self._probe_one_async(candidate))
+        except asyncio.CancelledError:
+            _log.info("echos_discovery_manual_probe_canceled", host=host)
+            return
+        except EchosApiError as exc:
+            _log.info("echos_discovery_manual_probe_failed", host=host, kind=exc.kind)
+            self.discoveryFailed.emit(exc.kind, str(exc))
+            return
+        except Exception as exc:  # never crash the worker thread
+            _log.exception("echos_discovery_manual_probe_error", host=host, error=str(exc))
+            self.discoveryFailed.emit("protocol", f"unexpected: {type(exc).__name__}: {exc}")
+            return
+        if device is not None and not self._stop_flag:
+            self.deviceDiscovered.emit(device)
+
+    async def _probe_one_async(self, candidate: _Candidate) -> DiscoveredEchos | None:
+        """Run one cancellable probe with the in-flight registration."""
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None  # always inside asyncio.run
+        with self._lock:
+            if self._stop_flag:
+                return None
+            self._in_flight = (loop, task)
+        try:
+            return await self._probe(candidate)
+        finally:
+            with self._lock:
+                self._in_flight = None
+
     # ------------------------------------------------------------------
     # Plain method (NOT a Slot). Callable from any thread.
     # ------------------------------------------------------------------
@@ -211,8 +267,20 @@ class EchosDiscoveryWorker(QObject):
             for candidate in candidates:
                 if self._stop_flag:
                     break
-                device = await self._probe(candidate)
-                if device is not None and not self._stop_flag:
+                try:
+                    device = await self._probe(candidate)
+                except EchosApiError as exc:
+                    # Not an Echos node this scan — logged, never surfaced
+                    # (a printer matching the prefilter must not scare the
+                    # user); the manual probe path DOES surface the kind.
+                    _log.info(
+                        "echos_discovery_probe_rejected",
+                        host=candidate.address,
+                        instance=candidate.instance,
+                        kind=exc.kind,
+                    )
+                    continue
+                if not self._stop_flag:
                     self.deviceDiscovered.emit(device)  # rows stream in live
                     confirmed += 1
             return confirmed
@@ -220,25 +288,28 @@ class EchosDiscoveryWorker(QObject):
             with self._lock:
                 self._in_flight = None
 
-    async def _probe(self, candidate: _Candidate) -> DiscoveredEchos | None:
+    async def _probe(self, candidate: _Candidate) -> DiscoveredEchos:
         """Confirm one candidate via the typed PUBLIC endpoints.
 
-        A candidate that fails transport or schema validation is simply
-        not an Echos node this scan — logged, never surfaced as an error
-        (a printer matching the prefilter must not scare the user).
+        Raises ``EchosApiError`` when the host fails transport or schema
+        validation. The StationXML fetch (selector derivation for the
+        wizard) is best-effort: its failure degrades to ``channels=()``,
+        never to a rejected node.
         """
-        try:
-            async with self._client_factory(candidate.address, candidate.http_port) as client:
-                status = await client.get_status()
-                seedlink = await client.get_seedlink_config()
-        except EchosApiError as exc:
-            _log.info(
-                "echos_discovery_probe_rejected",
-                host=candidate.address,
-                instance=candidate.instance,
-                kind=exc.kind,
-            )
-            return None
+        async with self._client_factory(candidate.address, candidate.http_port) as client:
+            status = await client.get_status()
+            seedlink = await client.get_seedlink_config()
+            channels: tuple[str, ...] = ()
+            try:
+                from echosmonitor.core.echos_device_worker import parse_stationxml_channels
+
+                channels = parse_stationxml_channels(await client.get_stationxml())
+            except EchosApiError as exc:
+                _log.info(
+                    "echos_discovery_stationxml_unavailable",
+                    host=candidate.address,
+                    kind=exc.kind,
+                )
         return DiscoveredEchos(
             instance=candidate.instance,
             hostname=candidate.hostname,
@@ -248,6 +319,7 @@ class EchosDiscoveryWorker(QObject):
             firmware_version=status.firmware_version,
             project_name=status.project_name,
             board=candidate.board,
+            channels=channels,
         )
 
     async def _zeroconf_browse(self) -> list[_Candidate]:

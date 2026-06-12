@@ -84,11 +84,12 @@ def _default_client_factory(target: EchosPollTarget, password: str | None) -> Ec
     return EchosApiClient(target.host, target.http_port, password)
 
 
-def _parse_channels(xml: str) -> tuple[str, ...]:
+def parse_stationxml_channels(xml: str) -> tuple[str, ...]:
     """Extract NSLC strings from a StationXML document (worker thread).
 
     obspy parsing is file/CPU work — exactly what this worker exists to
-    keep off the GUI thread (rule 1). Parse failures degrade to ()
+    keep off the GUI thread (rule 1; the discovery worker reuses it for
+    the wizard's selector derivation). Parse failures degrade to ()
     because selector derivation is a convenience, not a load gate.
     """
     from obspy import read_inventory
@@ -292,7 +293,7 @@ class EchosDeviceWorker(QObject):
             calibration = await client.get_calibration_status()
             channels: tuple[str, ...] = ()
             try:
-                channels = _parse_channels(await client.get_stationxml())
+                channels = parse_stationxml_channels(await client.get_stationxml())
             except EchosApiError as exc:
                 # Selector derivation is a convenience; the load stands.
                 _log.warning(

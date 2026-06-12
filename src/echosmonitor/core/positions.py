@@ -117,7 +117,7 @@ def stationxml_coordinates(xml: str) -> tuple[float, float, float] | None:
     carries no usable coordinates.
 
     Worker-thread only by convention: obspy parsing is file/CPU work
-    (rule 1; same reasoning as ``echos_device_worker._parse_channels``).
+    (rule 1; same reasoning as ``echos_device_worker.parse_stationxml_channels``).
     Lat/lon exactly 0/0 is the firmware's no-fix placeholder ("null
     island") and is treated as absent so the caller falls back to the
     live GNSS fix.

@@ -774,8 +774,30 @@ rebuild port, no-data root surfacing.
       log (a `slice_inflight` flag distinct from `pending` would make the
       ownership guard exact); a whole-cycle worker failure surfaces only in
       the log + `ArrayHvsrSummary.last_error`, not in the per-device rows.
-- [ ] First-run wizard rewritten for Echos (discover device on
+- [x] First-run wizard rewritten for Echos (discover device on
       `192.168.4.1` AP / mDNS `*.local`, set admin password, add device).
+      *Done 2026-06-12:* full rewrite of `first_run_wizard.py` (the
+      GFZ/IRIS public-server wizard is gone). Welcome (scan / AP-mode at
+      `192.168.4.1` with serial-password instructions / skip) → Find
+      (embedded M6-2 mDNS scan + manual host "Check device" via the new
+      `EchosDiscoveryWorker.probe_host` — same typed public gate, but a
+      MANUAL failure surfaces its kind; rows dedupe on normalized
+      {hostname,address}+port; configured hosts marked, not blocked) →
+      Details (de-collided name + OPTIONAL admin password). Finish
+      writes the DeviceConfig via ConfigStore (mDNS hostname host,
+      PROBED SeedLink port, StationXML-exact selectors — the discovery
+      probe now fetches `/api/stationxml` best-effort into
+      `DiscoveredEchos.channels`) and stores the password via
+      `EchosDeviceWorker.storeCredential` on the wizard's worker thread
+      (15 s bounded; timeout/early-close accept with a warn — the device
+      write is already durable). The wizard performs NO device writes:
+      changing the password ON the device stays in the device dialog
+      (that POST is still unexercised on real firmware — M1 closure).
+      ONE lazily-started thread hosts both workers (an undriven wizard
+      owns no running thread — fixed a real destroyed-while-running
+      crash); audit PASS, all 8 findings fixed; obsolete InfoWorker
+      integration test consciously rewritten for the same contract
+      class (queued off-GUI dispatch) on the new worker.
 - [x] mDNS discovery of Echos nodes on the LAN (optional, zeroconf).
       *Done 2026-06-12:* advert contract PINNED LIVE against fw 1aa72cbe —
       the firmware advertises `ADS131M04-WebServer._http._tcp.local.` with
@@ -924,6 +946,8 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6 discovery: mDNS advert is only a PREFILTER (loose substring/prefix on instance `ADS131M04` / TXT `board=ESP32*`); the typed public probe (`/api/status` + `/api/seedlink/config`) is the gate; both pinned LIVE against echos.local (fw 1aa72cbe) | The instance/TXT are firmware constants the next build could reword (and mDNS conflict-renames duplicates "name (2)"), so exact-matching would be brittle; a schema-validated credential-less probe cannot be spoofed by a printer and can never trip the auth lockout (rule 15). pihw.local proved the negative case: no `_http` advert → manual add stays first-class. |
 | 2026-06-12 | M6 discovery: `zeroconf` is a REGULAR dependency; the milestone's "optional" is honoured at the FEATURE level (lazy import → `discoveryFailed("unavailable")` on stripped installs) | An optional extra would keep the default `uv sync` gate from ever exercising the discovery tests; zeroconf is pure-python with one tiny dep (ifaddr), so the packaging cost is nil while testability wins. |
 | 2026-06-12 | M6 discovery: the add-device prefill uses the mDNS HOSTNAME (`echos.local`), not the resolved IP, as `DeviceConfig.host` | The hostname survives DHCP lease changes — the exact field failure mode of a seismometer that sits on a site LAN for weeks; the probed IP remains visible in the dialog row for debugging. |
+| 2026-06-12 | M6 wizard: performs NO device writes — "set admin password" means STORE in the OS keyring (off-thread, bounded 15 s, accept-with-warning on timeout/close); changing the password ON the device stays in the device dialog | `POST /api/auth/password` is still unexercised on real firmware (M1 closure) and needs the CURRENT password anyway; the wizard's job is to leave a working config + credential, not to mutate a factory-fresh device. The device write lands BEFORE the credential wait, so no close path can lose it (persisted-before-announced). |
+| 2026-06-12 | M6 wizard: the worker thread starts LAZILY on the first page action; an undriven wizard owns no running thread | A wizard constructed but never driven (Help-menu open + patched/closed exec) never reaches done()/teardown — an eagerly-started thread then gets GC'd while running, a hard Qt abort (crashed the menubar tests for real). Queued events posted before start are delivered when exec() runs, so laziness costs nothing. |
 
 ## Open questions (resolve before the milestone that needs them)
 

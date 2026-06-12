@@ -198,6 +198,10 @@ class DiscoveredEchos:
     firmware_version: str  # from /api/status
     project_name: str  # from /api/status
     board: str  # TXT "board" (e.g. "ESP32-S3"), display-only
+    # NSLC strings from the device StationXML (M6 wizard: exact selector
+    # derivation). () when the document was unavailable/unparseable —
+    # the probe still confirms, selectors just stay manual.
+    channels: tuple[str, ...] = ()
 
 
 # Separator used to namespace per-stream engine state by device. The same

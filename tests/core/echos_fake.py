@@ -66,7 +66,7 @@ _SEEDLINK_KEYS = frozenset(
 
 # Minimal-but-valid FDSN StationXML 1.2: 3 velocimeter channels, the
 # shape the firmware's /api/stationxml serves. Parsed by obspy in
-# core/echos_device_worker._parse_channels for selector derivation.
+# core/echos_device_worker.parse_stationxml_channels for selector derivation.
 _STATIONXML = """<?xml version="1.0" encoding="UTF-8"?>
 <FDSNStationXML xmlns="http://www.fdsn.org/xml/station/1" schemaVersion="1.2">
   <Source>Echos firmware_seedlink</Source>

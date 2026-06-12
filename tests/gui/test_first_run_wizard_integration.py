@@ -1,162 +1,79 @@
-"""Real-thread integration test for :class:`FirstRunWizard` (M4 stage C).
+"""Real-thread integration test for :class:`FirstRunWizard` (M6 rewrite).
 
-The unit-level wizard tests stub the :class:`InfoWorker`, which side-
-steps the cross-thread dispatch path that the production wizard uses.
-Stage C's first draft called ``self._info_worker.requestId(...)``
-directly on the GUI thread, blocking it for up to 30 s on an
-unreachable host — code-reviewer caught the regression. The fix
-routes the request through an internal ``_idRequested`` signal
-connected to the worker's slot via ``Qt.ConnectionType.QueuedConnection``.
+The unit-level wizard tests inject fake workers, which side-steps the
+cross-thread dispatch path the production wizard uses. The original
+M4-C version of this test pinned the InfoWorker probe (the public-server
+wizard); the M6 Echos rewrite replaced that machinery, so this is the
+consciously rewritten equivalent for the SAME contract class: page
+actions reach a REAL worker on a REAL QThread via queued connections and
+the GUI thread never blocks on the network.
 
-This test pins the contract end-to-end:
-
-* A real :class:`InfoWorker` lives on a real ``QThread``.
-* A real :class:`FakeSeedLinkServer` answers ``INFO ID``.
-* The wizard's welcome page fires the queued-connection probe.
-* We assert ``identityReceived`` actually fires for one of the two
-  request_ids — proving the GUI thread did NOT block waiting for
-  the slot to run synchronously.
-
-A regression to direct-call dispatch would either time out
-(``waitSignal`` deadline) or — worse — silently freeze the test
-thread inside the slot body for up to 30 s.
+Here a real :class:`EchosDiscoveryWorker` (browse injected, probes
+served by the pinned :class:`FakeEchosFirmware` transport) lives on the
+wizard's own thread; the Find page's auto-scan must round-trip into a
+selectable, probe-confirmed row.
 """
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-import pytest
 from PySide6.QtCore import QThread
 
-from echosmonitor.config.schema import (
-    AppConfig,
-    RootConfig,
-    UiConfig,
-)
+from echosmonitor.config.schema import AppConfig, RootConfig, UiConfig
 from echosmonitor.core.config_store import ConfigStore
-from echosmonitor.core.info_worker import InfoWorker
+from echosmonitor.core.discovery import EchosDiscoveryWorker, _Candidate
+from echosmonitor.core.echos_api import EchosApiClient
 from echosmonitor.gui.dialogs.first_run_wizard import FirstRunWizard
-from tests.core.fakes import (
-    FakeSeedLinkServer,
-    FakeSeedLinkServerConfig,
-    FakeStation,
-)
-from tests.core.test_seedlink_worker import _LoopThread, loop_thread  # noqa: F401
+from tests.core.echos_fake import FakeEchosFirmware
 
 
-@pytest.fixture
-def make_fake_server(
-    loop_thread: _LoopThread,  # noqa: F811
-) -> Iterator[Callable[[FakeSeedLinkServerConfig], FakeSeedLinkServer]]:
-    started: list[FakeSeedLinkServer] = []
-
-    def _factory(cfg: FakeSeedLinkServerConfig) -> FakeSeedLinkServer:
-        server = FakeSeedLinkServer(config=cfg)
-        loop_thread.submit(server.start()).result(timeout=2.0)
-        started.append(server)
-        return server
-
-    yield _factory
-
-    for server in started:
-        with contextlib.suppress(Exception):
-            loop_thread.submit(server.stop()).result(timeout=3.0)
-
-
-def test_wizard_probe_dispatches_through_real_worker_thread(
-    qtbot: Any,
-    tmp_path: Path,
-    make_fake_server: Callable[[FakeSeedLinkServerConfig], FakeSeedLinkServer],
+def test_wizard_scan_dispatches_through_real_worker_thread(
+    qtbot: Any, tmp_path: Path
 ) -> None:
-    """The welcome page's probe runs on the InfoWorker thread, not the GUI thread.
+    """The Find page's scan runs on the wizard's worker thread (queued
+    dispatch — rule 1): the probe-confirmed device lands back in the
+    table and is selectable, and the browse demonstrably executed OFF
+    the GUI thread."""
+    fw = FakeEchosFirmware()
+    browse_threads: list[QThread] = []
 
-    A direct ``requestId`` call from the GUI thread would block the
-    test thread inside ``info.fetch`` for the full ``timeout_s = 30``;
-    the queued-connection emit completes immediately and the actual
-    fetch runs on the worker thread. We pin this by:
+    async def browse() -> list[_Candidate]:
+        browse_threads.append(QThread.currentThread())
+        return [
+            _Candidate(
+                instance="ADS131M04-WebServer",
+                hostname="echos.local",
+                address="192.0.2.10",
+                http_port=80,
+                board="ESP32-S3",
+            )
+        ]
 
-    * spinning up a real :class:`InfoWorker` on a real :class:`QThread`,
-    * pointing both the GFZ and IRIS recommended hosts at the SAME
-      fake server (the only INFO-capable test server we have),
-    * showing the wizard so its welcome page fires the probe,
-    * asserting ``identityReceived`` actually arrives — which is only
-      possible if the slot dispatched on the worker thread and got a
-      reply from the real (fake) server.
-    """
-    cfg = FakeSeedLinkServerConfig(
-        stations=(FakeStation(network="GE", station="WLF", description="Wittensee"),),
-    )
-    server = make_fake_server(cfg)
-
-    # Override the wizard's recommended-server constants so both
-    # probes target our local fake. Patching the module-level
-    # constants is cleaner than redefining them: a single import
-    # path is the canonical source.
-    import echosmonitor.gui.dialogs.first_run_wizard as wizard_mod
-
-    original_gfz = wizard_mod._RECOMMENDED_GFZ
-    original_iris = wizard_mod._RECOMMENDED_IRIS
-    wizard_mod._RECOMMENDED_GFZ = (
-        "fake-a",
-        server.host,
-        server.port,
-        "GE",
-        "WLF",
-        "",
-        "BHZ",
-        "Fake A",
-    )
-    wizard_mod._RECOMMENDED_IRIS = (
-        "fake-b",
-        server.host,
-        server.port,
-        "GE",
-        "WLF",
-        "",
-        "BHZ",
-        "Fake B",
-    )
-
-    try:
-        # Real InfoWorker on a real QThread.
-        worker_thread = QThread()
-        worker_thread.setObjectName("info-worker-test")
-        worker = InfoWorker()
-        worker.moveToThread(worker_thread)
-        worker_thread.start()
-
-        store_path = tmp_path / "config.yaml"
-        store = ConfigStore(
-            RootConfig(app=AppConfig(), ui=UiConfig(), devices=[]),
-            store_path,
+    def factory(address: str, http_port: int) -> EchosApiClient:
+        return EchosApiClient(
+            address, http_port, transport=fw.transport, get_retries=0, retry_delay_s=0.0
         )
 
-        try:
-            with qtbot.waitSignal(worker.identityReceived, timeout=10000) as blocker:
-                wizard = FirstRunWizard(store=store, info_worker=worker)
-                qtbot.addWidget(wizard)
-                wizard.show()
-                qtbot.waitExposed(wizard)
-                # Do nothing else — the probe was kicked off in
-                # initializePage and the queued emit has dispatched.
-                # waitSignal blocks until the reply arrives.
-
-            request_id, label, _identity = blocker.args
-            # Either GFZ or IRIS request_id — both target the same fake.
-            welcome = wizard.page(0)
-            assert request_id in {welcome._gfz_request_id, welcome._iris_request_id}, (  # type: ignore[attr-defined]
-                "identityReceived fired for an unrelated request_id"
-            )
-            assert label == f"{server.host}:{server.port}"
-        finally:
-            worker.stop()
-            worker_thread.quit()
-            assert worker_thread.wait(2000), "info worker thread did not join"
+    worker = EchosDiscoveryWorker(client_factory=factory, browse=browse)
+    store = ConfigStore(
+        RootConfig(app=AppConfig(), ui=UiConfig(), devices=[]),
+        tmp_path / "config.yaml",
+    )
+    wizard = FirstRunWizard(store=store, discovery_worker=worker)
+    qtbot.addWidget(wizard)
+    wizard.restart()
+    try:
+        wizard.next()  # → Find page: auto-scan dispatches (queued)
+        qtbot.waitUntil(lambda: wizard._find.selected_device() is not None, timeout=8000)
+        device = wizard._find.selected_device()
+        assert device is not None
+        assert device.hostname == "echos.local"
+        assert device.seedlink_port == 18000  # probed via the REAL client
+        assert device.channels  # StationXML parsed on the worker
+        assert browse_threads == [wizard._thread]
+        assert wizard._thread is not QThread.currentThread()
     finally:
-        # Restore the constants so subsequent tests aren't affected.
-        wizard_mod._RECOMMENDED_GFZ = original_gfz
-        wizard_mod._RECOMMENDED_IRIS = original_iris
+        wizard.done(0)
+    assert not wizard._thread.isRunning()

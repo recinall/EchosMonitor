@@ -1247,10 +1247,10 @@ class MainWindow(QMainWindow):
         """Help → First-run wizard. Safe to call against a populated config."""
         wizard = FirstRunWizard(
             store=self._store,
-            info_worker=self._info_worker,
             parent=self,
         )
         wizard.exec()
+        wizard.deleteLater()
 
     def _on_show_shortcuts(self) -> None:
         """Help → Keyboard shortcuts. Open the read-only reference modal."""

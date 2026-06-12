@@ -96,10 +96,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.config is None and is_first_run(user_config_path(), cfg):
         wizard = FirstRunWizard(
             store=window._store,
-            info_worker=window._info_worker,
             parent=window,
         )
         wizard.exec()
+        wizard.deleteLater()
 
     window.show()
 

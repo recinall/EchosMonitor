@@ -52,6 +52,7 @@ _IMPOSTOR_CANDIDATE = _Candidate(
 
 class _Trigger(QObject):
     scanRequested = Signal()  # noqa: N815
+    probeRequested = Signal(str, int)  # noqa: N815
 
 
 def _factory_for(fw: FakeEchosFirmware) -> Any:
@@ -73,6 +74,7 @@ def _spawn(qtbot: Any, worker: EchosDiscoveryWorker) -> tuple[QThread, _Trigger]
     worker.moveToThread(thread)
     trigger = _Trigger()
     trigger.scanRequested.connect(worker.discover, type=Qt.ConnectionType.QueuedConnection)
+    trigger.probeRequested.connect(worker.probe_host, type=Qt.ConnectionType.QueuedConnection)
     thread.start()
     qtbot.waitUntil(thread.isRunning, timeout=1000)
     return thread, trigger
@@ -295,3 +297,81 @@ def test_results_stream_while_scan_still_running(qtbot: Any) -> None:
     finally:
         release_second.set()
         _shutdown(worker, thread)
+
+
+def test_probe_host_confirms_and_carries_hostname(qtbot: Any) -> None:
+    """M6 wizard manual path: a user-entered .local host probes through
+    the same typed gate; the hostname rides the payload (DHCP-stable
+    config host), and the StationXML channels come along."""
+    fw = FakeEchosFirmware()
+    not_used = httpx.MockTransport(lambda request: httpx.Response(404))
+
+    def factory(address: str, http_port: int) -> EchosApiClient:
+        transport = fw.transport if address.casefold() == "echos.local" else not_used
+        return EchosApiClient(
+            address, http_port, transport=transport, get_retries=0, retry_delay_s=0.0
+        )
+
+    worker = EchosDiscoveryWorker(client_factory=factory)
+    thread, trigger = _spawn(qtbot, worker)
+    found: list[object] = []
+    worker.deviceDiscovered.connect(found.append)
+    try:
+        with qtbot.waitSignal(worker.deviceDiscovered, timeout=_SCAN_DEADLINE_MS):
+            # Case + trailing dot must normalize.
+            trigger.probeRequested.emit("ECHOS.local.", 80)
+        (device,) = found
+        assert isinstance(device, DiscoveredEchos)
+        assert device.hostname == "ECHOS.local"  # .local detected case-insensitively
+        assert device.seedlink_port == 18000
+        assert device.channels  # StationXML parsed on the worker
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_probe_host_failure_surfaces_kind(qtbot: Any) -> None:
+    """Unlike the scan's silent reject, a MANUAL probe failure is the
+    user's answer — discoveryFailed carries the transport kind."""
+    worker = EchosDiscoveryWorker(client_factory=_factory_for(FakeEchosFirmware()))
+    thread, trigger = _spawn(qtbot, worker)
+    try:
+        with qtbot.waitSignal(worker.discoveryFailed, timeout=_SCAN_DEADLINE_MS) as blocker:
+            # 404s every path → protocol-class error.
+            trigger.probeRequested.emit(_PRINTER_ADDR, 80)
+        assert blocker.args[0]  # a closed-set kind, never empty
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_stop_cancels_inflight_manual_probe_bounded(qtbot: Any) -> None:
+    """Skill §7 stop-during-busy-slot for the NEW probe path: stop()
+    cancels the in-flight probe; nothing is announced; bounded join."""
+    import threading
+
+    probing = threading.Event()
+
+    async def _hang(request: httpx.Request) -> httpx.Response:
+        probing.set()
+        await asyncio.sleep(60.0)
+        return httpx.Response(404)
+
+    hung = httpx.MockTransport(_hang)
+
+    def factory(address: str, http_port: int) -> EchosApiClient:
+        return EchosApiClient(
+            address, http_port, transport=hung, get_retries=0, retry_delay_s=0.0
+        )
+
+    worker = EchosDiscoveryWorker(client_factory=factory)
+    thread, trigger = _spawn(qtbot, worker)
+    announced: list[object] = []
+    worker.deviceDiscovered.connect(announced.append)
+    worker.discoveryFailed.connect(lambda *a: announced.append(a))
+    trigger.probeRequested.emit("10.0.0.9", 80)
+    qtbot.waitUntil(probing.is_set, timeout=2000)  # probe in flight
+    t0 = time.monotonic()
+    _shutdown(worker, thread)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5.5, f"teardown took {elapsed:.1f}s (cancel should be ms)"
+    qtbot.wait(50)
+    assert announced == []

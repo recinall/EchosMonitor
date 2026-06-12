@@ -1,602 +1,658 @@
-"""First-run wizard (M4 stage C).
+"""First-run wizard, rewritten for Echos devices (M6).
 
-Triggered when ``is_first_run(...)`` returns True at app startup
-(see :mod:`echosmonitor.core.firstrun`). Three short pages:
+Triggered when ``is_first_run(...)`` returns True at app startup (see
+:mod:`echosmonitor.core.firstrun`; unchanged) and reachable any time via
+Help → First-run wizard. Three short pages:
 
-1. **Welcome** — three-way radio: recommended public server (default),
-   configure my own, or skip. The wizard fires a best-effort INFO
-   probe at GFZ and IRIS in the background while the user reads the
-   blurb so the recommended path lights up the moment a server has
-   confirmed itself reachable. If neither responds within
-   :data:`_PROBE_TIMEOUT_S`, the recommended path stays available
-   but uses GFZ as the deterministic default — the user can edit
-   later from the Devices dock.
+1. **Welcome** — three-way radio: scan the local network (mDNS,
+   default), device in setup (AP) mode at ``http://192.168.4.1``
+   (button B ≥ 5 s on the device), or skip.
 
-2. **Configure** — only reached when "configure my own" is selected.
-   Embeds the same :class:`DeviceForm` the regular Add Device dialog
-   uses, plus a "Test connection" button that fires
-   :meth:`InfoWorker.requestId` and renders the result inline.
+2. **Find device** — an embedded mDNS scan (the M6-2
+   :class:`~echosmonitor.core.discovery.EchosDiscoveryWorker`, reused
+   verbatim) plus a manual host + "Check device" row driving the same
+   typed PUBLIC probe (``probe_host``) — that one row covers BOTH the
+   AP-mode path (host prefilled ``192.168.4.1``) and nodes that do not
+   advertise on mDNS (e.g. Pi-hosted). Only a probe-confirmed
+   :class:`DiscoveredEchos` can be selected.
 
-3. **Confirmation** — summary of the device that will be created
-   (name, host:port, selectors), the path the YAML will live at,
-   and a one-sentence "you can edit this file at any time" hint.
-   ``[Finish]`` writes via :class:`ConfigStore`.
+3. **Name & password** — device name (de-collided suggestion) and the
+   OPTIONAL admin password. First boot prints a random password to the
+   device serial console; the password goes to the OS keyring (file
+   fallback) via :class:`EchosDeviceWorker.storeCredential`, NEVER into
+   the YAML (rule 15). Skippable — it can be stored later from the
+   device dialog.
 
-The wizard never bypasses :class:`ConfigStore`. Every write goes
-through the same validation + atomic-write pipeline as a runtime
-mutation, so a wizard-induced bad config is impossible.
+Finish writes one :class:`DeviceConfig` through :class:`ConfigStore`
+(validation + atomic write, same as any runtime mutation): host is the
+mDNS hostname when available (survives DHCP), ``port`` is the PROBED
+SeedLink port, selectors are the device's exact StationXML channels
+(``DiscoveredEchos.channels`` — empty degrades to manual selectors
+later). NOTE the wizard performs NO device writes — storing the
+password locally is keyring-only; changing the password ON the device
+stays in the device dialog (that POST is still unexercised on real
+firmware — M1 closure).
 
-Skip path: no device is written; the main window displays the
-DevicePanel's empty-state CTA + the status-bar tip (Stage C2),
-so the user has two visible affordances to add their first server.
+Threading: ONE wizard-owned QThread hosts both workers (discovery +
+device); slots serialize, teardown is latch-guarded with the bounded
+join + retained-on-timeout pattern (M6-0 canon). The thread starts
+LAZILY on the first page action — an undriven wizard owns no running
+thread (see ``_ensure_thread``).
 """
 
 from __future__ import annotations
 
-import uuid
+import contextlib
 from typing import TYPE_CHECKING
 
 import structlog
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QWizard,
     QWizardPage,
 )
 
+from echosmonitor.config.credentials import CredentialsStore
 from echosmonitor.config.schema import (
-    BandpassStage,
-    DetrendStage,
     DeviceConfig,
-    ReconnectConfig,
-    StaLtaStage,
+    EchosDeviceConfig,
     StreamSelectorConfig,
 )
+from echosmonitor.core.discovery import EchosDiscoveryWorker
+from echosmonitor.core.echos_device_worker import EchosDeviceWorker
 from echosmonitor.core.exceptions import ConfigError
-from echosmonitor.gui.dialogs.device_dialog import DeviceForm
+from echosmonitor.core.models import DiscoveredEchos
 
 if TYPE_CHECKING:
     from echosmonitor.core.config_store import ConfigStore
-    from echosmonitor.core.info_worker import InfoWorker
 
 _log = structlog.get_logger(__name__)
 
-
-# Two well-known public SeedLink servers used as the recommended
-# defaults. GFZ replaced INGV in M4 prep (H1) because the latter became
-# unroutable from EU consumer ISPs in May 2026. IRIS is the canonical
-# US-based alternative; the wizard prefers whichever answered first.
-_RECOMMENDED_GFZ = ("gfz-de", "geofon.gfz-potsdam.de", 18000, "GE", "WLF", "", "BHZ", "GFZ Potsdam")
-_RECOMMENDED_IRIS = (
-    "iris-iu-anmo",
-    "rtserve.iris.washington.edu",
-    18000,
-    "IU",
-    "ANMO",
-    "00",
-    "BHZ",
-    "IRIS DMC",
-)
-
-# Wall-clock budget for the welcome-page background probe. After this
-# the recommended path stays selectable but uses GFZ deterministically.
-# Generous enough for transcontinental round-trips; short enough that a
-# user clicking Next quickly does not wait long.
-_PROBE_TIMEOUT_S = 5.0
-# How often the wizard polls its in-flight probe state when the user
-# clicks Next before the probe completes. 100 ms keeps cancel latency
-# (in the unusual case where the user cancels the wizard mid-probe)
-# under one frame at 60 Hz.
-_PROBE_POLL_MS = 100
-
-# Page indices — wizard supports non-linear navigation via nextId().
 _PAGE_WELCOME = 0
-_PAGE_CONFIGURE = 1
-_PAGE_CONFIRM = 2
+_PAGE_FIND = 1
+_PAGE_DETAILS = 2
+
+_AP_HOST = "192.168.4.1"
+
+_THREAD_JOIN_MS = 5000
+
+# Bounded wait for the keyring write at Finish (rule 7): a locked keyring
+# can prompt the user, so this is generous — past it the wizard accepts
+# anyway with a "store it later from the device dialog" warning.
+_CREDENTIAL_TIMEOUT_MS = 15_000
+
+# Worker/thread pairs whose bounded join timed out at teardown: keep them
+# referenced for the process lifetime (M6-0: dropping the last reference
+# to a running QThread is a hard abort).
+_ABANDONED: list[tuple[QThread, tuple[object, ...]]] = []
 
 
-def _make_recommended_device(name: str, host: str, port: int) -> DeviceConfig:
-    """Build the recommended-server config with a sensible default chain.
+def device_config_for(device: DiscoveredEchos, name: str) -> DeviceConfig:
+    """Map one probe-confirmed node to the DeviceConfig the store gets.
 
-    Mirrors the IRIS / GFZ blocks commented into ``config/default.yaml``:
-    a detrend → bandpass(0.5-8 Hz) → STA/LTA(1/30 s, 3.5/1.5) chain
-    that produces visibly filtered output on a global-scale broadband
-    instrument without firing detections on quiet background.
+    Host prefers the mDNS hostname (survives DHCP lease changes); the
+    SeedLink ``port`` was PROBED from ``/api/seedlink/config``; selectors
+    are the device's exact StationXML channels (empty when the document
+    was unavailable — the device dialog's "Use device channels" can fill
+    them later).
     """
-    network, station, location, channel = {
-        _RECOMMENDED_GFZ[1]: ("GE", "WLF", "", "BHZ"),
-        _RECOMMENDED_IRIS[1]: ("IU", "ANMO", "00", "BHZ"),
-    }.get(host, ("*", "*", "", "*"))
+    selectors = []
+    for nslc in device.channels:
+        parts = nslc.split(".")
+        if len(parts) != 4:
+            continue
+        selectors.append(
+            StreamSelectorConfig(
+                network=parts[0], station=parts[1], location=parts[2], channel=parts[3]
+            )
+        )
     return DeviceConfig(
         name=name,
-        host=host,
-        port=port,
-        reconnect=ReconnectConfig(initial_delay_s=1.0, max_delay_s=60.0, connect_timeout_s=10.0),
-        selectors=[
-            StreamSelectorConfig(
-                network=network,
-                station=station,
-                location=location,
-                channel=channel,
-            )
-        ],
-        dsp_chain=[
-            DetrendStage(type="detrend", kind="constant"),
-            BandpassStage(type="bandpass", freqmin=0.5, freqmax=8.0, corners=4, zerophase=False),
-            StaLtaStage(
-                type="sta_lta",
-                sta=1.0,
-                lta=30.0,
-                on_threshold=3.5,
-                off_threshold=1.5,
-            ),
-        ],
+        host=device.hostname or device.address,
+        port=device.seedlink_port,
+        selectors=selectors,
+        echos=EchosDeviceConfig(http_port=device.http_port),
     )
 
 
+def suggest_device_name(device: DiscoveredEchos, existing: set[str]) -> str:
+    """First mDNS label ("echos"), de-collided against the config."""
+    base = (device.hostname.split(".")[0] if device.hostname else "") or "echos"
+    name = base
+    suffix = 2
+    while name in existing:
+        name = f"{base}-{suffix}"
+        suffix += 1
+    return name
+
+
 class _WelcomePage(QWizardPage):
-    """First page: pick a path forward (recommended / configure / skip).
+    """Page 1 — how do we reach the device?"""
 
-    Fires a background INFO ID probe at both recommended servers so
-    the time the user spends reading the blurb is also probe-warmup
-    time. Whichever server replies first is locked in; if neither
-    replies within :data:`_PROBE_TIMEOUT_S` (enforced by a
-    ``QTimer.singleShot`` started from :meth:`initializePage`), the
-    wizard falls back to GFZ deterministically.
-
-    Probe dispatch goes through an internal ``_idRequested`` signal
-    connected to ``InfoWorker.requestId`` via
-    ``Qt.ConnectionType.QueuedConnection``. Calling the slot directly
-    from the GUI thread would NOT route through Qt's event queue —
-    ``@Slot`` decorators do not change Python attribute-call semantics
-    — and the slot's body does blocking TCP I/O for up to 30 s, which
-    would freeze the welcome page. Mirrors the
-    ``station_browser.py::_stationsRequested`` / ``_streamsRequested``
-    pattern. The original Stage C draft called the slot directly and
-    code-reviewer caught the regression in the M4 stage C pass.
-    """
-
-    # Cross-thread request emission. The QueuedConnection ensures the
-    # request body runs on the InfoWorker's thread, not ours.
-    _idRequested = Signal(str, str, str, int)  # noqa: N815
-
-    def __init__(self, info_worker: InfoWorker, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._info_worker = info_worker
-        self._probe_winner: tuple[str, str, int, str] | None = None  # (label, host, port, name)
-        self._gfz_request_id = uuid.uuid4().hex
-        self._iris_request_id = uuid.uuid4().hex
-        self._gfz_responded = False
-        self._iris_responded = False
-        # Single-shot timer enforces ``_PROBE_TIMEOUT_S``. If neither
-        # probe responds by the deadline, ``_force_fallback`` locks
-        # GFZ in deterministically and updates the probe label.
-        self._timeout_timer = QTimer(self)
-        self._timeout_timer.setSingleShot(True)
-        self._timeout_timer.timeout.connect(self._on_probe_timeout)
-
         self.setTitle("Welcome to EchosMonitor")
-        self.setSubTitle("Choose how you'd like to get started.")
-
         layout = QVBoxLayout(self)
         blurb = QLabel(
-            "EchosMonitor streams real-time seismic data from one or more "
-            "SeedLink servers. To start, pick where to get your data from."
+            "EchosMonitor talks to Echos seismic nodes over your local "
+            "network. Let's add your first device.\n",
+            self,
         )
         blurb.setWordWrap(True)
         layout.addWidget(blurb)
 
-        self._radio_recommended = QRadioButton("Start with a recommended public server")
-        self._radio_recommended.setChecked(True)
-        self._radio_configure = QRadioButton("Configure my own server now")
-        self._radio_skip = QRadioButton("Skip — I'll add a device later")
-
+        self._scan_radio = QRadioButton(
+            "Find my device on the network (recommended)", self
+        )
+        scan_hint = QLabel(
+            "The device is powered on and joined to this WiFi/LAN — "
+            "EchosMonitor will discover it automatically.",
+            self,
+        )
+        self._ap_radio = QRadioButton("The device is in setup (AP) mode", self)
+        ap_hint = QLabel(
+            f"A factory-fresh device (or after holding button B for 5 s) "
+            f"starts its own WiFi access point. Join that WiFi first; the "
+            f"device then answers at http://{_AP_HOST}. Its initial admin "
+            f"password is printed once on the device serial console.",
+            self,
+        )
+        self._skip_radio = QRadioButton("Skip — I'll add devices later", self)
+        for hint in (scan_hint, ap_hint):
+            hint.setWordWrap(True)
+            hint.setIndent(22)
+            hint.setStyleSheet("color: palette(mid);")
         self._group = QButtonGroup(self)
-        for radio in (self._radio_recommended, self._radio_configure, self._radio_skip):
+        for radio in (self._scan_radio, self._ap_radio, self._skip_radio):
             self._group.addButton(radio)
-            layout.addWidget(radio)
-
-        self._probe_label = QLabel("Probing recommended servers…")
-        self._probe_label.setStyleSheet("color: #888; font-style: italic;")
-        layout.addWidget(self._probe_label)
-
+        self._scan_radio.setChecked(True)
+        layout.addWidget(self._scan_radio)
+        layout.addWidget(scan_hint)
+        layout.addWidget(self._ap_radio)
+        layout.addWidget(ap_hint)
+        layout.addWidget(self._skip_radio)
         layout.addStretch(1)
-
-        # Cross-thread request signal: routes ``_idRequested.emit(...)``
-        # to ``InfoWorker.requestId`` on the worker thread. Without
-        # the QueuedConnection, a direct call would block the GUI
-        # thread inside the slot body for the duration of the fetch.
-        self._idRequested.connect(
-            self._info_worker.requestId, type=Qt.ConnectionType.QueuedConnection
-        )
-
-        # Wire probe replies. The wizard subscribes to the worker's
-        # public reply signals; request_id filtering ensures stale
-        # responses (from any other code path that might issue probes)
-        # are ignored.
-        self._info_worker.identityReceived.connect(
-            self._on_identity, type=Qt.ConnectionType.QueuedConnection
-        )
-        self._info_worker.infoFailed.connect(
-            self._on_failed, type=Qt.ConnectionType.QueuedConnection
-        )
-
-    def initializePage(self) -> None:  # noqa: N802 — Qt override
-        """Kick off the probe lazily on first display.
-
-        Avoids firing the probe in tests that never reach this page,
-        and starts the wall-clock timer so a hung probe cannot delay
-        the wizard past :data:`_PROBE_TIMEOUT_S`.
-        """
-        gfz_host = _RECOMMENDED_GFZ[1]
-        gfz_port = _RECOMMENDED_GFZ[2]
-        iris_host = _RECOMMENDED_IRIS[1]
-        iris_port = _RECOMMENDED_IRIS[2]
-        # Emit through the queued-connection signal so the work runs
-        # on the InfoWorker thread. ``requestId`` echoes the second
-        # arg as the device_id label; we use the host:port string so
-        # the reply slot can identify which server answered.
-        self._idRequested.emit(self._gfz_request_id, f"{gfz_host}:{gfz_port}", gfz_host, gfz_port)
-        self._idRequested.emit(
-            self._iris_request_id, f"{iris_host}:{iris_port}", iris_host, iris_port
-        )
-        # Start the wall-clock budget. If neither probe replies in
-        # ``_PROBE_TIMEOUT_S``, ``_on_probe_timeout`` locks GFZ in.
-        self._timeout_timer.start(int(_PROBE_TIMEOUT_S * 1000))
-
-    @Slot(str, str, object)
-    def _on_identity(self, request_id: str, label: str, _identity: object) -> None:
-        if request_id == self._gfz_request_id:
-            self._gfz_responded = True
-            if self._probe_winner is None:
-                self._probe_winner = (
-                    _RECOMMENDED_GFZ[7],  # display label
-                    _RECOMMENDED_GFZ[1],
-                    _RECOMMENDED_GFZ[2],
-                    _RECOMMENDED_GFZ[0],  # device name
-                )
-                self._probe_label.setText(f"Recommended: {label} (responded ✓)")
-                self._timeout_timer.stop()
-        elif request_id == self._iris_request_id:
-            self._iris_responded = True
-            if self._probe_winner is None:
-                self._probe_winner = (
-                    _RECOMMENDED_IRIS[7],
-                    _RECOMMENDED_IRIS[1],
-                    _RECOMMENDED_IRIS[2],
-                    _RECOMMENDED_IRIS[0],
-                )
-                self._probe_label.setText(f"Recommended: {label} (responded ✓)")
-                self._timeout_timer.stop()
-
-    @Slot(str, str, str, str)
-    def _on_failed(self, request_id: str, _label: str, _kind: str, _reason: str) -> None:
-        if request_id == self._gfz_request_id:
-            self._gfz_responded = True
-        elif request_id == self._iris_request_id:
-            self._iris_responded = True
-        if self._gfz_responded and self._iris_responded and self._probe_winner is None:
-            # Both probes failed — fall back to GFZ deterministically.
-            # The user can still proceed; if GFZ is unreachable from
-            # their network they'll see WAITING_RETRY in the Devices
-            # dock and can fix it from there.
-            self._probe_winner = (
-                _RECOMMENDED_GFZ[7],
-                _RECOMMENDED_GFZ[1],
-                _RECOMMENDED_GFZ[2],
-                _RECOMMENDED_GFZ[0],
-            )
-            self._probe_label.setText(
-                "Recommended: GFZ Potsdam (probe failed; using as default — you can edit it later)."
-            )
-            self._timeout_timer.stop()
-
-    @Slot()
-    def _on_probe_timeout(self) -> None:
-        """Fire after :data:`_PROBE_TIMEOUT_S` if neither probe locked in.
-
-        ``_on_identity`` and ``_on_failed`` stop the timer the moment a
-        winner is set, so this only runs when both probes are still
-        outstanding past the budget — i.e. the in-flight ``info.fetch``
-        is still blocking on the worker thread inside its own deadline.
-        We DO NOT cancel the in-flight fetch (the InfoWorker tracks
-        only one ``_in_flight`` token across all clients, and other
-        code paths may also be using it); we just commit to the
-        deterministic GFZ default so the wizard's UX is bounded.
-        """
-        if self._probe_winner is not None:
-            return
-        self._probe_winner = (
-            _RECOMMENDED_GFZ[7],
-            _RECOMMENDED_GFZ[1],
-            _RECOMMENDED_GFZ[2],
-            _RECOMMENDED_GFZ[0],
-        )
-        self._probe_label.setText(
-            f"Recommended: GFZ Potsdam (no response within {int(_PROBE_TIMEOUT_S)}s — "
-            "using as default; you can edit it later)."
-        )
-
-    def winner(self) -> tuple[str, str, int, str] | None:
-        """Return the locked-in recommended server, or ``None`` if no probe answered yet.
-
-        Tuple shape: ``(display_label, host, port, device_name)``.
-        """
-        return self._probe_winner
 
     def selected_path(self) -> str:
-        """Return ``"recommended" | "configure" | "skip"`` based on the radios."""
-        if self._radio_recommended.isChecked():
-            return "recommended"
-        if self._radio_configure.isChecked():
-            return "configure"
-        return "skip"
+        if self._skip_radio.isChecked():
+            return "skip"
+        return "ap" if self._ap_radio.isChecked() else "scan"
 
     def nextId(self) -> int:  # noqa: N802 — Qt override
-        path = self.selected_path()
-        if path == "configure":
-            return _PAGE_CONFIGURE
-        # Recommended and skip both go straight to confirm.
-        return _PAGE_CONFIRM
+        return -1 if self.selected_path() == "skip" else _PAGE_FIND
 
 
-class _ConfigurePage(QWizardPage):
-    """Second page: embedded :class:`DeviceForm` + Test connection button.
+class _FindPage(QWizardPage):
+    """Page 2 — discover or manually probe; only confirmed nodes select."""
 
-    Uses the same internal-signal pattern as :class:`_WelcomePage` for
-    cross-thread INFO requests: ``_idRequested`` is wired to
-    ``InfoWorker.requestId`` via ``Qt.ConnectionType.QueuedConnection``
-    so the slot runs on the worker thread, not the GUI thread.
-    Calling the slot directly from the GUI thread would block for up
-    to 30 s on an unreachable host (the slot's body does blocking TCP
-    I/O — the ``@Slot`` decorator is a Qt-side annotation, not a
-    cross-thread dispatcher).
-    """
-
-    _idRequested = Signal(str, str, str, int)  # noqa: N815
+    # Page → workers (queued; the wizard connects them to the thread).
+    scanRequested = Signal()  # noqa: N815
+    probeRequested = Signal(str, int)  # host, http_port  # noqa: N815
 
     def __init__(
         self,
-        info_worker: InfoWorker,
-        existing_names: list[str],
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._info_worker = info_worker
-        self.setTitle("Configure your server")
-        self.setSubTitle(
-            "Enter your SeedLink server details. The Test connection button "
-            "performs an INFO ID query."
-        )
-
-        outer = QVBoxLayout(self)
-        self._form = DeviceForm(existing_names=existing_names, parent=self)
-        outer.addWidget(self._form)
-
-        test_row = QHBoxLayout()
-        self._test_button = QPushButton("Test connection")
-        self._test_label = QLabel("")
-        self._test_label.setStyleSheet("color: #888; font-style: italic;")
-        test_row.addWidget(self._test_button)
-        test_row.addWidget(self._test_label, stretch=1)
-        outer.addLayout(test_row)
-
-        self._test_request_id: str | None = None
-        self._test_button.clicked.connect(self._on_test_clicked)
-        self._idRequested.connect(
-            self._info_worker.requestId, type=Qt.ConnectionType.QueuedConnection
-        )
-        self._info_worker.identityReceived.connect(
-            self._on_test_identity, type=Qt.ConnectionType.QueuedConnection
-        )
-        self._info_worker.infoFailed.connect(
-            self._on_test_failed, type=Qt.ConnectionType.QueuedConnection
-        )
-
-        # Forward the form's validity state into the wizard's Next/Finish
-        # button machinery via ``isComplete`` overrides.
-        self._form.isValid.connect(self._on_form_valid)
-
-    def isComplete(self) -> bool:  # noqa: N802 — Qt override
-        return self._form.is_valid()
-
-    @Slot(bool)
-    def _on_form_valid(self, _valid: bool) -> None:
-        # Notify QWizard that ``isComplete`` may have changed.
-        self.completeChanged.emit()
-
-    @Slot()
-    def _on_test_clicked(self) -> None:
-        if not self._form.is_valid():
-            self._test_label.setText("Fix validation errors first.")
-            return
-        cfg = self._form.to_config()
-        self._test_request_id = uuid.uuid4().hex
-        self._test_label.setText("Probing…")
-        label = f"{cfg.host}:{cfg.port}"
-        # Emit through the queued-connection signal so the fetch runs
-        # on the InfoWorker thread, not ours. See class docstring.
-        self._idRequested.emit(self._test_request_id, label, cfg.host, cfg.port)
-
-    @Slot(str, str, object)
-    def _on_test_identity(self, request_id: str, label: str, identity: object) -> None:
-        if request_id != self._test_request_id:
-            return
-        version = getattr(identity, "version", "?")
-        organization = getattr(identity, "organization", "") or ""
-        suffix = f" ({organization})" if organization else ""
-        self._test_label.setText(f"✓ Connected to {label} v{version}{suffix}")
-
-    @Slot(str, str, str, str)
-    def _on_test_failed(self, request_id: str, label: str, _kind: str, reason: str) -> None:
-        if request_id != self._test_request_id:
-            return
-        self._test_label.setText(f"✗ {label}: {reason}")
-
-    def to_config(self) -> DeviceConfig:
-        return self._form.to_config()
-
-    def nextId(self) -> int:  # noqa: N802 — Qt override
-        return _PAGE_CONFIRM
-
-
-class _ConfirmPage(QWizardPage):
-    """Third page: summary + Finish.
-
-    Pulls the chosen device from whichever upstream page is active
-    (welcome's recommended winner or configure's form). Renders a
-    short summary plus the resolved config path.
-    """
-
-    def __init__(
-        self,
-        store: ConfigStore,
         welcome: _WelcomePage,
-        configure: _ConfigurePage,
+        configured_hosts: set[str],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._store = store
+        self.setTitle("Find your Echos device")
         self._welcome = welcome
-        self._configure = configure
-        self.setTitle("Confirm")
+        # Normalized hosts already in the config (Help-menu re-runs): the
+        # row is marked, not blocked — re-adding under a new name is legal.
+        self._configured_hosts = configured_hosts
+        self._devices: list[DiscoveredEchos] = []
+        # Scan-busy and probe-busy are SEPARATE: a streaming scan row must
+        # not re-enable "Scan network" mid-scan (the worker's no-queue
+        # invariant assumes the button gates re-entry — auditor MED-1).
+        self._scan_busy = False
+        self._probe_busy = False
 
         layout = QVBoxLayout(self)
-        self._summary_label = QLabel("")
-        self._summary_label.setWordWrap(True)
-        layout.addWidget(self._summary_label)
+        self._status = QLabel("", self)
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status)
 
-        self._path_label = QLabel("")
-        self._path_label.setWordWrap(True)
-        self._path_label.setStyleSheet("color: #888; font-style: italic;")
-        layout.addWidget(self._path_label)
+        self._table = QTableWidget(0, 4, self)
+        self._table.setHorizontalHeaderLabels(["Device", "Host", "Firmware", "Project"])
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._table, 1)
 
-        layout.addStretch(1)
+        row = QHBoxLayout()
+        self._scan_button = QPushButton("Scan network", self)
+        row.addWidget(self._scan_button)
+        row.addStretch(1)
+        row.addWidget(QLabel("Host:", self))
+        self._host_edit = QLineEdit(self)
+        self._host_edit.setPlaceholderText("echos.local or 192.168.4.1")
+        row.addWidget(self._host_edit, 1)
+        self._port_spin = QSpinBox(self)
+        self._port_spin.setRange(1, 65535)
+        self._port_spin.setValue(80)
+        row.addWidget(self._port_spin)
+        self._probe_button = QPushButton("Check device", self)
+        row.addWidget(self._probe_button)
+        layout.addLayout(row)
+
+        self._scan_button.clicked.connect(self._on_scan_clicked)
+        self._probe_button.clicked.connect(self._on_probe_clicked)
+        self._host_edit.textChanged.connect(lambda _text: self._update_buttons())
+        self._table.itemSelectionChanged.connect(self.completeChanged)
 
     def initializePage(self) -> None:  # noqa: N802 — Qt override
         path = self._welcome.selected_path()
-        cfg: DeviceConfig | None = None
-        if path == "recommended":
-            winner = self._welcome.winner()
-            if winner is None:
-                # Fallback (should be rare — hit only if the user
-                # clicked Next before either probe completed AND
-                # before the timeout fallback fired). Use GFZ.
-                winner = (
-                    _RECOMMENDED_GFZ[7],
-                    _RECOMMENDED_GFZ[1],
-                    _RECOMMENDED_GFZ[2],
-                    _RECOMMENDED_GFZ[0],
-                )
-            display_label, host, port, name = winner
-            cfg = _make_recommended_device(name, host, port)
-            self._summary_label.setText(
-                f"<b>Recommended server:</b> {display_label}<br>"
-                f"<b>Name:</b> {name}<br>"
-                f"<b>Host:</b> {host}:{port}<br>"
-                f"<b>Selectors:</b> {cfg.selectors[0].network}.{cfg.selectors[0].station}."
-                f"{cfg.selectors[0].location}.{cfg.selectors[0].channel}<br>"
-                f"<b>DSP chain:</b> {len(cfg.dsp_chain)} stages"
+        if path == "ap":
+            self._host_edit.setText(_AP_HOST)
+            self._status.setText(
+                f"Join the device's WiFi access point, then press "
+                f'"Check device" to reach it at {_AP_HOST}.'
             )
-        elif path == "configure":
-            cfg = self._configure.to_config()
-            sel = cfg.selectors[0] if cfg.selectors else None
-            sel_text = (
-                f"{sel.network}.{sel.station}.{sel.location}.{sel.channel}"
-                if sel is not None
-                else "(none)"
-            )
-            self._summary_label.setText(
-                f"<b>Custom server:</b><br>"
-                f"<b>Name:</b> {cfg.name}<br>"
-                f"<b>Host:</b> {cfg.host}:{cfg.port}<br>"
-                f"<b>Selectors:</b> {sel_text}<br>"
-                f"<b>DSP chain:</b> {len(cfg.dsp_chain)} stages"
-            )
+        elif not self._devices:
+            self._on_scan_clicked()
+
+    def isComplete(self) -> bool:  # noqa: N802 — Qt override
+        return self.selected_device() is not None
+
+    def selected_device(self) -> DiscoveredEchos | None:
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._devices):
+            return None
+        return self._devices[row]
+
+    def _update_buttons(self) -> None:
+        busy = self._scan_busy or self._probe_busy
+        self._scan_button.setEnabled(not busy)
+        self._probe_button.setEnabled(not busy and bool(self._host_edit.text().strip()))
+
+    @Slot()
+    def _on_scan_clicked(self) -> None:
+        self._devices.clear()
+        self._table.setRowCount(0)
+        self._scan_busy = True
+        self._status.setText("Scanning the local network…")
+        self._update_buttons()
+        self.scanRequested.emit()
+
+    @Slot()
+    def _on_probe_clicked(self) -> None:
+        host = self._host_edit.text().strip()
+        if not host:
+            return
+        self._probe_busy = True
+        self._status.setText(f"Checking {host}…")
+        self._update_buttons()
+        self.probeRequested.emit(host, int(self._port_spin.value()))
+
+    @staticmethod
+    def _host_keys(device: DiscoveredEchos) -> set[str]:
+        return {device.hostname.casefold().rstrip("."), device.address.casefold()} - {""}
+
+    @Slot(object)
+    def on_device(self, payload: object) -> None:
+        if not isinstance(payload, DiscoveredEchos):  # rule 4 guard
+            return
+        # Probe-busy ends with its result; a streaming SCAN row must NOT
+        # end scan-busy (the scan ends with on_scan_finished/on_failed).
+        if self._probe_busy:
+            self._probe_busy = False
+            self._status.setText("Device confirmed — select it and continue.")
+            self._update_buttons()
+        # Repeats (manual re-probe, scan row + manual probe of the same
+        # node under hostname vs address) replace, never stack: matched on
+        # the normalized {hostname, address} set + REST port.
+        keys = self._host_keys(payload)
+        for row, existing in enumerate(self._devices):
+            if existing.http_port == payload.http_port and keys & self._host_keys(existing):
+                self._devices[row] = payload
+                self._fill_row(row, payload)
+                self._table.selectRow(row)
+                return
+        self._devices.append(payload)
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+        self._fill_row(row, payload)
+        if self._table.currentRow() < 0:
+            self._table.selectRow(row)
+
+    def _fill_row(self, row: int, device: DiscoveredEchos) -> None:
+        name = device.instance
+        if self._host_keys(device) & self._configured_hosts:
+            # Help-menu re-runs: say so, don't block (re-adding under a
+            # new name is a legitimate config).
+            name += " (already configured)"
+        for column, text in (
+            (0, name),
+            (1, device.hostname or device.address),
+            (2, device.firmware_version),
+            (3, device.project_name),
+        ):
+            self._table.setItem(row, column, QTableWidgetItem(text))
+
+    @Slot(int)
+    def on_scan_finished(self, count: int) -> None:
+        self._scan_busy = False
+        self._update_buttons()
+        if count:
+            self._status.setText(f"Found {count} Echos node(s) — select one and continue.")
         else:
-            self._summary_label.setText(
-                "<b>No device will be created.</b><br>"
-                "You can add one any time from the Devices dock."
+            self._status.setText(
+                "No Echos nodes found on this network. Enter the device's "
+                "host below (it may not advertise on mDNS), or scan again."
             )
-        self._pending_cfg = cfg
-        self._path_label.setText(
-            f"Configuration will be saved to {self._store.path}. "
-            "You can edit this file directly at any time."
+
+    @Slot(str, str)
+    def on_failed(self, kind: str, message: str) -> None:
+        self._scan_busy = False
+        self._probe_busy = False
+        self._update_buttons()
+        self._status.setText(f"Could not confirm an Echos device ({kind}): {message}")
+
+
+class _DetailsPage(QWizardPage):
+    """Page 3 — name + optional admin password + summary."""
+
+    def __init__(
+        self, find: _FindPage, existing_names: set[str], parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setTitle("Name and credentials")
+        self._find = find
+        self._existing = existing_names
+
+        layout = QVBoxLayout(self)
+        self._summary = QLabel("", self)
+        self._summary.setWordWrap(True)
+        layout.addWidget(self._summary)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Device name:", self))
+        self._name_edit = QLineEdit(self)
+        name_row.addWidget(self._name_edit, 1)
+        layout.addLayout(name_row)
+        self._name_hint = QLabel("", self)
+        self._name_hint.setStyleSheet("color: palette(mid);")
+        layout.addWidget(self._name_hint)
+
+        pw_row = QHBoxLayout()
+        pw_row.addWidget(QLabel("Admin password:", self))
+        self._password_edit = QLineEdit(self)
+        self._password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        pw_row.addWidget(self._password_edit, 1)
+        layout.addLayout(pw_row)
+        pw_hint = QLabel(
+            "Optional — needed only to CHANGE settings on the device "
+            "(reading always works). On first boot the device prints a "
+            "random password once on its serial console. Stored in the "
+            "OS keyring, never in the config file. You can store or "
+            "change it later from the device dialog.",
+            self,
+        )
+        pw_hint.setWordWrap(True)
+        pw_hint.setStyleSheet("color: palette(mid);")
+        layout.addWidget(pw_hint)
+
+        self._finish_status = QLabel("", self)
+        layout.addWidget(self._finish_status)
+        layout.addStretch(1)
+
+        self._name_edit.textChanged.connect(self._on_name_changed)
+
+    def initializePage(self) -> None:  # noqa: N802 — Qt override
+        device = self._find.selected_device()
+        if device is None:
+            return
+        self._name_edit.setText(suggest_device_name(device, self._existing))
+        channels = len(device.channels)
+        selector_note = (
+            f"{channels} channels read from the device's StationXML — the "
+            "stream selectors are set up for you."
+            if channels
+            else "The device's channel list was not readable; configure the "
+            "stream selectors from the device dialog afterwards."
+        )
+        self._summary.setText(
+            f"Adding {device.hostname or device.address} — firmware "
+            f"{device.firmware_version}, project {device.project_name!r}, "
+            f"SeedLink port {device.seedlink_port}. {selector_note}\n"
         )
 
-    def commit(self) -> None:
-        """Apply the chosen device to the store. Called from the wizard's accept path.
+    def isComplete(self) -> bool:  # noqa: N802 — Qt override
+        name = self._name_edit.text().strip()
+        return bool(name) and name not in self._existing
 
-        Raises:
-            ConfigError: If the store rejects the config (e.g.
-                duplicate name in an unusual race).
-        """
-        cfg = getattr(self, "_pending_cfg", None)
-        if cfg is None:
-            return
-        self._store.add_device(cfg)
+    def device_name(self) -> str:
+        return self._name_edit.text().strip()
+
+    def password(self) -> str:
+        return self._password_edit.text()
+
+    def set_finish_status(self, text: str) -> None:
+        self._finish_status.setText(text)
+
+    @Slot()
+    def _on_name_changed(self) -> None:
+        name = self._name_edit.text().strip()
+        self._name_hint.setText(
+            "A device with this name already exists." if name in self._existing else ""
+        )
+        self.completeChanged.emit()
 
 
 class FirstRunWizard(QWizard):
-    """The 3-page first-run wizard (M4 stage C).
+    """The Echos first-run wizard (M6 rewrite).
 
-    Constructed only when :func:`is_first_run` returns True at app
-    startup — the regression test
-    ``tests/gui/test_first_run_no_trigger.py`` pins the
-    not-shown-on-populated-config invariant.
+    Constructed when :func:`is_first_run` returns True at startup, and
+    on demand from Help → First-run wizard. Owns ONE worker thread
+    hosting the discovery worker (scan + manual probe) and the device
+    worker (keyring credential store at Finish).
     """
+
+    # Wizard → device worker (queued).
+    _credStoreRequested = Signal(str, str)  # noqa: N815
 
     def __init__(
         self,
         *,
         store: ConfigStore,
-        info_worker: InfoWorker,
         parent: QWidget | None = None,
+        credentials: CredentialsStore | None = None,
+        discovery_worker: EchosDiscoveryWorker | None = None,
+        device_worker: EchosDeviceWorker | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("EchosMonitor — First Run")
         self.setModal(True)
-        # Don't show the "<" Back button on the welcome page — the
-        # wizard's flow is mostly forward.
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
 
         self._store = store
+        self._torn_down = False
+        self._pending_credential = False
 
-        existing_names = [d.name for d in store.root.devices]
-        self._welcome = _WelcomePage(info_worker, parent=self)
-        self._configure = _ConfigurePage(info_worker, existing_names, parent=self)
-        self._confirm = _ConfirmPage(store, self._welcome, self._configure, parent=self)
-
+        existing_names = {d.name for d in store.root.devices}
+        configured_hosts = {
+            d.host.casefold().rstrip(".") for d in store.root.devices if d.host
+        }
+        self._welcome = _WelcomePage(parent=self)
+        self._find = _FindPage(self._welcome, configured_hosts, parent=self)
+        self._details = _DetailsPage(self._find, existing_names, parent=self)
         self.setPage(_PAGE_WELCOME, self._welcome)
-        self.setPage(_PAGE_CONFIGURE, self._configure)
-        self.setPage(_PAGE_CONFIRM, self._confirm)
+        self.setPage(_PAGE_FIND, self._find)
+        self.setPage(_PAGE_DETAILS, self._details)
         self.setStartId(_PAGE_WELCOME)
 
+        # One thread, two small workers (slots serialize — a credential
+        # store can never race a scan into the same event loop).
+        self._discovery = discovery_worker or EchosDiscoveryWorker()
+        self._device_worker = device_worker or EchosDeviceWorker(
+            credentials if credentials is not None else CredentialsStore()
+        )
+        self._thread = QThread()
+        self._thread.setObjectName("firstrun-wizard")
+        self._discovery.moveToThread(self._thread)
+        self._device_worker.moveToThread(self._thread)
+        queued = Qt.ConnectionType.QueuedConnection
+        self._find.scanRequested.connect(self._discovery.discover, type=queued)
+        self._find.probeRequested.connect(self._discovery.probe_host, type=queued)
+        self._discovery.deviceDiscovered.connect(self._find.on_device, type=queued)
+        self._discovery.discoveryFinished.connect(self._find.on_scan_finished, type=queued)
+        self._discovery.discoveryFailed.connect(self._find.on_failed, type=queued)
+        self._credStoreRequested.connect(self._device_worker.storeCredential, type=queued)
+        self._device_worker.credentialStored.connect(self._on_credential_stored, type=queued)
+        # The thread starts LAZILY on the first page action: a wizard that
+        # is constructed but never driven past Welcome (Help-menu open +
+        # immediate close, menubar tests) must not own a running thread —
+        # an undriven QWizard never reaches done()/teardown when its exec
+        # is bypassed, and a GC'd running QThread is a hard abort. Queued
+        # events posted before the start are delivered once exec() runs.
+        self._find.scanRequested.connect(self._ensure_thread)
+        self._find.probeRequested.connect(self._ensure_thread)
+
+        # Rule 7: the keyring write at Finish is observable and bounded.
+        self._credential_timer = QTimer(self)
+        self._credential_timer.setSingleShot(True)
+        self._credential_timer.setInterval(_CREDENTIAL_TIMEOUT_MS)
+        self._credential_timer.timeout.connect(self._on_credential_timeout)
+
+    @Slot()
+    def _ensure_thread(self) -> None:
+        if not self._torn_down and not self._thread.isRunning():
+            self._thread.start()
+
+    # ------------------------------------------------------------------
+    # Finish path
+    # ------------------------------------------------------------------
     def accept(self) -> None:
+        if self._welcome.selected_path() == "skip" or self.currentId() == _PAGE_WELCOME:
+            _log.info("first_run_wizard_skipped", path=self._welcome.selected_path())
+            super().accept()
+            return
+        if self._pending_credential:
+            return  # already finishing — waiting on the keyring write
+        device = self._find.selected_device()
+        if device is None:
+            super().accept()
+            return
+        name = self._details.device_name()
         try:
-            self._confirm.commit()
+            self._store.add_device(device_config_for(device, name))
         except ConfigError as exc:
-            # Surface the error to the user and KEEP the wizard open
-            # (do NOT fall through to ``super().accept()``) so they
-            # can fix duplicate-name conflicts and retry. Silent
-            # reject was the original M4 stage C behaviour; code-
-            # reviewer caught it in the stage C pass.
+            # Keep the wizard open so the user can fix and retry (the
+            # M4-C reviewer finding — silent reject loses their input).
             _log.warning("first_run_wizard_commit_failed", error=str(exc))
             QMessageBox.warning(
                 self,
                 "Could not save device",
                 f"The device could not be saved:\n\n{exc}\n\n"
-                "Use the Back button to fix the form and try Finish again.",
+                "Adjust the name and try Finish again.",
             )
             return
+        _log.info(
+            "first_run_wizard_device_added",
+            device=name,
+            host=device.hostname or device.address,
+            selectors=len(device.channels),
+        )
+        password = self._details.password()
+        if not password:
+            super().accept()
+            return
+        # Keyring writes run on the worker (a locked keyring blocks on a
+        # system prompt — never the GUI thread, rule 1). The wizard
+        # accepts on stored/timeout; the password can always be re-stored
+        # from the device dialog.
+        self._pending_credential = True
+        self._details.set_finish_status("Storing the admin password…")
+        # Freeze ALL navigation during the bounded wait: Back would let
+        # the user change the selection under a finish already committed.
+        for which in (
+            QWizard.WizardButton.FinishButton,
+            QWizard.WizardButton.BackButton,
+            QWizard.WizardButton.CancelButton,
+        ):
+            button = self.button(which)
+            if button is not None:
+                button.setEnabled(False)
+        self._ensure_thread()
+        self._credential_timer.start()
+        self._credStoreRequested.emit(name, password)
+
+    @Slot(str)
+    def _on_credential_stored(self, device_key: str) -> None:
+        del device_key
+        if not self._pending_credential:
+            return
+        self._pending_credential = False
+        self._credential_timer.stop()
+        _log.info("first_run_wizard_credential_stored")
         super().accept()
+
+    @Slot()
+    def _on_credential_timeout(self) -> None:
+        if not self._pending_credential:
+            return
+        self._pending_credential = False
+        _log.warning("first_run_wizard_credential_timeout")
+        QMessageBox.warning(
+            self,
+            "Password not stored",
+            "Storing the admin password timed out (the OS keyring may be "
+            "locked). The device was added — store the password later "
+            "from the device dialog.",
+        )
+        super().accept()
+
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+    def done(self, result: int) -> None:
+        self._teardown()
+        super().done(result)
+
+    def _teardown(self) -> None:
+        if self._torn_down:
+            return
+        self._torn_down = True
+        if self._pending_credential:
+            # X/Esc during the bounded keyring wait: the DEVICE write is
+            # already durable; only the password store is dropped — say
+            # so (rule 7: every dropped wait is observable). It can be
+            # re-stored from the device dialog.
+            self._pending_credential = False
+            _log.warning("first_run_wizard_credential_dropped_at_close")
+        self._credential_timer.stop()
+        self._discovery.stop()
+        self._device_worker.stop()
+        self._thread.quit()
+        joined = self._thread.wait(_THREAD_JOIN_MS)
+        for signal, slot in (
+            (self._find.scanRequested, self._discovery.discover),
+            (self._find.probeRequested, self._discovery.probe_host),
+            (self._discovery.deviceDiscovered, self._find.on_device),
+            (self._discovery.discoveryFinished, self._find.on_scan_finished),
+            (self._discovery.discoveryFailed, self._find.on_failed),
+            (self._credStoreRequested, self._device_worker.storeCredential),
+            (self._device_worker.credentialStored, self._on_credential_stored),
+        ):
+            with contextlib.suppress(RuntimeError, TypeError):
+                signal.disconnect(slot)
+        if not joined:
+            _log.warning("first_run_wizard_thread_join_timeout")
+            _ABANDONED.append((self._thread, (self._discovery, self._device_worker)))
 
 
 __all__ = ["FirstRunWizard"]
