@@ -29,8 +29,6 @@ not an error dialog (decision log 2026-06-12).
 
 from __future__ import annotations
 
-import itertools
-
 import pyqtgraph as pg
 import structlog
 from PySide6.QtCore import QPointF, Qt, Signal, Slot
@@ -48,8 +46,8 @@ from PySide6.QtWidgets import (
 from echosmonitor.core.models import AcquisitionState, ConnState
 from echosmonitor.core.positions import (
     ResolvedPosition,
-    haversine_m,
     local_east_north,
+    station_geometry,
 )
 
 _log = structlog.get_logger(__name__)
@@ -266,10 +264,10 @@ class MapWidget(QWidget):
         )
 
     def _update_distances(self, positioned: list[tuple[str, ResolvedPosition]]) -> None:
-        pairs = [
-            (a, b, haversine_m(pa.latitude, pa.longitude, pb.latitude, pb.longitude))
-            for (a, pa), (b, pb) in itertools.combinations(positioned, 2)
-        ]
+        # Same geometry shape M5 consumes (core.positions.station_geometry)
+        # so the table and the future array report can never disagree.
+        geometry = station_geometry(dict(positioned))
+        pairs = [(a, b, meters) for (a, b), meters in geometry.distances_m.items()]
         pairs.sort(key=lambda row: row[2])
         self._distance_table.setRowCount(len(pairs))
         for row, (name_a, name_b, meters) in enumerate(pairs):

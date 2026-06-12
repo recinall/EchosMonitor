@@ -596,7 +596,19 @@ Goal: a Map tab showing each device's position and live state.
       live in `core/positions.py` for M5 reuse. Reviewer minors fixed:
       unchanged-state early-out (no plot churn on flapping retries),
       dead assert dropped, ghost-device `select_device` no-op pinned.
-- [ ] **C. HVSR/M5 hooks**: expose station geometry (distances matrix).
+- [x] **C. HVSR/M5 hooks**: Done 2026-06-12. `core/positions.py`:
+      frozen `StationGeometry` (devices, positions, lexicographic-pair
+      `distances_m`, order-free `.distance()` that raises `KeyError` for
+      non-members) + pure `distance_matrix()` / `station_geometry()`;
+      `PositionResolver.geometry(devices=None)` snapshots the cache
+      (never aliases it) with optional selection — names without a
+      position are excluded and discoverable via the `.devices` diff
+      (M5 must render "no position" from that, not guess). The Map tab's
+      distance table now consumes the same shape, so it and the future
+      M5 report cannot disagree.
+
+**M4 CLOSED 2026-06-12** — resolver (A), map tab (B), geometry hooks (C);
+gate green at every stage, both reviewers passed each diff.
 
 ## M5 — Multi-device HVSR
 

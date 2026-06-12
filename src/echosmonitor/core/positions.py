@@ -37,7 +37,7 @@ import io
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -178,6 +178,72 @@ def local_east_north(
     east = _EARTH_RADIUS_M * math.radians(dlon) * math.cos(math.radians(lat0))
     north = _EARTH_RADIUS_M * math.radians(lat - lat0)
     return east, north
+
+
+@dataclass(frozen=True, slots=True)
+class StationGeometry:
+    """Resolved positions + pairwise distances for a station set (M4-C).
+
+    The M5 array-HVSR hook: the multi-device UI, the map f0 overlay and
+    the multi-station report all consume this one shape. ``devices``
+    holds only stations WITH a resolved position, in the caller's order;
+    ``distances_m`` is keyed by lexicographically ordered name pairs —
+    use :meth:`distance` for order-free lookup. Pure data (no Qt).
+    """
+
+    devices: tuple[str, ...]
+    positions: dict[str, ResolvedPosition]
+    distances_m: dict[tuple[str, str], float]
+
+    def distance(self, a: str, b: str) -> float:
+        """Great-circle metres between two member stations (order-free).
+
+        Raises ``KeyError`` when either name is not a positioned member —
+        an absent station silently measuring 0 m away would be the kind
+        of quiet lie rule 16 exists to prevent.
+        """
+        if a == b:
+            if a not in self.positions:
+                raise KeyError(a)
+            return 0.0
+        key = (a, b) if a <= b else (b, a)
+        return self.distances_m[key]
+
+
+def distance_matrix(
+    positions: Mapping[str, ResolvedPosition],
+) -> dict[tuple[str, str], float]:
+    """Pairwise great-circle distances, one entry per unordered pair.
+
+    Keys are ``(a, b)`` with ``a < b`` lexicographically. Pure.
+    """
+    matrix: dict[tuple[str, str], float] = {}
+    names = sorted(positions)
+    for index, a in enumerate(names):
+        for b in names[index + 1 :]:
+            pa, pb = positions[a], positions[b]
+            matrix[(a, b)] = haversine_m(pa.latitude, pa.longitude, pb.latitude, pb.longitude)
+    return matrix
+
+
+def station_geometry(
+    positions: Mapping[str, ResolvedPosition],
+    devices: Iterable[str] | None = None,
+) -> StationGeometry:
+    """Build the geometry snapshot for ``devices`` (default: all positioned).
+
+    Names without a resolved position are silently excluded — the caller
+    reads ``devices`` to learn what actually made it in (M5 must render
+    "station X has no position" from that difference, not guess).
+    """
+    if devices is None:
+        names = tuple(positions)
+    else:
+        names = tuple(dict.fromkeys(n for n in devices if n in positions))
+    subset = {name: positions[name] for name in names}
+    return StationGeometry(
+        devices=names, positions=subset, distances_m=distance_matrix(subset)
+    )
 
 
 def _default_client_factory(query: PositionQuery) -> EchosApiClient:
@@ -468,6 +534,15 @@ class PositionResolver(QObject):
         """Snapshot of every resolved position (copy — safe to hold)."""
         return dict(self._cache)
 
+    def geometry(self, devices: Iterable[str] | None = None) -> StationGeometry:
+        """Station geometry over the current cache (M4-C, the M5 hook).
+
+        ``devices`` restricts to a selection (e.g. the array-HVSR device
+        multi-select); names without a resolved position are excluded —
+        compare ``geometry.devices`` against the request to find them.
+        """
+        return station_geometry(self._cache, devices)
+
     def shutdown(self) -> None:
         """Tear down for app exit — stop the worker and join the thread.
 
@@ -532,7 +607,10 @@ __all__ = [
     "PositionResolver",
     "PositionSource",
     "ResolvedPosition",
+    "StationGeometry",
+    "distance_matrix",
     "haversine_m",
     "local_east_north",
+    "station_geometry",
     "stationxml_coordinates",
 ]

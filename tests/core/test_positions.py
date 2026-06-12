@@ -20,14 +20,17 @@ import threading
 from typing import Any
 
 import httpx
+import pytest
 
 from echosmonitor.core.echos_api import EchosApiClient
 from echosmonitor.core.positions import (
     PositionQuery,
     PositionResolver,
     ResolvedPosition,
+    distance_matrix,
     haversine_m,
     local_east_north,
+    station_geometry,
     stationxml_coordinates,
 )
 from tests.core.echos_fake import FakeEchosFirmware
@@ -130,6 +133,69 @@ def test_haversine_known_distances() -> None:
     assert haversine_m(45.0, 11.0, 45.1, 11.2) == haversine_m(45.1, 11.2, 45.0, 11.0)
     # ~0.01° of longitude at 45°N ≈ 786 m.
     assert abs(haversine_m(45.0, 11.0, 45.0, 11.01) - 786.0) < 2.0
+
+
+def _position(device: str, lat: float, lon: float, elev: float = 0.0) -> ResolvedPosition:
+    return ResolvedPosition(
+        device=device,
+        latitude=lat,
+        longitude=lon,
+        elevation_m=elev,
+        source="stationxml",
+        resolved_at=0.0,
+    )
+
+
+def test_distance_matrix_pairs_and_keys() -> None:
+    positions = {
+        "north": _position("north", 45.01, 11.0),
+        "east": _position("east", 45.0, 11.01),
+        "origin": _position("origin", 45.0, 11.0),
+    }
+    matrix = distance_matrix(positions)
+    # One entry per unordered pair, keys lexicographic (a < b).
+    assert set(matrix) == {("east", "north"), ("east", "origin"), ("north", "origin")}
+    assert abs(matrix[("east", "origin")] - 786.0) < 2.0
+    assert abs(matrix[("north", "origin")] - 1112.0) < 2.0
+    assert matrix[("east", "origin")] == haversine_m(45.0, 11.01, 45.0, 11.0)
+
+
+def test_station_geometry_selection_and_order_free_distance() -> None:
+    positions = {
+        "a": _position("a", 45.0, 11.0),
+        "b": _position("b", 45.0, 11.01),
+        "c": _position("c", 45.01, 11.0),
+    }
+    # Selection restricts membership; an unpositioned name is excluded
+    # (the caller reads .devices to learn what made it in), duplicates
+    # collapse, order preserved.
+    geometry = station_geometry(positions, ["b", "a", "b", "ghost"])
+    assert geometry.devices == ("b", "a")
+    assert set(geometry.positions) == {"a", "b"}
+    assert geometry.distance("a", "b") == geometry.distance("b", "a")
+    assert geometry.distance("a", "a") == 0.0
+    with pytest.raises(KeyError):
+        geometry.distance("a", "c")  # not a member of this selection
+    with pytest.raises(KeyError):
+        geometry.distance("ghost", "ghost")
+    # Default: every positioned station.
+    assert station_geometry(positions).devices == ("a", "b", "c")
+
+
+def test_resolver_geometry_reads_the_cache(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    resolver = _resolver(fw)
+    try:
+        with qtbot.waitSignal(resolver.positionResolved, timeout=_RESOLVE_DEADLINE_MS):
+            resolver.configure((_query(),))
+        geometry = resolver.geometry()
+        assert geometry.devices == ("echos-field-01",)
+        assert geometry.positions["echos-field-01"].latitude == 45.4
+        assert geometry.distances_m == {}
+        # Selection of an unresolved name yields an empty geometry, not a lie.
+        assert resolver.geometry(["nope"]).devices == ()
+    finally:
+        resolver.shutdown()
 
 
 def test_local_east_north_projection() -> None:
