@@ -990,15 +990,27 @@ surfaced real problems — this milestone fixes them.
       restored. Regression test
       `test_fallback_path_is_writable_user_path_not_bundle` pins a
       first write creating the user file with the bundle untouched.
-- [ ] **E. End-to-end perfection pass.** The dev machine now has a
-      REAL config (`~/.config/echosmonitor/config.yaml`, device
-      "echos" → echos.local, written by the wizard during the field
-      run). After A–D, re-run the full field workflow against it
-      (deploy→configure→monitor→record→archive→HVSR→report) and fix
-      every rough edge found. The user has authorized testing with
-      this device (monitoring/streaming included); device-config
-      WRITES still only with explicit user go-ahead; respect the 429
-      lockout.
+- [x] **E. End-to-end perfection pass.** DONE 2026-06-12 (headless
+      scope; two visual checks ride the next GUI session — below).
+      `scripts/e2e_field_check.py` recorded the REAL echos.local for
+      4 min through the real engine into project `M65_E2E_Claude`
+      (kept in the archive as evidence — browsable in the Archive
+      tab): 5155 packets, **zero backpressure** (A/C), **zero
+      gap/overlap events** (B; the device's clock state at run time:
+      GNSS 12 sats, PPS locked, RMC+PPS+NTP), coverage exactly
+      1.0000 on all 3 channels, ONE contiguous segment each (the
+      original field run had 17). Session `archive.db`: 1 session /
+      3 streams / 3 files / **0 gap rows**. `ArchiveReader`
+      read-back of a 180 s window: exactly 90001 samples/channel,
+      unmasked int32 — gap-free science windows for archive HVSR.
+      Map: 30 real Esri World Imagery tiles fetched+decoded+cached
+      for the actual site (45.8852 N, 11.0609 E, z18). No device
+      writes were made; no rough edges found in the exercised paths.
+      USER CHECKLIST for the next GUI session: (1) toggle Satellite
+      on the Map tab and confirm imagery orientation/placement
+      against the known site; (2) one GUI-driven
+      monitor→record→browse→HVSR→report pass (those code paths are
+      gate-covered and untouched by M6.5, but eyes beat tests).
 
 Field-run notes for the M6 closure items: the real-device
 wizard/discovery validation is DONE (read path + keyring store worked
