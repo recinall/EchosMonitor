@@ -356,6 +356,86 @@ def test_replay_burst_loses_no_recorded_samples(
         engine.stop()
 
 
+def test_engine_rectifies_jittered_stamps_before_archiving(
+    qtbot,
+    tmp_path: Path,
+    capture_structlog,
+) -> None:
+    """M6.5-B wiring: ``_on_packet`` → ``_observe_gap`` applies the
+    detector's grid snap to the trace before it reaches the writer, so
+    field-like stamp jitter (±2 samples @ 500 Hz) produces ONE
+    contiguous on-disk segment and zero gap events/logs."""
+    from obspy import Trace, UTCDateTime
+
+    fs = 500.0
+    npts = 100
+    archive_root = tmp_path / "archive"
+    cfg = _make_root_cfg(
+        devices=[
+            DeviceConfig(
+                name="dev",
+                host="192.0.2.1",  # unroutable: only injected packets flow
+                port=18000,
+                reconnect=ReconnectConfig(
+                    initial_delay_s=3600.0, max_delay_s=3600.0, connect_timeout_s=0.5
+                ),
+                selectors=[
+                    StreamSelectorConfig(
+                        network="XX", station="JIT", location="00", channel="HHZ"
+                    )
+                ],
+                archive=ArchiveConfig(
+                    enabled=True, fsync_interval_s=0.5, jitter_tolerance_ms=10.0
+                ),
+            )
+        ],
+        archive_root=archive_root,
+    )
+    engine = StreamingEngine(cfg)
+    engine.start_session("jit", ["dev"])
+    try:
+        t0 = UTCDateTime("2026-06-12T12:00:00")
+        for i, j in enumerate([0, 2, 0, -1, 0, 1, -2, 0]):
+            tr = Trace(
+                data=(np.arange(npts, dtype=np.int32) % 100),
+                header={
+                    "network": "XX",
+                    "station": "JIT",
+                    "location": "00",
+                    "channel": "HHZ",
+                    "sampling_rate": fs,
+                    "starttime": t0 + i * npts / fs + j / fs,
+                },
+            )
+            engine._on_packet("dev", tr)
+
+        def _on_disk() -> int:
+            total = 0
+            for f in archive_root.rglob("*JIT*"):
+                if f.is_file():
+                    total += sum(tr.stats.npts for tr in read(str(f)))
+            return total
+
+        assert _wait_until(lambda: _on_disk() >= 8 * npts, timeout_s=15.0, qtbot=qtbot)
+        # Segment count straight after read: ``read`` groups contiguous
+        # records into one trace; jittered stamps would split it (and a
+        # merge() would mask, not heal).
+        segments = Stream()
+        for f in archive_root.rglob("*JIT*"):
+            if f.is_file():
+                segments += read(str(f))
+        assert len(segments) == 1, f"jittered stamps fragmented the archive: {segments}"
+        assert not np.ma.isMaskedArray(segments[0].data)
+        gap_logs = [
+            r
+            for r in capture_structlog
+            if r.get("event") == "streaming_engine_archive_gap_detected"
+        ]
+        assert gap_logs == [], "in-tolerance jitter must not log gap chatter"
+    finally:
+        engine.stop()
+
+
 def test_archive_inflight_gauge_warns_without_dropping(
     qtbot,
     tmp_path: Path,

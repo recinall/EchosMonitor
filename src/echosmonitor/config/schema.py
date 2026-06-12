@@ -116,6 +116,21 @@ class ArchiveConfig(_Base):
     # 5 s ≈ 12 fsyncs/min/file. The DB metadata index is gated on
     # fsync (DB-after-fsync invariant), so this also bounds DB lag.
     fsync_interval_s: Annotated[float, Field(ge=0.5, le=60.0)] = 5.0
+    # M6.5-B: packet-stamp jitter tolerance for the archive gap
+    # detector, in absolute milliseconds (device clock wobble is a
+    # time property, not a sample count — the real echos.local stamps
+    # wander up to ~±5 ms at 500 Hz in gap/overlap pairs that net
+    # zero). Within the tolerance (floored at half a sample period)
+    # packets are treated as contiguous and their stamps are SNAPPED
+    # onto the expected sample grid before writing: no spurious
+    # gap/overlap events, no MiniSEED record fragmentation. Beyond it
+    # a real discontinuity is declared and the grid re-anchors to the
+    # device stamps. Honest cost: a real discontinuity smaller than
+    # the tolerance is absorbed as up to one tolerance of absolute
+    # timing bias — inside the device's own stamping noise — and the
+    # bias persists until the next over-tolerance event re-anchors.
+    # 0 keeps only the half-sample floor.
+    jitter_tolerance_ms: Annotated[float, Field(ge=0.0, le=100.0)] = 10.0
     # In-flight WARN threshold for the archive seam (M6.5-A). The
     # engine posts recorded packets straight to the storage QThread and
     # NEVER drops them (the archive is the science sink — the old

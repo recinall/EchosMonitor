@@ -506,6 +506,78 @@ def test_close_is_idempotent(writer_factory: Any) -> None:
     writer.close_all()  # must not raise
 
 
+def test_rectified_jittered_stream_is_contiguous_on_disk(
+    writer_factory: Any, tmp_path: Path
+) -> None:
+    """M6.5-B end-to-end at the storage layer: a stream whose stamps
+    jitter like the real device's (±1/±2 samples at 500 Hz around a
+    perfect grid) writes as ONE contiguous segment when the gap
+    detector's grid snap is applied — and fragments without it (the
+    field archive showed 17 segments in 440 s)."""
+    from echosmonitor.storage.gap_detector import GapDetector
+
+    fs = 500.0
+    npts = 100
+    t0 = UTCDateTime("2026-06-12T12:00:00")
+    # Field-run-like jitter pattern in samples; net zero, all within
+    # the 10 ms tolerance.
+    jitter = [0, 2, 0, -1, 0, 1, -2, 0, 2, -1]
+
+    def _traces(nslc: str) -> list[Trace]:
+        out = []
+        for i, j in enumerate(jitter):
+            tr = _make_int32_trace(
+                starttime=t0 + i * npts / fs + j / fs,
+                npts=npts,
+                sampling_rate=fs,
+                nslc=nslc,
+            )
+            out.append(tr)
+        return out
+
+    writer = writer_factory(fsync_interval_s=0.5)
+
+    # Rectified path: detector snap applied before write (what the
+    # engine's _observe_gap does).
+    rect_nslc = "IU.RECT.00.BHZ"
+    det = GapDetector(stream_id=0, sample_rate=fs, jitter_tolerance_s=0.010)
+    events = []
+    for tr in _traces(rect_nslc):
+        ev = det.observe(tr)
+        if ev is not None:
+            events.append(ev)
+        if det.last_snap_s:
+            tr.stats.starttime = tr.stats.starttime + det.last_snap_s
+        writer.write_trace(rect_nslc, tr)
+    assert events == [], "jitter within tolerance must not declare gaps"
+
+    # Raw path: same jitter, no rectification (legacy behavior).
+    raw_nslc = "IU.RAW.00.BHZ"
+    for tr in _traces(raw_nslc):
+        writer.write_trace(raw_nslc, tr)
+
+    writer.close_all()
+
+    def _read(nslc: str):
+        sid = StreamID.from_trace_id(nslc)
+        path = sds_path(_expected_root(tmp_path), t0, sid)
+        return read(str(path))
+
+    # ``read`` groups contiguous records into one trace; jittered
+    # stamps split it. (``merge(method=0)`` would re-join even the
+    # jittered stream into ONE trace — but a masked, sample-dropping
+    # one, so segment count must be taken straight after read.)
+    rect = _read(rect_nslc)
+    assert len(rect) == 1, f"rectified stream fragmented: {rect}"
+    assert rect[0].stats.npts == len(jitter) * npts
+    assert not np.ma.isMaskedArray(rect[0].data), "rectified stream has masked gaps"
+    raw = _read(raw_nslc)
+    assert len(raw) > 1, (
+        "negative control: unrectified jitter should fragment the file "
+        "(if this fails, the test no longer proves rectification matters)"
+    )
+
+
 def test_exactly_one_terminal_signal_per_write_including_pause(
     writer_factory: Any,
     monkeypatch: pytest.MonkeyPatch,

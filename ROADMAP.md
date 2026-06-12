@@ -915,16 +915,26 @@ surfaced real problems — this milestone fixes them.
       thread drains slowly (fsync cadence? STEIM2 encode per tiny
       record? DB work per record?). Regression test must reproduce a
       replay burst against the fake SeedLink server.
-- [ ] **B. Gap-detector subsample chatter.** Steady ±1/±2-sample
-      gap/overlap PAIRS logged every few seconds throughout the
-      recording (`streaming_engine_archive_gap_detected
-      samples_missing=±1/±2`, kind alternating gap→overlap): the
-      device's packet timestamps jitter at subsample scale at 500 Hz.
-      Each spurious "gap" spams the log AND may split MiniSEED
-      records/fragment the archive. Add a tolerance (≤ half a sample
-      period?) before declaring a gap/overlap; verify record
-      continuity on disk improves; decision-log it (skill
-      `miniseed-sds`).
+- [x] **B. Gap-detector subsample chatter.** FIXED 2026-06-12. Field
+      forensics (Test_1 archive): the jitter is DEVICE-WIDE (identical
+      offsets on all 3 channels at the same instants), reaches
+      ±2.55 samples (±5.1 ms — NOT subsample, which is why the
+      existing half-sample tolerance never caught it), and comes in
+      gap→overlap pairs netting zero; it fragmented the archive into
+      17 on-disk segments per 440 s. Fix:
+      `archive.jitter_tolerance_ms` (default 10 ms, absolute time —
+      clock wobble is a time property, so the "≤ half a sample"
+      suggestion was rejected as both too small and wrongly
+      rate-scaled) with the half-sample floor; within tolerance the
+      packet is contiguous, its stamp is SNAPPED onto the
+      reconstructed grid before writing (engine applies
+      `GapDetector.last_snap_s` on the archive branch only), and
+      `last_end` follows the grid so zero-mean jitter never
+      accumulates; drift crossing the tolerance re-anchors with one
+      honest event. On-disk continuity proven by
+      `test_rectified_jittered_stream_is_contiguous_on_disk` (raw
+      jitter fragments as negative control) and the engine wiring
+      test (mutation-verified).
 - [ ] **C. App efficiency.** Profile CPU/GIL during 500 Hz × 3 ch
       Monitor and Record (render path, spectrogram, PSD; the dev
       machine also runs a live SeedTiLa production instance).
@@ -1084,6 +1094,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6 wizard: the worker thread starts LAZILY on the first page action; an undriven wizard owns no running thread | A wizard constructed but never driven (Help-menu open + patched/closed exec) never reaches done()/teardown — an eagerly-started thread then gets GC'd while running, a hard Qt abort (crashed the menubar tests for real). Queued events posted before start are delivered when exec() runs, so laziness costs nothing. |
 | 2026-06-12 | M6 settings: `ui.theme` scope is the PLOTS (pyqtgraph background/foreground at bootstrap), not the widget chrome; all settings labeled "next launch" | Restyling every Qt widget is a large fragile surface for no field value (the chrome follows the system); pyqtgraph reads its config at item creation so a runtime switch would leave existing plots in the old colors — honest "next launch" beats a half-applied hot toggle. `ui.recent_detections_limit` stays out of the dialog until the M3 prefill that consumes it lands. |
 | 2026-06-12 | M6.5-A: the archive seam has **no engine-side queue and no drop point** — `_on_packet` posts each recorded packet straight to the storage thread; rule 5's bound becomes an **in-flight gauge** (sent − writer-acked) warn-logged + `archiveBackpressure`-signalled above `queue_max` (field kept, repurposed as the warn threshold) | The old bounded deque was drained only by the flush tick and the drain emitted per-entry anyway — pure added latency plus a drop hazard; a replay burst starves the tick (Qt posted-event flood) and drop-oldest ate 33 s of LIVE recorded data in the field. The archive is the science sink (ROADMAP A: correctness > liveness; rule 11 protects display, not this path); the physical bound is the device ring + live rate, and sustained writer slowness still trips the writer's own slow-IO pause valve. `DeviceStatus.archive_drops_total` removed (no readers; nothing can drop there now). |
+| 2026-06-12 | M6.5-B: gap-detector jitter tolerance is **absolute milliseconds** (`archive.jitter_tolerance_ms`, default 10, half-sample floor), and in-tolerance packets are **snapped onto the reconstructed grid** before archiving (`last_end` follows the grid, not the device stamps) | The field jitter is device clock wobble — a time property (±5.1 ms on echos.local), so a sample-scaled tolerance would be wrong at other rates and "≤ half a sample" (the ROADMAP sketch) was already in place and demonstrably too small. Snapping (not just suppressing the event) is what fixes the REAL damage — 17 on-disk segments/440 s that fragment reads and HVSR windows; `last_end` following the grid is what stops zero-mean jitter from emitting pairs forever. Honest cost, documented in code + schema: a real discontinuity ≤ tolerance is absorbed as ≤ 10 ms persistent timing bias (no `gaps` row) until the next over-tolerance event re-anchors — inside the device's own stamping noise, and irrelevant to single- and multi-station HVSR (no cross-station phase coherence used). Display/DSP keep the raw stamps; only the archive branch mutates, after every other consumer captured its values. |
 | 2026-06-12 | M6.5-A: MseedWriter **terminal-signal invariant** — exactly one `writeOk` XOR `writeFailed` per `write_trace`; the paused-path drop emits `writeFailed` (was silent), the pause-TRIP write emits only its `writeOk` (the old `writeFailed("filesystem unresponsive")` on the success path is gone) | The in-flight gauge counts terminal acks against sends; a silent drop inflates the gauge forever (false backpressure), a double terminal injects spurious acks that mask real backpressure exactly when the filesystem struggles (both reviewers flagged the latter). The teardown close barrier logs inflight + elapsed (rule 7) since its wait now scales with the backlog. |
 
 ## Open questions (resolve before the milestone that needs them)

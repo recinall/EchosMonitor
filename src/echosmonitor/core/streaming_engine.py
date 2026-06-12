@@ -581,6 +581,15 @@ class StreamingEngine(QObject):
         self._archive_acked: dict[str, int] = {}
         self._archive_inflight_warn: dict[str, int] = {}
         self._archive_inflight_last_log: dict[str, float] = {}
+        # M6.5-B: per-device gap-detector jitter tolerance (seconds),
+        # snapshotted from ``archive.jitter_tolerance_ms`` at writer
+        # setup; per-stream rectification accounting, throttled like
+        # every other per-stream log (rule 5). ``_rect_pending`` maps
+        # composite stream key → (count, max_abs_snap_s) since the
+        # last log line.
+        self._archive_jitter_tol_s: dict[str, float] = {}
+        self._rect_pending: dict[str, tuple[int, float]] = {}
+        self._rect_last_log: dict[str, float] = {}
         # Distinct SDS paths the writer has touched this session per
         # device. ``len(set)`` populates ``DeviceStatus.archive_files_open``.
         self._archive_paths_seen: dict[str, set[Path]] = {}
@@ -914,6 +923,8 @@ class StreamingEngine(QObject):
         self._archive_stream_ids.clear()
         self._gap_detectors.clear()
         self._pending_gaps.clear()
+        self._rect_pending.clear()
+        self._rect_last_log.clear()
         # A detection open across a DAO swap stays an open row in the
         # closing DB (crash-equivalent semantics) and its later close
         # lands as a separate closed row in the next DB. Rare (STA/LTA
@@ -2335,6 +2346,7 @@ class StreamingEngine(QObject):
         # this many unacknowledged traces toward the storage thread the
         # engine logs + signals backpressure — without dropping.
         self._archive_inflight_warn[name] = dev_cfg.archive.queue_max
+        self._archive_jitter_tol_s[name] = dev_cfg.archive.jitter_tolerance_ms / 1000.0
         self._archive_paths_seen[name] = set()
         status = self._status.get(name)
         if status is not None:
@@ -2375,6 +2387,7 @@ class StreamingEngine(QObject):
         # around the close barrier below (rule 7): the barrier's wait is
         # proportional to this backlog.
         inflight_at_close = self._archive_sent.pop(name, 0) - self._archive_acked.pop(name, 0)
+        self._archive_jitter_tol_s.pop(name, None)
         self._archive_inflight_warn.pop(name, None)
         self._archive_inflight_last_log.pop(name, None)
         self._archive_paths_seen.pop(name, None)
@@ -2391,6 +2404,20 @@ class StreamingEngine(QObject):
             self._gap_detectors.pop(stale_key, None)
         for stale_key in [k for k in self._pending_gaps if k.startswith(prefix)]:
             self._pending_gaps.pop(stale_key, None)
+        # Flush the residual rectification tally (≤ one throttle window)
+        # so session totals in the logs are exact, then drop the state.
+        for stale_key in [k for k in self._rect_pending if k.startswith(prefix)]:
+            residual_count, residual_max = self._rect_pending.pop(stale_key)
+            _log.debug(
+                "streaming_engine_archive_stamp_rectified",
+                device=name,
+                stream_key=stale_key,
+                n_packets=residual_count,
+                max_abs_ms=round(residual_max * 1000.0, 3),
+                at="writer_teardown",
+            )
+        for stale_key in [k for k in self._rect_last_log if k.startswith(prefix)]:
+            self._rect_last_log.pop(stale_key, None)
         if writer is None:
             return
         if sender is not None:
@@ -2595,6 +2622,16 @@ class StreamingEngine(QObject):
         gaps are tied to the stream, not to any one file, so all
         pending events for a stream flush together regardless of which
         file the writer was filling.
+
+        Stamp rectification (M6.5-B): when the detector judges the
+        packet contiguous-within-jitter-tolerance it reports a grid
+        correction, applied here to ``trace.stats.starttime`` so the
+        WRITER sees exactly-contiguous stamps (no record splits, no
+        fragmented reads). Mutating the shared trace is safe at this
+        point: every display/DSP consumer in ``_on_packet`` ran before
+        the archive branch and captured its own times; the writer is
+        the only downstream reader. The correction is ≤ the tolerance
+        (10 ms default) — inside the device's own stamping noise.
         """
         detector = self._gap_detectors.get(key)
         if detector is None:
@@ -2602,9 +2639,29 @@ class StreamingEngine(QObject):
             # correlation only; the DAO's real ``streams.id`` is
             # looked up at flush time via ``_archive_stream_ids``.
             # Pass 0 here so the field is unambiguously not a DB row id.
-            detector = GapDetector(stream_id=0, sample_rate=fs)
+            detector = GapDetector(
+                stream_id=0,
+                sample_rate=fs,
+                jitter_tolerance_s=self._archive_jitter_tol_s.get(device_name, 0.0),
+            )
             self._gap_detectors[key] = detector
         event = detector.observe(trace)
+        snap_s = detector.last_snap_s
+        if snap_s != 0.0:
+            trace.stats.starttime = trace.stats.starttime + snap_s
+            count, max_abs = self._rect_pending.get(key, (0, 0.0))
+            self._rect_pending[key] = (count + 1, max(max_abs, abs(snap_s)))
+            now = time.monotonic()
+            if now - self._rect_last_log.get(key, 0.0) >= _DROP_LOG_INTERVAL_S:
+                logged_count, logged_max = self._rect_pending.pop(key)
+                self._rect_last_log[key] = now
+                _log.debug(
+                    "streaming_engine_archive_stamp_rectified",
+                    device=device_name,
+                    nslc=nslc,
+                    n_packets=logged_count,
+                    max_abs_ms=round(logged_max * 1000.0, 3),
+                )
         if event is None:
             return
         self._pending_gaps.setdefault(key, []).append(event)
