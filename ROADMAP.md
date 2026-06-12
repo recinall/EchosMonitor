@@ -834,7 +834,22 @@ rebuild port, no-data root surfacing.
       lost, crystal drifting) must never read as "NTP, network accuracy"
       (reviewer MAJOR on the first cut). Tests at models/poller/panel
       layers, verdict ladder mutation-verified.
-- [ ] Settings dialog (archive root, theme, display caps).
+- [x] Settings dialog (archive root, theme, display caps).
+      *Done 2026-06-12:* File → Settings… (`gui/dialogs/settings_dialog.py`)
+      edits `app.archive_root` (path picker; empty = the platformdirs
+      default, shown verbatim as the placeholder via the ONE shared
+      resolver) + `ui` theme/refresh/window/max-plots/max-display-rate,
+      through the new `ConfigStore.update_settings` (same rule-3
+      validate→rotate→atomic-write→emit pipeline; `_commit_candidate`
+      refactor shared with the device mutations; devices untouched → the
+      engine diff is a no-op, verified per configChanged consumer).
+      `ui.theme` is finally CONSUMED: `gui/theme.py` applies pyqtgraph
+      background/foreground at bootstrap (plots only — widget chrome
+      stays on the system palette); all fields honestly labeled
+      "next launch". `ui.recent_detections_limit` deliberately NOT
+      exposed (reviewer: nothing consumes it since the rule-13 autostart
+      removal — a dead setting in this dialog would lie; it's the knob
+      for the open M3 cross-session detection prefill).
 - [ ] Docs: user manual for the field workflow (deploy → configure →
       record → HVSR → report).
 
@@ -948,6 +963,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6 discovery: the add-device prefill uses the mDNS HOSTNAME (`echos.local`), not the resolved IP, as `DeviceConfig.host` | The hostname survives DHCP lease changes — the exact field failure mode of a seismometer that sits on a site LAN for weeks; the probed IP remains visible in the dialog row for debugging. |
 | 2026-06-12 | M6 wizard: performs NO device writes — "set admin password" means STORE in the OS keyring (off-thread, bounded 15 s, accept-with-warning on timeout/close); changing the password ON the device stays in the device dialog | `POST /api/auth/password` is still unexercised on real firmware (M1 closure) and needs the CURRENT password anyway; the wizard's job is to leave a working config + credential, not to mutate a factory-fresh device. The device write lands BEFORE the credential wait, so no close path can lose it (persisted-before-announced). |
 | 2026-06-12 | M6 wizard: the worker thread starts LAZILY on the first page action; an undriven wizard owns no running thread | A wizard constructed but never driven (Help-menu open + patched/closed exec) never reaches done()/teardown — an eagerly-started thread then gets GC'd while running, a hard Qt abort (crashed the menubar tests for real). Queued events posted before start are delivered when exec() runs, so laziness costs nothing. |
+| 2026-06-12 | M6 settings: `ui.theme` scope is the PLOTS (pyqtgraph background/foreground at bootstrap), not the widget chrome; all settings labeled "next launch" | Restyling every Qt widget is a large fragile surface for no field value (the chrome follows the system); pyqtgraph reads its config at item creation so a runtime switch would leave existing plots in the old colors — honest "next launch" beats a half-applied hot toggle. `ui.recent_detections_limit` stays out of the dialog until the M3 prefill that consumes it lands. |
 
 ## Open questions (resolve before the milestone that needs them)
 

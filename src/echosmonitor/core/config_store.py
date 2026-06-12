@@ -48,9 +48,11 @@ import yaml
 from PySide6.QtCore import QObject, Signal
 
 from echosmonitor.config.schema import (
+    AppConfig,
     DeviceConfig,
     RootConfig,
     StreamSelectorConfig,
+    UiConfig,
 )
 from echosmonitor.core.exceptions import ConfigError
 
@@ -73,7 +75,8 @@ class ConfigStore(QObject):
     rewrite atomically.
 
     Mutation methods (``add_device`` / ``update_device`` /
-    ``remove_device`` / ``add_selectors``) follow this exact sequence:
+    ``remove_device`` / ``add_selectors`` / ``update_settings``) follow
+    this exact sequence:
 
     1. Build a candidate :class:`RootConfig` via ``model_copy``.
     2. Re-validate by round-tripping through ``model_dump`` +
@@ -224,6 +227,21 @@ class ConfigStore(QObject):
         if wrote:
             self._emit_changed()
 
+    def update_settings(self, app: AppConfig, ui: UiConfig) -> None:
+        """Replace the ``app`` and ``ui`` sections (M6 settings dialog).
+
+        Devices are untouched, so the engine's device diff is empty and
+        no worker churn occurs; most ``ui`` fields are read at widget
+        construction and apply at the NEXT launch — the dialog says so.
+
+        Raises:
+            ConfigError: The resulting config fails schema validation.
+        """
+        with self._lock:
+            candidate = self._root.model_copy(update={"app": app, "ui": ui})
+            self._commit_candidate(candidate, action="update_settings")
+        self._emit_changed()
+
     def reload_from_disk(self) -> None:
         """Discard the in-memory shadow and reload from ``path``.
 
@@ -267,6 +285,10 @@ class ConfigStore(QObject):
         deadlocked on the non-reentrant ``threading.Lock``.
         """
         candidate = self._root.model_copy(update={"devices": new_devices})
+        self._commit_candidate(candidate, action=action, **log_extra)
+
+    def _commit_candidate(self, candidate: RootConfig, *, action: str, **log_extra: object) -> None:
+        """Shared tail of every mutation. Caller holds ``self._lock``."""
         # Re-validate by round-trip. ``model_copy(update=...)`` bypasses
         # field-level validators, so without this the candidate could
         # carry an invalid combination (e.g. duplicate selector entries

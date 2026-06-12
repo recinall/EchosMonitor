@@ -44,10 +44,10 @@ class UiConfig(_Base):
     # toggled. Most-recently-seen wins (engine-driven for M3 part 1; a
     # per-stream user toggle arrives in M3 part 2).
     max_visible_plots: Annotated[int, Field(ge=1, le=64)] = 8
-    # M8: how many recent detections to pre-load from the DB index on
-    # startup (the "historical taste" the user sees before new live
-    # detections arrive). A bounded, index-backed read — never waveforms.
-    # 0 disables the pre-load.
+    # Currently UNWIRED: the startup prefill went away with autostart
+    # (rule 13); the cross-session detection-history prefill is an open
+    # M3 item and this field is its knob when it lands. Deliberately not
+    # exposed in the settings dialog until then.
     recent_detections_limit: Annotated[int, Field(ge=0, le=10000)] = 200
     # High-fs display throttle (rule 11): the maximum effective sample
     # rate handed to the trace *renderer*. Streams faster than this are

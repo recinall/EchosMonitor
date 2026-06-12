@@ -73,6 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
 
+    # M6: plot theme from ui.theme — must run BEFORE MainWindow constructs
+    # any pyqtgraph item (the colors are read at item creation).
+    from echosmonitor.gui.theme import apply_theme
+
+    apply_theme(cfg.ui.theme)
+
     # Qt's event loop swallows SIGINT by default; route it to a clean app quit
     # so Ctrl-C in a terminal exits the GUI instead of being ignored. A noop
     # QTimer wakes the Python interpreter often enough for the signal to be

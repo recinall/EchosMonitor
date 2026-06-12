@@ -1152,6 +1152,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(remove_action)
 
         file_menu.addSeparator()
+        settings_action = QAction("&Settings…", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self._on_show_settings)
+        file_menu.addAction(settings_action)
+
+        file_menu.addSeparator()
         quit_action = QAction("&Quit", self)
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
@@ -1242,6 +1248,14 @@ class MainWindow(QMainWindow):
         self._apply_default_dock_layout()
         self.resize(_DEFAULT_WIDTH, _DEFAULT_HEIGHT)
         _log.info("window_layout_reset")
+
+    def _on_show_settings(self) -> None:
+        """File → Settings… (M6): archive root, theme, display caps."""
+        from echosmonitor.gui.dialogs.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog(self, self._store)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _on_show_first_run_wizard(self) -> None:
         """Help → First-run wizard. Safe to call against a populated config."""

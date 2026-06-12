@@ -235,3 +235,37 @@ def test_reload_from_disk_picks_up_external_changes(qtbot, tmp_path: Path) -> No
         store.reload_from_disk()
     assert block.signal_triggered
     assert {d.name for d in store.root.devices} == {"alpha", "beta"}
+
+
+def test_update_settings_persists_app_and_ui(qtbot, tmp_path: Path) -> None:
+    """M6 settings dialog: app/ui replacement goes through the same
+    validate→backup→atomic-write pipeline (rule 3), emits configChanged
+    exactly once, and leaves devices untouched."""
+    store, path = _make_store(tmp_path)
+    devices_before = list(store.root.devices)
+    new_app = store.root.app.model_copy(update={"archive_root": tmp_path / "arch"})
+    new_ui = store.root.ui.model_copy(
+        update={"theme": "light", "max_display_rate_hz": 500}
+    )
+    with qtbot.waitSignal(store.configChanged, timeout=1000):
+        store.update_settings(new_app, new_ui)
+    assert store.root.app.archive_root == tmp_path / "arch"
+    assert store.root.ui.theme == "light"
+    assert store.root.ui.max_display_rate_hz == 500
+    assert list(store.root.devices) == devices_before
+    on_disk = yaml.safe_load(path.read_text())
+    assert on_disk["ui"]["theme"] == "light"
+    assert on_disk["app"]["archive_root"] == str(tmp_path / "arch")
+
+
+def test_update_settings_validation_failure_leaves_config_unchanged(
+    qtbot, tmp_path: Path
+) -> None:
+    store, path = _make_store(tmp_path)
+    before_text = path.read_text() if path.exists() else None
+    bad_ui = store.root.ui.model_copy(update={"max_display_rate_hz": 0})  # ge=1
+    with pytest.raises(ConfigError):
+        store.update_settings(store.root.app, bad_ui)
+    assert store.root.ui.max_display_rate_hz != 0
+    if before_text is not None:
+        assert path.read_text() == before_text
