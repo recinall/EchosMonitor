@@ -125,16 +125,21 @@ def load_config(path: Path | None = None) -> tuple[RootConfig, Path]:
             the bundled defaults.
 
     Returns:
-        A tuple ``(config, resolved_path)`` where ``resolved_path`` points to
-        the user-provided file (when present) or the bundled default. Useful
-        for surfacing which file is in effect in the UI.
+        A tuple ``(config, resolved_path)``. ``resolved_path`` is the file
+        runtime mutations must WRITE to: the explicit ``path`` when given,
+        else the per-user config path — even when that file does not exist
+        yet and the bundled defaults provided every value. It is NEVER the
+        bundled file: handing that to :class:`ConfigStore` made the
+        first-run wizard rewrite the package's ``default.yaml`` in place
+        (caught in the 2026-06-12 field run; in a packaged install the
+        bundle is read-only and every wizard finish would fail).
 
     Raises:
         FileNotFoundError: An explicit ``path`` was provided but does not exist.
         yaml.YAMLError: The user YAML file is malformed.
         pydantic.ValidationError: The merged configuration violates the schema.
     """
-    base, bundled_path = _read_bundled_default()
+    base, _bundled_path = _read_bundled_default()
 
     if path is not None:
         if not path.exists():
@@ -157,4 +162,7 @@ def load_config(path: Path | None = None) -> tuple[RootConfig, Path]:
             expected_path=str(user_path),
             hint="copy the file to the new path to keep your devices",
         )
-    return RootConfig.model_validate(base), bundled_path
+    # Bundled defaults are in effect, but the resolved path is the USER
+    # path: it is where the first write (wizard, settings, add-device)
+    # must land. The bundled file is package data, never a write target.
+    return RootConfig.model_validate(base), user_path

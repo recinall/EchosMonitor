@@ -924,6 +924,22 @@ surfaced real problems — this milestone fixes them.
       documented fallback if Web-Mercator tile math proves
       unreasonable. Decision-log the choice + the tile source/usage
       terms.
+- [x] **F. Wizard wrote into the BUNDLED default.yaml (fixed
+      2026-06-12, same day).** The field run exposed it: with no user
+      config, `load_config(None)` returned the bundled
+      `src/echosmonitor/config/default.yaml` as the resolved path,
+      MainWindow handed that to ConfigStore, and the wizard's
+      `add_device` atomically REWROTE package data in place (plus a
+      `.yaml.1` backup in the source tree — both briefly committed,
+      then cleaned). In a packaged install the bundle is read-only →
+      every wizard finish would fail. Fix: the loader's fallback now
+      returns the USER config path as the resolved (write-target)
+      path; the bundle is never a write target. The user's
+      wizard-written device config was moved to
+      `~/.config/echosmonitor/config.yaml` and the pristine bundle
+      restored. Regression test
+      `test_fallback_path_is_writable_user_path_not_bundle` pins a
+      first write creating the user file with the bundle untouched.
 - [ ] **E. End-to-end perfection pass.** The dev machine now has a
       REAL config (`~/.config/echosmonitor/config.yaml`, device
       "echos" → echos.local, written by the wizard during the field

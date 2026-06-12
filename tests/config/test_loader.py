@@ -24,7 +24,12 @@ def test_loads_bundled_defaults_when_no_path(
     assert cfg.app.log_level == "INFO"
     assert cfg.ui.theme == "dark"
     assert cfg.devices == []
-    assert path.name == "default.yaml"
+    # Consciously rewritten (2026-06-12 field-run bug): the resolved path
+    # is the USER path even when the bundled defaults provided every
+    # value — it is the WRITE target for ConfigStore. Returning the
+    # bundled path made the wizard rewrite package data in place.
+    assert path == tmp_path / "missing.yaml"
+    assert path.name != "default.yaml"
 
 
 def test_explicit_path_returned(tmp_path: Path) -> None:
@@ -179,7 +184,10 @@ def test_legacy_platformdirs_config_ignored_with_warning(
 
     cfg, path = load_config(None)
     # Bundled defaults win — the legacy file's override is NOT applied.
-    assert path.name == "default.yaml"
+    # (Resolved path = the USER write target, never the bundle — the
+    # 2026-06-12 field-run fix.)
+    assert path.name == "config.yaml"
+    assert "echosmonitor" in str(path)
     assert cfg.ui.theme == "dark"
 
     events = [r for r in capture_structlog if r.get("event") == "legacy_config_ignored"]
@@ -201,7 +209,7 @@ def test_no_legacy_warning_when_legacy_config_absent(
         loader_mod, "user_config_dir", lambda app_name: str(tmp_path / app_name)
     )
     _cfg, path = load_config(None)
-    assert path.name == "default.yaml"
+    assert path.name == "config.yaml"  # USER write target (field-run fix)
     assert not any(r.get("event") == "legacy_config_ignored" for r in capture_structlog)
 
 
@@ -217,3 +225,30 @@ def test_bundled_default_matches_repo_root() -> None:
     assert repo_root.read_bytes() == bundled_bytes, (
         f"{repo_root} differs from bundled default.yaml; sync them"
     )
+
+
+def test_fallback_path_is_writable_user_path_not_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression (2026-06-12 field run): a ConfigStore built on the
+    loader's fallback path must create the USER file on first write and
+    never touch the bundled default.yaml (read-only in a packaged app)."""
+    from echosmonitor.config.schema import DeviceConfig
+    from echosmonitor.core.config_store import ConfigStore
+
+    user_path = tmp_path / "cfgdir" / "config.yaml"  # parent doesn't exist yet
+    monkeypatch.setattr(loader_mod, "_user_config_path", lambda: user_path)
+    cfg, path = load_config(None)
+    assert path == user_path
+
+    import echosmonitor.config as config_pkg
+
+    bundled = Path(config_pkg.__file__).parent / "default.yaml"
+    bundled_before = bundled.read_bytes()
+
+    store = ConfigStore(cfg, path)
+    store.add_device(DeviceConfig(name="echos", host="echos.local"))
+    assert user_path.exists()
+    assert "echos.local" in user_path.read_text()
+    assert bundled.read_bytes() == bundled_before
+    assert not bundled.with_suffix(".yaml.1").exists()
