@@ -871,6 +871,76 @@ the user's real device config still lives at the old
 until it is copied/migrated (ask the user; the wizard/Settings work is
 the natural moment).
 
+## M6.5 — Field-test hardening (from the first real recording, 2026-06-12)
+
+The user's field run (real echos.local, fw 1.4.2, 500 Hz × 3 ch) proved
+the M6 deliverables end to end on hardware: wizard (mDNS discovery →
+typed probe → add device "echos" with StationXML selectors → keyring
+credential store), Monitor, Record (project `Test_1`), Archive
+browse/waveform load and Map click all worked. The recording also
+surfaced real problems — this milestone fixes them.
+
+- [ ] **A. Archive sample loss under burst (CRITICAL — recorded data
+      was dropped).** Log evidence from the run:
+      `streaming_engine_archive_backpressure dropped=29` during steady
+      recording (17:45:28), then the device disconnected mid-recording
+      (17:47:55), the worker reconnected in ~1 s and the device
+      replayed its ring backlog (gap_detector_clock_jump back
+      9.6–12.2 s; gaps of 1344/1488 samples logged), and the replay
+      burst overflowed the engine→storage archive inbox
+      (`queue_max=1024`) → `dropped=440`. Drop-oldest discarded
+      RECORDED samples. Directions to investigate (consult skills
+      `miniseed-sds` + `qt-worker-threading` first): (1) size the
+      inbox for replay bursts (device ring seconds × fs × channels —
+      the ring is sized in kB via /api/seedlink/config); (2) recording
+      correctness > liveness during catch-up: consider back-pressuring
+      the SeedLink reader during FETCH replay instead of dropping
+      (rule 11 protects the DISPLAY consumers, not the archive path —
+      the archive IS the science sink); (3) profile WHY the storage
+      thread drains slowly (fsync cadence? STEIM2 encode per tiny
+      record? DB work per record?). Regression test must reproduce a
+      replay burst against the fake SeedLink server.
+- [ ] **B. Gap-detector subsample chatter.** Steady ±1/±2-sample
+      gap/overlap PAIRS logged every few seconds throughout the
+      recording (`streaming_engine_archive_gap_detected
+      samples_missing=±1/±2`, kind alternating gap→overlap): the
+      device's packet timestamps jitter at subsample scale at 500 Hz.
+      Each spurious "gap" spams the log AND may split MiniSEED
+      records/fragment the archive. Add a tolerance (≤ half a sample
+      period?) before declaring a gap/overlap; verify record
+      continuity on disk improves; decision-log it (skill
+      `miniseed-sds`).
+- [ ] **C. App efficiency.** Profile CPU/GIL during 500 Hz × 3 ch
+      Monitor and Record (render path, spectrogram, PSD; the dev
+      machine also runs a live SeedTiLa production instance).
+      Acceptance: zero archive backpressure in steady-state recording
+      on this machine, with headroom for a second device.
+- [ ] **D. Map satellite layer.** The Map tab must offer a satellite
+      basemap (Esri World Imagery or equivalent). M4's decision
+      avoided QtWebEngine — preferred approach: raster XYZ tiles
+      fetched on a worker (httpx, bounded, disk-cached, attribution
+      text rendered) drawn as pyqtgraph ImageItems UNDER the existing
+      device scatter/f0 overlay; QtWebEngine+Leaflet stays the
+      documented fallback if Web-Mercator tile math proves
+      unreasonable. Decision-log the choice + the tile source/usage
+      terms.
+- [ ] **E. End-to-end perfection pass.** The dev machine now has a
+      REAL config (`~/.config/echosmonitor/config.yaml`, device
+      "echos" → echos.local, written by the wizard during the field
+      run). After A–D, re-run the full field workflow against it
+      (deploy→configure→monitor→record→archive→HVSR→report) and fix
+      every rough edge found. The user has authorized testing with
+      this device (monitoring/streaming included); device-config
+      WRITES still only with explicit user go-ahead; respect the 429
+      lockout.
+
+Field-run notes for the M6 closure items: the real-device
+wizard/discovery validation is DONE (read path + keyring store worked
+on hardware); `POST /api/auth/password` (changing the password ON the
+device) remains the only unexercised write. The legacy-config
+migration question is SUPERSEDED — the user re-added the device via
+the wizard; pihw.local can be added manually the same way if wanted.
+
 ## M7 — Release: Windows / Linux / macOS
 
 Goal: a tagged version produces installable artifacts for the three desktop
