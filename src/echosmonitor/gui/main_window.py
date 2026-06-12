@@ -2536,6 +2536,9 @@ class MainWindow(QMainWindow):
         # stop() cancels an in-flight fetch via the asyncio task nudge.
         # Terminal — a later configChanged push is refused, not revived.
         self._position_resolver.shutdown()
+        # M6.5-D: the Map tab's tile worker (bounded join; no-op when
+        # the Satellite layer was never toggled).
+        self._map_widget.shutdown_basemap()
         # M11 B: stop the dedicated deconvolution thread. It runs a plain
         # Qt event loop dispatching one-shot ``compute`` slots (no parked
         # blocking loop), so ``quit()`` returns it promptly.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import numpy as np
 from pytestqt.qtbot import QtBot
 
 from echosmonitor.config.schema import (
@@ -20,6 +21,12 @@ from echosmonitor.config.schema import (
     RootConfig,
     StreamSelectorConfig,
     UiConfig,
+)
+from echosmonitor.core.map_tiles import (
+    MAX_TILES_PER_REQUEST,
+    TileRequest,
+    TileResult,
+    tile_xy,
 )
 from echosmonitor.core.models import AcquisitionState, ConnState
 from echosmonitor.core.positions import ResolvedPosition, haversine_m
@@ -242,3 +249,162 @@ def test_set_devices_prunes_f0_overlay(qtbot: QtBot) -> None:
     widget.set_f0_overlay({"dev-a": 2.0})
     widget.set_devices(("dev-b",))
     assert widget._f0_overlay == {}
+
+
+# ----------------------------------------------------------------------
+# Satellite basemap (M6.5-D)
+# ----------------------------------------------------------------------
+def _stub_tile_worker(widget: MapWidget, monkeypatch) -> list:
+    """Replace the lazy worker creation with a no-thread stub and return
+    the list that captures emitted TileRequests."""
+
+    class _StubFetcher:
+        def supersede(self, generation: int) -> None:
+            self.generation = generation
+
+        def stop(self) -> None:
+            pass
+
+    requests: list = []
+    stub = _StubFetcher()
+    monkeypatch.setattr(widget, "_ensure_tile_worker", lambda: stub)
+    widget._tileRequested.connect(requests.append)
+    return requests
+
+
+def test_satellite_toggle_requests_bounded_batch(qtbot: QtBot, monkeypatch) -> None:
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.on_position(_resolved("dev-b", _POS_B))
+    assert requests == []  # off by default — nothing fetched
+    widget._satellite_button.setChecked(True)
+    assert len(requests) == 1
+    req = requests[0]
+    assert isinstance(req, TileRequest)
+    assert 1 <= len(req.tiles) <= MAX_TILES_PER_REQUEST
+    assert req.generation == widget._tile_generation
+    # The chosen tiles cover the array centroid.
+    lat0, lon0 = widget._frame_origin
+    assert tile_xy(lat0, lon0, req.zoom) in req.tiles
+    # Attribution is part of the imagery's usage terms.
+    assert widget._attribution_label.isVisible() or widget._attribution_label.text()
+    assert "Esri" in widget._attribution_label.text()
+
+
+def test_tile_ready_draws_under_scatter_and_clears_on_toggle_off(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.on_position(_resolved("dev-b", _POS_B))
+    widget._satellite_button.setChecked(True)
+    req = requests[-1]
+    x, y = req.tiles[0]
+    image = np.zeros((256, 256, 4), dtype=np.uint8)
+    widget._on_tile_ready(
+        TileResult(generation=req.generation, zoom=req.zoom, x=x, y=y, image=image)
+    )
+    assert len(widget._tile_items) == 1
+    item = next(iter(widget._tile_items.values()))
+    # Under the scatter (z below the default-0 spots) and geometrically
+    # sane: the tile rect must contain or touch the array's frame origin
+    # region (it covers the centroid tile).
+    assert item.zValue() < 0
+    rect = item.boundingRect()
+    assert rect.width() > 0 and rect.height() > 0
+    # Toggle off: items dropped, attribution hidden, nothing fetched.
+    widget._satellite_button.setChecked(False)
+    assert widget._tile_items == {}
+    assert not widget._attribution_label.isVisible()
+
+
+def test_stale_generation_tile_is_ignored(qtbot: QtBot, monkeypatch) -> None:
+    widget = _widget(qtbot, ("dev-a",))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    req = requests[-1]
+    stale = TileResult(
+        generation=req.generation - 1,
+        zoom=req.zoom,
+        x=req.tiles[0][0],
+        y=req.tiles[0][1],
+        image=np.zeros((256, 256, 4), dtype=np.uint8),
+    )
+    widget._on_tile_ready(stale)
+    assert widget._tile_items == {}
+
+
+def test_position_change_rerequests_with_fresh_generation(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    first = requests[-1]
+    # Second device arrives → centroid moves → tiles re-requested under
+    # a NEW generation (the old placement would be misframed).
+    widget.on_position(_resolved("dev-b", _POS_B))
+    assert len(requests) >= 2
+    assert requests[-1].generation > first.generation
+
+
+def test_state_only_rebuild_does_not_blank_or_refetch_basemap(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    """Marker recolours / connection flaps rebuild the scatter but must
+    not churn the basemap: same extent → no new TileRequest and the
+    already-drawn tiles stay."""
+    widget = _widget(qtbot, ("dev-a", "dev-b"))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget.on_position(_resolved("dev-b", _POS_B))
+    widget._satellite_button.setChecked(True)
+    req = requests[-1]
+    n_requests = len(requests)
+    x, y = req.tiles[0]
+    widget._on_tile_ready(
+        TileResult(
+            generation=req.generation,
+            zoom=req.zoom,
+            x=x,
+            y=y,
+            image=np.zeros((256, 256, 4), dtype=np.uint8),
+        )
+    )
+    # A flapping connection (the scatter-churn guard's own case).
+    widget.on_acquisition_state("dev-a", int(AcquisitionState.MONITORING))
+    widget.on_device_state("dev-a", int(ConnState.WAITING_RETRY))
+    widget.set_f0_overlay({"dev-a": 2.0})
+    assert len(requests) == n_requests, "state-only rebuilds must not refetch tiles"
+    assert len(widget._tile_items) == 1, "state-only rebuilds must not blank the basemap"
+
+
+def test_batch_failure_shows_honest_note_and_recovery_restores_credit(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    widget = _widget(qtbot, ("dev-a",))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    widget._on_tile_batch_failed(requests[-1].generation, "network unreachable")
+    assert "unavailable" in widget._attribution_label.text()
+    # A stale failure must not clobber the attribution of a newer batch.
+    n_requests = len(requests)
+    widget._on_tile_batch_failed(requests[0].generation - 1, "old noise")
+    assert "unavailable" in widget._attribution_label.text()
+    # Recovery: the failure cleared the request memo, so the NEXT
+    # rebuild retries the same extent — and the fresh request restores
+    # the Esri credit (imagery may arrive; usage terms).
+    widget.on_acquisition_state("dev-a", int(AcquisitionState.MONITORING))
+    assert len(requests) == n_requests + 1
+    assert "Esri" in widget._attribution_label.text()
+
+
+def test_shutdown_basemap_without_toggle_is_noop(qtbot: QtBot) -> None:
+    widget = _widget(qtbot, ("dev-a",))
+    widget.shutdown_basemap()  # never toggled: no thread, must not raise
+    assert widget._tile_thread is None

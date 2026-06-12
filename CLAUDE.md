@@ -60,8 +60,9 @@ especially). **Do not renumber.** New Echos rules continue from 12.
    (parentless QObject + `moveToThread`, QueuedConnection both ways).
 2. **Pure modules stay pure.** `dsp/`, `core/models.py`, `core/hvsr.py`,
    `storage/sds.py` contain no Qt, no I/O, no global state. Networking lives
-   only in `core/seedlink_worker.py`, `core/info*.py` and the new
-   `core/echos_api.py`. `__main__.py` only bootstraps.
+   only in `core/seedlink_worker.py`, `core/info*.py`, `core/echos_api.py`
+   and `core/map_tiles.py` (M6.5-D basemap fetcher; worker thread only).
+   `__main__.py` only bootstraps.
 3. **Config has one writer.** All runtime config mutations go through
    `ConfigStore` (validate → rotate backups → atomic write → emit
    `configChanged`). The engine hot-reloads via the diff path; never restart
@@ -84,7 +85,11 @@ especially). **Do not renumber.** New Echos rules continue from 12.
    DB is an index over it. DB rows are written only AFTER fsync
    (DB-after-fsync). Anything announced via signal is durable first
    (persisted-before-announced). Atomic writes: temp file in same dir →
-   fsync → `os.replace`.
+   fsync → `os.replace`. Sanctioned exceptions, each on its own thread
+   and following the same atomic recipe: ConfigStore (rule 3), the
+   keyring fallback file (rule 15), and the `core/map_tiles.py` basemap
+   cache (M6.5-D; an accelerator, never truth — evicted on decode
+   failure).
 9. **DAO field provenance.** Counters come from `COUNT(*)`/actual on-disk
    values at the call site, never from in-memory accumulators passed along.
 10. **Tests + postmortems.** Every bug fix lands with a regression test and,

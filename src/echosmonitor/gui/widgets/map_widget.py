@@ -34,15 +34,30 @@ keep their state colour (honest: not measured ≠ measured-low). The
 hover tip gains the f0 line and the toolbar gains a "Clear f0" button;
 the overlay persists across measurement stop (the result stays valid)
 until cleared or superseded by the next array run.
+
+Satellite basemap (M6.5-D, revising the M4-B "no tiles" decision on a
+real field need): a checkable "Satellite" toolbar button fetches Esri
+World Imagery XYZ tiles via :class:`~echosmonitor.core.map_tiles.
+TileFetcher` on a widget-owned worker thread (lazy-started on first
+toggle — the M6 wizard lesson) and draws them as ``ImageItem``s with
+``zValue=-10`` UNDER the scatter/f0 overlay, placed in the same local
+east/north frame (tile lat/lon corners through ``local_east_north``;
+the equirectangular-vs-Mercator mismatch is sub-metre at array scale).
+Still NO QtWebEngine and no slippy-map stack: one bounded batch per
+array extent, disk-cached for offline field use, attribution rendered
+whenever imagery is shown. ``Fit view`` keeps fitting the DEVICES
+(tiles are added with ``ignoreBounds=True``).
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 
+import numpy as np
 import pyqtgraph as pg
 import structlog
-from PySide6.QtCore import QPointF, Qt, Signal, Slot
+from PySide6.QtCore import QMetaObject, QPointF, QRectF, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -54,6 +69,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from echosmonitor.core.map_tiles import (
+    ATTRIBUTION,
+    TileFetcher,
+    TileRequest,
+    TileResult,
+    tile_bounds,
+    tiles_for_extent,
+    zoom_for_span,
+)
 from echosmonitor.core.models import AcquisitionState, ConnState
 from echosmonitor.core.positions import (
     ResolvedPosition,
@@ -77,6 +101,23 @@ _MARKER_SIZE = 14
 
 # Distance readout formatting threshold.
 _KM_THRESHOLD_M = 1000.0
+
+# Basemap layering + sizing. Tiles sit below everything the map draws
+# (scatter spots default to zValue 0, labels likewise).
+_TILE_Z_VALUE = -10.0
+# Margin factor applied around the array extent when choosing the
+# basemap coverage, and the floor for a degenerate (single-station)
+# extent so one node still gets a recognisable patch of imagery.
+_BASEMAP_MARGIN = 2.0
+_BASEMAP_MIN_SPAN_M = 200.0
+# Bounded join for the tile worker thread at shutdown (rule 7).
+_TILE_THREAD_JOIN_MS = 2000
+
+# Tile worker/thread pairs whose bounded join timed out at shutdown.
+# Retained for the process lifetime: dropping the last reference to a
+# RUNNING QThread is a hard Qt abort (the M6-0 lesson; same pattern as
+# the discovery dialog and both HVSR engines). Count is logged.
+_ABANDONED: list[tuple[TileFetcher, QThread]] = []
 
 # f0 overlay ramp endpoints (low f0 → blue, high f0 → red). A manual
 # two-colour lerp over the log-frequency range: deterministic, no
@@ -117,6 +158,9 @@ class MapWidget(QWidget):
 
     deviceSelected = Signal(str)  # noqa: N815
     refreshRequested = Signal()  # noqa: N815
+    # Owner→worker request signal for the tile fetcher (queued; the
+    # worker lives on the widget-owned tile thread).
+    _tileRequested = Signal(object)  # noqa: N815
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -129,6 +173,22 @@ class MapWidget(QWidget):
         self._conn_states: dict[str, ConnState] = {}
         self._f0_overlay: dict[str, float] = {}  # device -> f0 Hz (M5-B)
         self._labels: list[pg.TextItem] = []
+
+        # ----- M6.5-D satellite basemap state -------------------------
+        # Worker + thread are lazily created on the first Satellite
+        # toggle (an unused map owns no running thread — the M6 wizard
+        # lesson). ``_frame_origin`` is the centroid the CURRENT tiles
+        # were placed against; a rebuild that moves it re-requests.
+        self._tile_fetcher: TileFetcher | None = None
+        self._tile_thread: QThread | None = None
+        self._tile_items: dict[tuple[int, int, int], pg.ImageItem] = {}
+        self._tile_generation = 0
+        self._frame_origin: tuple[float, float] | None = None
+        # Memo of the last issued request (origin, zoom, tiles): a
+        # rebuild that does not move the basemap (marker recolours,
+        # f0 overlay, connection flaps) must not blank + refetch it.
+        # Cleared on batch failure so the next rebuild retries.
+        self._last_basemap_key: tuple[object, ...] | None = None
 
         root = QVBoxLayout(self)
 
@@ -144,10 +204,27 @@ class MapWidget(QWidget):
         self._clear_f0_button.clicked.connect(self.clear_f0_overlay)
         self._clear_f0_button.setVisible(False)
         toolbar.addWidget(self._clear_f0_button)
+        self._satellite_button = QPushButton("Satellite", self)
+        self._satellite_button.setCheckable(True)
+        self._satellite_button.setToolTip(
+            "Esri World Imagery basemap under the markers (fetched once "
+            "per array extent, cached on disk for offline use)."
+        )
+        self._satellite_button.toggled.connect(self._on_satellite_toggled)
+        toolbar.addWidget(self._satellite_button)
         toolbar.addStretch(1)
         self._status_label = QLabel("", self)
         toolbar.addWidget(self._status_label)
         root.addLayout(toolbar)
+
+        # Attribution is part of the imagery's usage terms: visible
+        # whenever the basemap is on (also carries the failure note when
+        # a batch can't be fetched and the cache is cold).
+        self._attribution_label = QLabel(ATTRIBUTION, self)
+        attribution_font = self._attribution_label.font()
+        attribution_font.setPointSizeF(max(6.0, attribution_font.pointSizeF() - 2.0))
+        self._attribution_label.setFont(attribution_font)
+        self._attribution_label.setVisible(False)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
 
@@ -186,6 +263,7 @@ class MapWidget(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, 1)
+        root.addWidget(self._attribution_label)
 
     # ------------------------------------------------------------------
     # Inputs (wired by MainWindow)
@@ -307,9 +385,11 @@ class MapWidget(QWidget):
         self._labels.clear()
 
         spots: list[dict[str, object]] = []
+        new_origin: tuple[float, float] | None = None
         if positioned:
             lat0 = sum(p.latitude for _, p in positioned) / len(positioned)
             lon0 = sum(p.longitude for _, p in positioned) / len(positioned)
+            new_origin = (lat0, lon0)
             for name, position in positioned:
                 east, north = local_east_north(position.latitude, position.longitude, lat0, lon0)
                 spots.append(
@@ -325,6 +405,8 @@ class MapWidget(QWidget):
                 self._labels.append(label)
         self._scatter.setData(spots=spots)
 
+        self._frame_origin = new_origin
+        self._update_basemap(positioned)
         self._update_distances(positioned)
         self._update_unpositioned()
         status = f"{len(positioned)} of {len(self._devices)} devices positioned"
@@ -360,6 +442,203 @@ class MapWidget(QWidget):
 
     def _fit_view(self) -> None:
         self._plot.getPlotItem().getViewBox().autoRange()
+
+    # ------------------------------------------------------------------
+    # M6.5-D — satellite basemap
+    # ------------------------------------------------------------------
+    @Slot(bool)
+    def _on_satellite_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._tile_generation += 1  # supersede anything in flight
+            if self._tile_fetcher is not None:
+                self._tile_fetcher.supersede(self._tile_generation)
+            self._clear_tiles()
+            self._last_basemap_key = None
+            self._attribution_label.setVisible(False)
+            return
+        self._attribution_label.setText(ATTRIBUTION)
+        self._attribution_label.setVisible(True)
+        self._update_basemap(self._positioned())
+
+    def _ensure_tile_worker(self) -> TileFetcher:
+        """Lazily boot the tile worker thread (first Satellite toggle).
+
+        Tests that toggle the Satellite button MUST stub this method
+        (see ``_stub_tile_worker`` in the widget tests): a real thread
+        booted here is only ever joined by :meth:`shutdown_basemap`,
+        which production wires from ``MainWindow.closeEvent`` — a test
+        dropping a toggled widget without that call would drop a
+        RUNNING QThread (hard Qt abort, the M6-0 lesson).
+        """
+        if self._tile_fetcher is None:
+            fetcher = TileFetcher()
+            thread = QThread()
+            thread.setObjectName("map-tiles")
+            fetcher.moveToThread(thread)
+            self._tileRequested.connect(fetcher.fetch, Qt.ConnectionType.QueuedConnection)
+            fetcher.tileReady.connect(self._on_tile_ready, Qt.ConnectionType.QueuedConnection)
+            fetcher.batchFailed.connect(
+                self._on_tile_batch_failed, Qt.ConnectionType.QueuedConnection
+            )
+            thread.start()
+            self._tile_fetcher = fetcher
+            self._tile_thread = thread
+        return self._tile_fetcher
+
+    def _update_basemap(self, positioned: list[tuple[str, ResolvedPosition]]) -> None:
+        """(Re)request imagery for the current array extent.
+
+        Called from ``_rebuild`` (positions may have moved the frame
+        origin — old tiles would be misplaced, so they are dropped
+        before the re-request; the disk cache makes the refetch cheap)
+        and from the Satellite toggle. No-op when the basemap is off.
+        """
+        if not self._satellite_button.isChecked():
+            return
+        if not positioned or self._frame_origin is None:
+            self._clear_tiles()
+            self._last_basemap_key = None
+            return
+        lat0, lon0 = self._frame_origin
+        east_north = [
+            local_east_north(p.latitude, p.longitude, lat0, lon0) for _, p in positioned
+        ]
+        span_e = max(e for e, _ in east_north) - min(e for e, _ in east_north)
+        span_n = max(n for _, n in east_north) - min(n for _, n in east_north)
+        span_m = max(span_e, span_n, _BASEMAP_MIN_SPAN_M) * _BASEMAP_MARGIN
+        zoom = zoom_for_span(span_m, lat0)
+        # Pad the lat/lon box by half the (margined) span on each side.
+        half_span_deg_lat = (span_m / 2.0) / 111_320.0
+        cos_lat = max(0.01, math.cos(math.radians(lat0)))
+        half_span_deg_lon = (span_m / 2.0) / (111_320.0 * cos_lat)
+        lats = [p.latitude for _, p in positioned]
+        lons = [p.longitude for _, p in positioned]
+        tiles = tiles_for_extent(
+            min(lats) - half_span_deg_lat,
+            max(lats) + half_span_deg_lat,
+            min(lons) - half_span_deg_lon,
+            max(lons) + half_span_deg_lon,
+            zoom,
+        )
+        # Rebuilds that did not move the basemap (marker recolours, f0
+        # overlay, connection flaps) must not blank + refetch it.
+        basemap_key = (lat0, lon0, zoom, tuple(tiles))
+        if basemap_key == self._last_basemap_key:
+            return
+        self._clear_tiles()
+        self._last_basemap_key = basemap_key
+        # A fresh request always restores the credit line: a stale
+        # "imagery unavailable" note must never caption tiles that DO
+        # arrive (Esri usage terms).
+        self._attribution_label.setText(ATTRIBUTION)
+        self._tile_generation += 1
+        fetcher = self._ensure_tile_worker()
+        fetcher.supersede(self._tile_generation)
+        _log.info(
+            "map_basemap_requested",
+            generation=self._tile_generation,
+            zoom=zoom,
+            n_tiles=len(tiles),
+            span_m=round(span_m, 1),
+        )
+        self._tileRequested.emit(
+            TileRequest(
+                generation=self._tile_generation,
+                zoom=zoom,
+                tiles=tuple(tiles),
+            )
+        )
+
+    @Slot(object)
+    def _on_tile_ready(self, payload: object) -> None:
+        if not isinstance(payload, TileResult):  # rule 4 guard
+            return
+        if (
+            payload.generation != self._tile_generation
+            or not self._satellite_button.isChecked()
+            or self._frame_origin is None
+        ):
+            return
+        lat0, lon0 = self._frame_origin
+        lat_n, lon_w, lat_s, lon_e = tile_bounds(payload.zoom, payload.x, payload.y)
+        east_w, north_n = local_east_north(lat_n, lon_w, lat0, lon0)
+        east_e, north_s = local_east_north(lat_s, lon_e, lat0, lon0)
+        # Row 0 of the decoded image is the tile's NORTH edge; pyqtgraph
+        # in row-major mode draws row 0 at the rect's BOTTOM (y grows
+        # upward) — flip so north stays up.
+        image = np.ascontiguousarray(payload.image[::-1])
+        item = pg.ImageItem(image, axisOrder="row-major")
+        item.setRect(QRectF(east_w, north_s, east_e - east_w, north_n - north_s))
+        item.setZValue(_TILE_Z_VALUE)
+        # ignoreBounds: "Fit view" keeps fitting the ARRAY, not the
+        # (much larger) imagery patch.
+        self._plot.getPlotItem().addItem(item, ignoreBounds=True)
+        key = (payload.zoom, payload.x, payload.y)
+        previous = self._tile_items.pop(key, None)
+        if previous is not None:
+            self._plot.getPlotItem().removeItem(previous)
+        self._tile_items[key] = item
+
+    @Slot(int, str)
+    def _on_tile_batch_failed(self, generation: int, reason: str) -> None:
+        if generation != self._tile_generation or not self._satellite_button.isChecked():
+            return
+        # Honest offline state on the attribution line — the map keeps
+        # working without imagery (field laptops). Clearing the memo
+        # lets the next rebuild retry instead of believing the failed
+        # batch is still on screen.
+        self._last_basemap_key = None
+        self._attribution_label.setText(f"Satellite imagery unavailable: {reason}")
+
+    def _clear_tiles(self) -> None:
+        plot_item = self._plot.getPlotItem()
+        for item in self._tile_items.values():
+            plot_item.removeItem(item)
+        self._tile_items.clear()
+
+    def shutdown_basemap(self) -> None:
+        """Stop the tile worker thread (bounded join; rule 7).
+
+        Called from MainWindow.closeEvent. Idempotent; a widget whose
+        Satellite button was never toggled owns no running thread.
+        """
+        if self._tile_thread is None:
+            return
+        fetcher = self._tile_fetcher
+        if fetcher is not None:
+            fetcher.stop()
+            self._tile_generation += 1
+            fetcher.supersede(self._tile_generation)
+            with contextlib.suppress(RuntimeError, TypeError):
+                self._tileRequested.disconnect(fetcher.fetch)
+            # Best-effort queued close of the httpx client on ITS
+            # thread. quit() below may interrupt the dispatcher before
+            # this dispatches (POSTMORTEMS 2026-05-10 — quit is NOT a
+            # queue barrier); the fetch loop also closes the client
+            # itself when it observes the stop flag, and at worst the
+            # OS reclaims the sockets at process exit.
+            QMetaObject.invokeMethod(
+                fetcher, "shutdown", Qt.ConnectionType.QueuedConnection
+            )
+        self._tile_thread.quit()
+        joined = self._tile_thread.wait(_TILE_THREAD_JOIN_MS)
+        # Sever the worker→owner direction in BOTH branches (skill §3:
+        # disconnect at the join). For an abandoned pair this is what
+        # keeps a still-running fetch from posting events into a widget
+        # that is being destroyed as the app exits.
+        if fetcher is not None:
+            for signal in (fetcher.tileReady, fetcher.batchDone, fetcher.batchFailed):
+                with contextlib.suppress(RuntimeError, TypeError):
+                    signal.disconnect()
+        if not joined:
+            # A tile fetch stuck inside its HTTP timeout can outlive the
+            # bounded join; retain the pair instead of dropping a
+            # running QThread (hard Qt abort — M6-0 lesson).
+            if fetcher is not None:
+                _ABANDONED.append((fetcher, self._tile_thread))
+            _log.warning("map_tile_thread_join_timeout", abandoned=len(_ABANDONED))
+        self._tile_fetcher = None
+        self._tile_thread = None
 
     def _spot_tip(self, x: float, y: float, data: object) -> str:
         if not isinstance(data, str):
