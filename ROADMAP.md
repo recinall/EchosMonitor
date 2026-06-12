@@ -850,8 +850,26 @@ rebuild port, no-data root surfacing.
       exposed (reviewer: nothing consumes it since the rule-13 autostart
       removal — a dead setting in this dialog would lie; it's the knob
       for the open M3 cross-session detection prefill).
-- [ ] Docs: user manual for the field workflow (deploy → configure →
+- [x] Docs: user manual for the field workflow (deploy → configure →
       record → HVSR → report).
+      *Done 2026-06-12:* `docs/MANUAL.md` — grounded in the actual UI
+      labels (wizard pages, Devices-dock actions, session-toolbar
+      states, tab names), the clock-health token table, the rule-13/14
+      state model, and a troubleshooting section (mDNS, rename-orphaned
+      credential, 429 lockout, holdover, lost password).
+
+**M6 code complete 2026-06-12** (all five items + the M5 follow-ups).
+Gate at close: 1106 passed / 5 perf-deselected, ruff + mypy --strict
+clean. Remaining before M6 CLOSURE (user-gated, do not do unsolicited):
+(1) real-device validation of the wizard/discovery against echos.local
+(read-only: mDNS advert + public probe — the advert contract was
+already pinned live 2026-06-12) and, separately, the first REAL
+authenticated write (password/credential flow) which remains
+unexercised on hardware; (2) the legacy config migration question —
+the user's real device config still lives at the old
+`~/.config/seedlink-dashboard` path and EchosMonitor sees 0 devices
+until it is copied/migrated (ask the user; the wizard/Settings work is
+the natural moment).
 
 ## M7 — Release: Windows / Linux / macOS
 
