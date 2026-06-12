@@ -51,6 +51,8 @@ from echosmonitor.core.exceptions import HvsrError
 from echosmonitor.dsp.psd import power_to_db, welch_psd
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from echosmonitor.core.response import ResponseProvider
     from echosmonitor.storage.archive_reader import ArchiveReader
 
@@ -842,6 +844,7 @@ def slice_archive_windows(
     t_start: UTCDateTime,
     t_end: UTCDateTime,
     settings: HvsrSettings,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, UTCDateTime, float]]:
     """Slice an archived range into non-overlapping 3C windows for HVSR.
 
@@ -854,6 +857,12 @@ def slice_archive_windows(
     honest about gaps rather than feeding zeros or a partial component set
     (rule 8: the file is the truth).
 
+    ``should_stop`` (optional, for worker-thread callers — rule 7) is
+    polled before each component read and at every window step; when it
+    turns true the slice aborts and returns ``[]`` — never a partial
+    result. The residual uninterruptible unit is ONE component's
+    ``read_window`` (bounded by the reader's day-scan cap).
+
     Returns a list of ``(z, n, e, t_start, fs)`` tuples in time order (each
     ready for :meth:`HvsrAccumulator.add_window`). Empty if the range holds
     no gap-free 3C window.
@@ -864,6 +873,8 @@ def slice_archive_windows(
     traces: dict[str, object] = {}
     fs = 0.0
     for comp in ("Z", "N", "E"):
+        if should_stop is not None and should_stop():
+            return []
         nslc = group.get(comp)
         if nslc is None:
             return []
@@ -884,6 +895,8 @@ def slice_archive_windows(
     windows: list[tuple[np.ndarray, np.ndarray, np.ndarray, UTCDateTime, float]] = []
     t = t_start
     while t + wl <= t_end + 1e-9:
+        if should_stop is not None and should_stop():
+            return []
         comp_arrays: dict[str, np.ndarray] = {}
         for comp, tr in traces.items():
             seg = tr.slice(t, t + wl)  # type: ignore[attr-defined]

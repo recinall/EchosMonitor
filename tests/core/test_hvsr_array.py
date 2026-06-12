@@ -25,7 +25,7 @@ import time
 import numpy as np
 import pytest
 from obspy import UTCDateTime
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
 
 from echosmonitor.core import hvsr as hvsr_mod
 from echosmonitor.core.hvsr import HvsrResult, HvsrSettings, SesameCriterion
@@ -471,10 +471,18 @@ def _archive_windows(n: int) -> list[tuple]:
     ]
 
 
+class _RootedReader:
+    """Duck-typed reader carrying only the ``root`` the engine surfaces."""
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+
+
 def test_archive_run_one_shot_and_per_device_independent(qtbot, monkeypatch) -> None:
-    """M5-D: devA has archived windows, devB none — one forced cycle runs,
-    devA computes (provenance archive), devB stays selected with no result,
-    the measurement ends IDLE and the live timer never starts."""
+    """M5-D: devA has archived windows, devB none — one slice+compute cycle
+    runs (on the worker — M6), devA computes (provenance archive), devB
+    stays selected with no result, the measurement ends IDLE and the live
+    timer never starts."""
     monkeypatch.setattr(
         hvsr_mod.HvsrAccumulator, "compute", lambda self: _dummy_result(self._device)
     )
@@ -507,15 +515,217 @@ def test_archive_run_one_shot_and_per_device_independent(qtbot, monkeypatch) -> 
         assert not hv._timer.isActive()  # archive runs never tick
         # The accumulators are archive-provenance.
         assert m.stations[_DEV_A].accumulator._provenance == "archive"
+        # Engine-side totals reflect the worker's slice (devB honestly 0).
+        summary = hv.active_measurement()
+        assert summary is not None
+        assert summary.window_counts[_DEV_A] == (3, 3)
+        assert summary.window_counts[_DEV_B] == (0, 0)
     finally:
         hv.shutdown()
 
 
-def test_archive_run_with_no_windows_anywhere_returns_empty(qtbot, monkeypatch) -> None:
+def test_archive_no_data_is_async_and_names_searched_roots(qtbot, monkeypatch) -> None:
+    """M6: a range with no gap-free 3C window on any device is announced
+    asynchronously via arrayArchiveNoData with the deduped searched roots;
+    the measurement is discarded WITHOUT an arrayMeasurementStopped."""
     monkeypatch.setattr(hvsr_mod, "slice_archive_windows", lambda *a, **k: [])
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    stopped: list[str] = []
+    hv.arrayMeasurementStopped.connect(stopped.append)
+    try:
+        with qtbot.waitSignal(hv.arrayArchiveNoData, timeout=5000) as blocker:
+            mid = hv.start_archive_measurement(
+                _DEVICES,
+                UTCDateTime(0),
+                UTCDateTime(10),
+                _settings(),
+                _geometry(),
+                {_DEV_A: _RootedReader("/arch/a"), _DEV_B: _RootedReader("/arch/a")},  # type: ignore[dict-item]
+            )
+        assert mid
+        assert blocker.args[0] == mid
+        assert blocker.args[1] == ("/arch/a",)  # shared root, deduped
+        assert hv.active_measurement() is None
+        assert stopped == []  # no-data is terminal without a stopped emit
+    finally:
+        hv.shutdown()
+
+
+def test_archive_run_without_any_reader_returns_empty() -> None:
+    """The degenerate synchronous "" path: no checked device has a reader."""
     hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
     try:
         mid = hv.start_archive_measurement(
+            _DEVICES, UTCDateTime(0), UTCDateTime(10), _settings(), _geometry(), {}
+        )
+        assert mid == ""
+        assert hv.active_measurement() is None
+    finally:
+        hv.shutdown()
+
+
+def test_archive_slicing_runs_off_the_gui_thread(qtbot, monkeypatch) -> None:
+    """M6 (auditor F1): the N-device archive read runs on the array worker
+    thread, never on the calling/GUI thread."""
+    threads: list[QThread] = []
+
+    def _slice(reader, device, *a, **k):
+        threads.append(QThread.currentThread())
+        return _archive_windows(2)
+
+    monkeypatch.setattr(hvsr_mod, "slice_archive_windows", _slice)
+    monkeypatch.setattr(
+        hvsr_mod.HvsrAccumulator, "compute", lambda self: _dummy_result(self._device)
+    )
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    try:
+        with qtbot.waitSignal(hv.arrayUpdated, timeout=5000):
+            hv.start_archive_measurement(
+                _DEVICES,
+                UTCDateTime(0),
+                UTCDateTime(10),
+                _settings(),
+                _geometry(),
+                {_DEV_A: object(), _DEV_B: object()},  # type: ignore[dict-item]
+            )
+        gui_thread = QThread.currentThread()
+        assert threads
+        assert all(t is hv._array_thread for t in threads)
+        assert all(t is not gui_thread for t in threads)
+    finally:
+        hv.shutdown()
+
+
+def test_archive_all_slices_failed_reports_errors_not_no_data(qtbot, monkeypatch) -> None:
+    """M6 review: when NOTHING sliced because every READ failed, the cycle
+    announces the per-device errors (empty-results arrayUpdated), never the
+    misleading 'no data' outcome."""
+
+    def _boom(reader, device, *a, **k):
+        raise OSError(f"disk gone for {device}")
+
+    monkeypatch.setattr(hvsr_mod, "slice_archive_windows", _boom)
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    no_data: list[object] = []
+    hv.arrayArchiveNoData.connect(lambda *a: no_data.append(a))
+    try:
+        with qtbot.waitSignal(hv.arrayUpdated, timeout=5000) as blocker:
+            mid = hv.start_archive_measurement(
+                _DEVICES,
+                UTCDateTime(0),
+                UTCDateTime(10),
+                _settings(),
+                _geometry(),
+                {_DEV_A: object(), _DEV_B: object()},  # type: ignore[dict-item]
+            )
+        result = blocker.args[0]
+        assert isinstance(result, ArrayHvsrResult)
+        assert result.measurement_id == mid
+        assert dict(result.results) == {}
+        assert set(result.errors) == {_DEV_A, _DEV_B}
+        assert "disk gone" in result.errors[_DEV_A]
+        assert no_data == []
+    finally:
+        hv.shutdown()
+
+
+def test_window_override_ignored_while_archive_cycle_inflight(qtbot, monkeypatch) -> None:
+    """M6 auditor: the archive cycle owns the accumulators; a GUI-thread
+    override during the in-flight slice must not touch them (and works
+    again once the cycle lands)."""
+    override_calls: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        hvsr_mod.HvsrAccumulator,
+        "set_window_override",
+        lambda self, wid, acc: override_calls.append((wid, acc)),
+    )
+    monkeypatch.setattr(
+        hvsr_mod.HvsrAccumulator, "compute", lambda self: _dummy_result(self._device)
+    )
+    started = []
+
+    def _slow_slice(reader, device, *a, **k):
+        started.append(device)
+        time.sleep(1.0)
+        return _archive_windows(2)
+
+    monkeypatch.setattr(hvsr_mod, "slice_archive_windows", _slow_slice)
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    try:
+        with qtbot.waitSignal(hv.arrayUpdated, timeout=8000):
+            mid = hv.start_archive_measurement(
+                {_DEV_A: _group("STA")},
+                UTCDateTime(0),
+                UTCDateTime(10),
+                _settings(),
+                _geometry(),
+                {_DEV_A: object()},  # type: ignore[dict-item]
+            )
+            qtbot.waitUntil(lambda: bool(started), timeout=2000)  # slice in flight
+            hv.set_window_override(mid, _DEV_A, 0, False)
+            assert override_calls == []  # worker owns the accumulator
+        # Cycle landed: ownership is back, overrides apply again.
+        with qtbot.waitSignal(hv.arrayUpdated, timeout=5000):
+            hv.set_window_override(mid, _DEV_A, 0, False)
+        assert override_calls == [(0, False)]
+    finally:
+        hv.shutdown()
+
+
+def test_shutdown_keeps_unjoined_abandoned_thread_referenced(qtbot, monkeypatch) -> None:
+    """M6 auditor: shutdown must never drop the last reference to a
+    still-running abandoned QThread (destroyed-while-running aborts);
+    the pair stays in _abandoned until a later drain joins it."""
+    import echosmonitor.core.hvsr_array as hvsr_array_mod
+
+    calls: list[str] = []
+
+    def _compute(self: hvsr_mod.HvsrAccumulator) -> HvsrResult:
+        calls.append(self._device)
+        if len(calls) == 1:
+            time.sleep(2.0)  # the uninterruptible first compute
+        return _dummy_result(self._device)
+
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", _compute)
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    try:
+        hv.start_measurement({_DEV_A: _group("STA")}, _settings(), _geometry())
+        _seed_windows(hv, _DEV_A, 3)
+        m = hv._measurement
+        assert m is not None
+        hv._request_recompute(m, force=True)
+        qtbot.waitUntil(lambda: bool(calls), timeout=2000)  # compute in flight
+        monkeypatch.setattr(hvsr_array_mod, "_THREAD_JOIN_MS", 50)
+        hv.stop_measurement()  # join times out → poisoned
+        hv.start_measurement({_DEV_A: _group("STA")}, _settings(), _geometry())
+        assert hv._abandoned  # rebuilt; old pair abandoned, still busy
+        hv.stop_measurement()
+        hv.shutdown()  # 50 ms bound: the busy thread cannot join yet
+        assert hv._abandoned, "a running abandoned thread must stay referenced"
+    finally:
+        monkeypatch.setattr(hvsr_array_mod, "_THREAD_JOIN_MS", 8000)
+        hv.shutdown()  # full bound: drains for real
+    assert not hv._abandoned
+
+
+def test_stop_during_archive_slicing_aborts_at_device_boundary(qtbot, monkeypatch) -> None:
+    """Rule 7: the stop flag is observed between devices in the slice phase —
+    once stop lands during devA's slow read, devB is never sliced and the
+    superseded cycle announces nothing."""
+    sliced: list[str] = []
+
+    def _slow_slice(reader, device, *a, **k):
+        sliced.append(device)
+        time.sleep(2.0)
+        return _archive_windows(2)
+
+    monkeypatch.setattr(hvsr_mod, "slice_archive_windows", _slow_slice)
+    hv = HvsrArrayEngine(_FakeRingEngine(), None)  # type: ignore[arg-type]
+    announced: list[object] = []
+    hv.arrayUpdated.connect(announced.append)
+    hv.arrayArchiveNoData.connect(lambda *a: announced.append(a))
+    try:
+        hv.start_archive_measurement(
             _DEVICES,
             UTCDateTime(0),
             UTCDateTime(10),
@@ -523,8 +733,14 @@ def test_archive_run_with_no_windows_anywhere_returns_empty(qtbot, monkeypatch) 
             _geometry(),
             {_DEV_A: object(), _DEV_B: object()},  # type: ignore[dict-item]
         )
-        assert mid == ""
-        assert hv.active_measurement() is None
+        qtbot.waitUntil(lambda: bool(sliced), timeout=2000)  # devA slice in flight
+        t0 = time.monotonic()
+        hv.stop_measurement()
+        elapsed = time.monotonic() - t0
+        assert elapsed < 8.5, f"stop took {elapsed:.1f}s (should join within the bound)"
+        qtbot.wait(100)  # drain anything wrongly queued
+        assert sliced == [_DEV_A], "stop must abort the cycle at the per-device boundary"
+        assert announced == []
     finally:
         hv.shutdown()
 

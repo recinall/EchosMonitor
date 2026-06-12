@@ -49,6 +49,7 @@ class _FakeArrayEngine(QObject):
     arrayWindowCounts = Signal(str, object)  # noqa: N815
     arrayStateChanged = Signal(str, str)  # noqa: N815
     arrayBackpressure = Signal(str, int)  # noqa: N815
+    arrayArchiveNoData = Signal(str, object)  # noqa: N815
 
     def __init__(self) -> None:
         super().__init__()
@@ -363,7 +364,46 @@ def test_archive_click_during_live_run_resolves_cleanly(qtbot) -> None:
     assert "(archive" in widget._title.text()
 
 
-def test_archive_no_data_reports_clearly(qtbot) -> None:
+def test_archive_no_data_reports_clearly_with_roots(qtbot) -> None:
+    """M6: the async no-data outcome names WHICH archive root(s) were
+    searched, and clears the tracked measurement."""
+    widget, engine, array, _calls = _make(qtbot)
+    _add_3c(engine, "alpha", "STA")
+    qtbot.wait(20)
+    _check_all(widget)
+    widget.set_archive_request_handler(lambda *_a: "hvsr-array-arch")
+    widget._on_archive_clicked()
+    assert widget._measurement_id == "hvsr-array-arch"
+    assert widget._table.rowCount() > 0  # rows seeded at click time
+    array.arrayArchiveNoData.emit("hvsr-array-arch", ("/data/sessions/proj",))
+    qtbot.wait(20)
+    assert widget._measurement_id is None
+    text = widget.status_text()
+    assert "no archived data" in text.lower()
+    assert "/data/sessions/proj" in text
+    # The discarded run leaves no stale 0/0 rows under the no-measurement title.
+    assert widget._table.rowCount() == 0
+    assert widget._title.text() == "HVSR array — no measurement"
+
+
+def test_archive_no_data_for_other_measurement_ignored(qtbot) -> None:
+    """A stale no-data announcement (superseded run) must not clobber the
+    current run's state."""
+    widget, engine, array, _calls = _make(qtbot)
+    _add_3c(engine, "alpha", "STA")
+    qtbot.wait(20)
+    _check_all(widget)
+    widget.set_archive_request_handler(lambda *_a: "hvsr-array-arch")
+    widget._on_archive_clicked()
+    array.arrayArchiveNoData.emit("hvsr-array-stale", ("/other",))
+    qtbot.wait(20)
+    assert widget._measurement_id == "hvsr-array-arch"
+    assert "/other" not in widget.status_text()
+
+
+def test_archive_without_any_reader_reports_degenerate_case(qtbot) -> None:
+    """The handler's synchronous "" now means only: no device has an
+    archive at all (M6 — the no-data outcome is async otherwise)."""
     widget, engine, _array, _calls = _make(qtbot)
     _add_3c(engine, "alpha", "STA")
     qtbot.wait(20)
@@ -371,7 +411,7 @@ def test_archive_no_data_reports_clearly(qtbot) -> None:
     widget.set_archive_request_handler(lambda *_a: "")
     widget._on_archive_clicked()
     assert widget._measurement_id is None
-    assert "no archived data" in widget.status_text().lower()
+    assert "no archive is available" in widget.status_text().lower()
 
 
 def test_export_buttons_gated_and_context_derives_period(qtbot) -> None:

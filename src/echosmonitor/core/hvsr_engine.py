@@ -32,6 +32,7 @@ This module imports no ``hvsrpy`` — the boundary lives in
 
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -233,12 +234,22 @@ class _HvsrWorker(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._stop = False
+        # Latest-wins token (skill §2, ported from the array worker): the
+        # engine writes the live measurement id GIL-atomically; a stale
+        # queued compute (its posted event can survive quit() and dispatch
+        # on the next thread start) dies at the first check instead of
+        # burning a full JIT-scale compute ahead of the new run's first
+        # honest result.
+        self._active_id = ""
+
+    def _superseded(self, measurement_id: str) -> bool:
+        return self._stop or measurement_id != self._active_id
 
     @Slot(object)
     def compute(self, request: object) -> None:
         if not isinstance(request, _ComputeRequest):  # defensive (type-erased)
             return
-        if self._stop:
+        if self._superseded(request.measurement_id):
             return
         t0 = time.monotonic()
         try:
@@ -247,10 +258,12 @@ class _HvsrWorker(QObject):
             _log.error(
                 "hvsr_worker_compute_failed", measurement=request.measurement_id, error=str(exc)
             )
+            if self._superseded(request.measurement_id):
+                return  # stopped/superseded mid-compute — do not announce
             self.failed.emit(request.measurement_id, str(exc))
             return
-        if self._stop:
-            return  # disengaged mid-compute — do not announce
+        if self._superseded(request.measurement_id):
+            return  # stopped/superseded mid-compute — do not announce
         elapsed = (time.monotonic() - t0) * 1000.0
         self.computed.emit(_ComputeResult(request.measurement_id, result, elapsed))
 
@@ -292,25 +305,76 @@ class HvsrEngine(QObject):
         self._provider = provider
         self._measurement: _Measurement | None = None
         self._seq = 0
+        # Set when a stop's bounded join timed out: the thread is still
+        # finishing an uninterruptible compute with a quit() pending, and
+        # once that slot returns exec() exits DISCARDING queued events (the
+        # recorded postmortem race) — a new measurement dispatched into it
+        # would hang forever. _boot_worker rebuilds in that case (the M5
+        # array-engine F2 fix, ported here as the M6 follow-up).
+        self._join_timed_out = False
+        # Abandoned (worker, thread) pairs kept alive until shutdown so a
+        # still-running QThread object is never garbage-collected.
+        self._abandoned: list[tuple[_HvsrWorker, QThread]] = []
 
-        self._worker = _HvsrWorker()
-        self._hvsr_thread = QThread()
-        self._hvsr_thread.setObjectName("hvsr-worker")
-        self._worker.moveToThread(self._hvsr_thread)
-
-        # Worker → engine: QueuedConnection so these slots run on the GUI thread.
-        self._worker.computed.connect(self._on_computed, Qt.ConnectionType.QueuedConnection)
-        self._worker.failed.connect(self._on_failed, Qt.ConnectionType.QueuedConnection)
-        # Engine → worker: QueuedConnection so the slot body runs on the worker.
-        self._computeRequested.connect(self._worker.compute, Qt.ConnectionType.QueuedConnection)
-        self._stopRequested.connect(self._worker.request_stop, Qt.ConnectionType.QueuedConnection)
-        self._clearStopRequested.connect(
-            self._worker.clear_stop, Qt.ConnectionType.QueuedConnection
-        )
+        self._worker, self._hvsr_thread = self._make_worker()
 
         # GUI-thread pull timer (live mode). Interval set per measurement.
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
+
+    def _make_worker(self) -> tuple[_HvsrWorker, QThread]:
+        worker = _HvsrWorker()
+        thread = QThread()
+        thread.setObjectName("hvsr-worker")
+        worker.moveToThread(thread)
+        # Worker → engine: QueuedConnection so these slots run on the GUI thread.
+        worker.computed.connect(self._on_computed, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(self._on_failed, Qt.ConnectionType.QueuedConnection)
+        # Engine → worker: QueuedConnection so the slot body runs on the worker.
+        self._computeRequested.connect(worker.compute, Qt.ConnectionType.QueuedConnection)
+        self._stopRequested.connect(worker.request_stop, Qt.ConnectionType.QueuedConnection)
+        self._clearStopRequested.connect(worker.clear_stop, Qt.ConnectionType.QueuedConnection)
+        return worker, thread
+
+    def _disconnect_worker(self, worker: _HvsrWorker) -> None:
+        """Sever an abandoned worker so it can never announce or receive."""
+        worker._stop = True  # compute checks it before emitting
+        worker._active_id = ""
+        for signal, slot in (
+            (worker.computed, self._on_computed),
+            (worker.failed, self._on_failed),
+            (self._computeRequested, worker.compute),
+            (self._stopRequested, worker.request_stop),
+            (self._clearStopRequested, worker.clear_stop),
+        ):
+            with contextlib.suppress(RuntimeError, TypeError):
+                signal.disconnect(slot)
+
+    def _boot_worker(self, measurement_id: str) -> None:
+        if self._join_timed_out:
+            # The prior stop's join timed out: the thread is (probably)
+            # still inside an uninterruptible compute with a quit() pending.
+            # Dispatching into it would be silently discarded when exec()
+            # exits (array-engine auditor F2). One brief second chance, else
+            # abandon the poisoned pair and rebuild fresh.
+            if self._hvsr_thread.isRunning() and not self._hvsr_thread.wait(100):
+                self._disconnect_worker(self._worker)
+                self._abandoned.append((self._worker, self._hvsr_thread))
+                _log.warning(
+                    "hvsr_worker_rebuilt_after_join_timeout",
+                    abandoned=len(self._abandoned),
+                )
+                self._worker, self._hvsr_thread = self._make_worker()
+            self._join_timed_out = False
+        if not self._hvsr_thread.isRunning():
+            self._hvsr_thread.start()
+        # Queued clear AFTER start: a prior stop's queued request_stop can
+        # survive quit() un-dispatched (the postmortem race) and would re-set
+        # the flag on restart, silently dropping the next compute. FIFO
+        # ordering guarantees stale-stop → clear → compute.
+        self._clearStopRequested.emit()
+        self._worker._stop = False
+        self._worker._active_id = measurement_id  # latest-wins token (skill §2)
 
     # ------------------------------------------------------------------
     # Public API
@@ -346,10 +410,7 @@ class HvsrEngine(QObject):
             same_response=same_response,
         )
         self._measurement = m
-        if not self._hvsr_thread.isRunning():
-            self._hvsr_thread.start()
-        self._clearStopRequested.emit()  # reset a stop flag from a prior run
-        self._worker._stop = False
+        self._boot_worker(measurement_id)
         self._set_state(m, HvsrState.ACCUMULATING)
         self.hvsrMeasurementStarted.emit(measurement_id, self._summary(m))
         # Tick fast enough to notice a full fresh window promptly; the capture
@@ -415,14 +476,7 @@ class HvsrEngine(QObject):
             same_response=same_response,
         )
         self._measurement = m
-        if not self._hvsr_thread.isRunning():
-            self._hvsr_thread.start()
-        # Queued clear AFTER start: a prior stop's queued request_stop can
-        # survive quit() un-dispatched (the postmortem race) and would re-set
-        # the flag on restart, silently dropping the one-shot compute below.
-        # FIFO ordering guarantees stale-stop → clear → compute.
-        self._clearStopRequested.emit()
-        self._worker._stop = False
+        self._boot_worker(measurement_id)
         self._set_state(m, HvsrState.ACCUMULATING)
         self.hvsrMeasurementStarted.emit(measurement_id, self._summary(m))
         self._request_recompute(m, force=True)  # single off-thread compute
@@ -454,11 +508,13 @@ class HvsrEngine(QObject):
         # interrupted within one poll; the queued request_stop is a
         # belt-and-suspenders for the idle-worker case.
         self._worker._stop = True
+        self._worker._active_id = ""  # supersede any queued/in-flight compute
         self._stopRequested.emit()
         if self._hvsr_thread.isRunning():
             self._hvsr_thread.quit()
             if not self._hvsr_thread.wait(_THREAD_JOIN_MS):
                 _log.warning("hvsr_thread_join_timeout", measurement=m.measurement_id)
+                self._join_timed_out = True  # next boot rebuilds if still stuck
         self._set_state(m, HvsrState.IDLE)
         stopped_id = m.measurement_id
         self._measurement = None
@@ -470,11 +526,24 @@ class HvsrEngine(QObject):
         return None if m is None else self._summary(m)
 
     def shutdown(self) -> None:
-        """Tear down for app exit — stop the measurement and the thread."""
+        """Tear down for app exit — stop the measurement and every thread."""
         self.stop_measurement()
         if self._hvsr_thread.isRunning():
             self._hvsr_thread.quit()
             self._hvsr_thread.wait(_THREAD_JOIN_MS)
+        # Drain any threads abandoned by a poisoned-thread rebuild: their
+        # severed workers can no longer announce, but a still-running
+        # QThread must be joined (bounded) before the process exits. A pair
+        # whose join times out stays REFERENCED — dropping the last Python
+        # reference to a running QThread aborts (destroyed-while-running).
+        still_running: list[tuple[_HvsrWorker, QThread]] = []
+        for worker, thread in self._abandoned:
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(_THREAD_JOIN_MS):
+                    _log.warning("hvsr_abandoned_thread_join_timeout")
+                    still_running.append((worker, thread))
+        self._abandoned = still_running
 
     # ------------------------------------------------------------------
     # Internal — live accumulation

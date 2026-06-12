@@ -154,3 +154,32 @@ def test_engine_archive_empty_returns_blank(qtbot, tmp_path) -> None:
     finally:
         hv.shutdown()
         engine.stop()
+
+
+def test_slice_archive_windows_honors_should_stop(tmp_path) -> None:
+    """Rule 7 (M6): a worker-thread caller can abort the slice cooperatively;
+    an aborted slice returns [] — never a partial window list."""
+    root = tmp_path / "sds"
+    _write_archive(root)
+    reader = ArchiveReader(root)
+    settings = HvsrSettings(window_length_s=30.0, freqmin_hz=0.5, freqmax_hz=40.0, resample_n=128)
+    full = slice_archive_windows(reader, "dev", _GROUP, _T0, _T0 + _DURATION_S, settings)
+    assert full  # sanity: the range does hold windows
+
+    polls: list[int] = []
+
+    def _stop_after_first_poll() -> bool:
+        polls.append(len(polls))
+        return len(polls) > 1
+
+    aborted = slice_archive_windows(
+        reader,
+        "dev",
+        _GROUP,
+        _T0,
+        _T0 + _DURATION_S,
+        settings,
+        should_stop=_stop_after_first_poll,
+    )
+    assert aborted == []
+    assert len(polls) >= 2  # the flag was genuinely polled along the way

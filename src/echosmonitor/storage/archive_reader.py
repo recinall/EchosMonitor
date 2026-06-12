@@ -51,6 +51,11 @@ class ArchiveReader:
         self._root = root
         self._dao = dao
 
+    @property
+    def root(self) -> Path:
+        """The SDS archive root this reader scans (read-only)."""
+        return self._root
+
     def read_window(
         self,
         sid: StreamID,

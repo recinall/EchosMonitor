@@ -749,6 +749,31 @@ rebuild port, no-data root surfacing.
 
 ## M6 — Hardening & polish
 
+- [x] **0. M5 follow-ups** *(done 2026-06-12)*:
+      (1) array archive slicing moved onto the array worker (auditor F1):
+      `start_archive_measurement` returns the id immediately and dispatches
+      ONE slice+compute cycle; the worker owns the stations' accumulators
+      until its result lands (engine-side `n_windows_total` backs all UI
+      counts; `set_window_override` and `_request_recompute` are
+      pending-gated), and `slice_archive_windows` grew a cooperative
+      `should_stop` (polled per component read / window step — rule 7).
+      (2) HvsrEngine got the poisoned-thread rebuild port (auditor F2) PLUS
+      the latest-wins `_active_id` token, and BOTH engines' shutdown now
+      retains (never drops) abandoned pairs whose bounded join timed out —
+      dropping the last reference to a running QThread aborts the process
+      (the mutation run crashed the interpreter, proving the test).
+      (3) the array no-data outcome is now the async signal
+      `arrayArchiveNoData(id, searched_roots)` and the widget message names
+      WHICH archive root(s) were searched; a cycle where every slice READ
+      failed announces the per-device errors instead of "no data"; the
+      handler's `""` return is reserved for the no-reader degenerate case.
+      Gate at close: 1071 passed / 5 perf-deselected, ruff + mypy --strict
+      clean; all new regression tests mutation-verified.
+      Known LOW gaps (auditor, deliberate): a second manual override issued
+      while a post-slice recompute is still pending is dropped with a warn
+      log (a `slice_inflight` flag distinct from `pending` would make the
+      ownership guard exact); a whole-cycle worker failure surfaces only in
+      the log + `ArrayHvsrSummary.last_error`, not in the per-device rows.
 - [ ] First-run wizard rewritten for Echos (discover device on
       `192.168.4.1` AP / mDNS `*.local`, set admin password, add device).
 - [ ] mDNS discovery of Echos nodes on the LAN (optional, zeroconf).
@@ -857,6 +882,10 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M4-B: position resolution runs from launch (configure on every configChanged), like the M1-C status poller | Rule 13's "nothing starts without the user" governs *acquisition* (the engine); positions are passive credential-less fleet metadata, the same sanctioned class as the status poller. The Map tab also works before any device is started — which is when the field user is placing instruments. |
 | 2026-06-12 | M5-D: the array archive run roots at the Archive tab's **currently selected session** (pull-based, one shared reader for all checked devices); with no selection each device falls back to its live `engine.archive_root` | The single-station hand-off ctx (M3-E) is push-based and keyed to one device + interval; an array run spans N devices, and the selected session's root is the only honest reach into a CLOSED session's per-device SDS trees (rule 14). The user flow is explicit: pick the session in the Archive tab, then run the array over it. |
 | 2026-06-12 | M5-A (open question 5): array windowing is **per-device independent** — each device accumulates its own gap-free disjoint windows (own `last_window_end` cursor); the common-window gate (accept only when ALL devices cover the same span) is a deferred optional toggle | Skill `hvsr-array`: independent windows degrade gracefully (a flaky device just contributes fewer windows; it can never collapse the whole array's throughput) and stay honest — curves remain comparable because the interval and the one shared settings panel are identical across stations. Common windows buy stricter comparability at the cost of throughput hostage-taking by the weakest device; revisit on a real field need and surface per-device rejection reasons then. |
+| 2026-06-12 | M6-0: the array archive no-data outcome is the ASYNC signal `arrayArchiveNoData(id, searched_roots)` — no `arrayMeasurementStopped` (nothing ran to stop), and the handler's `""` return shrinks to the no-reader degenerate case | Moving the N-device slice onto the worker (auditor F1) makes the outcome inherently async; emitting `stopped` first would clear the widget's id and make it drop the no-data message, emitting it second would clobber the message with "Stopped.". The roots ride the signal because the message must say WHERE it looked (the M5 follow-up: a stale Archive-tab session selection used to read as bare "no data"). |
+| 2026-06-12 | M6-0: during an archive cycle the worker OWNS the stations' accumulators; the engine/UI read only engine-side `_Station.n_windows_total`, and `set_window_override` + `_request_recompute` are pending-gated | The accumulators are filled in place on the worker (snapshotting N devices' window lists would double memory for nothing); the ownership convention plus the pending-first gate removes every cross-thread accumulator touch instead of blessing "GIL-safe" racy reads. Known cost: a second override during a post-slice pending recompute is dropped (warn-logged) — `slice_inflight` flag if it ever matters. |
+| 2026-06-12 | M6-0: a cycle where EVERY device's slice read raised announces the per-device errors as an empty-results `arrayUpdated`, never `arrayArchiveNoData` | "No archived data in that range" when the truth is N I/O failures sends the user hunting for a time-range mistake that does not exist; the errors ride the result so the table's per-device status column shows the real cause (reviewer finding on the first M6-0 cut). |
+| 2026-06-12 | M6-0: both HVSR engines' shutdown RETAINS abandoned worker/thread pairs whose bounded join timed out (drain retries on the next shutdown; no cap, count logged) | Dropping the last Python reference to a running QThread is a hard Qt abort (destroyed-while-running) — the mutation run literally crashed the interpreter. A cap is impossible without dropping a running reference, so the logged `abandoned=` count is the rule-5 observability compromise. |
 
 ## Open questions (resolve before the milestone that needs them)
 

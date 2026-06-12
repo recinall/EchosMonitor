@@ -2355,6 +2355,11 @@ class MainWindow(QMainWindow):
         Archive-tab selection is the pull-based counterpart of the
         single-station hand-off context — the user picks the session
         first, then runs the array over it.
+
+        The slicing runs on the array worker (M6): this returns the id
+        immediately, and a range with no data is announced asynchronously
+        via ``arrayArchiveNoData`` together with the searched roots (the
+        readers' ``root`` is where the message text comes from).
         """
         from pathlib import Path
 

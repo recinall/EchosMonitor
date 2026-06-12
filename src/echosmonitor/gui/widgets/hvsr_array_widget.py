@@ -73,9 +73,12 @@ if TYPE_CHECKING:
 # ``geometry(devices)`` (rule 16). Injected so the widget holds no resolver.
 GeometryProvider = Callable[[Iterable[str]], "StationGeometry"]
 
-# (groups, t_start, t_end, settings, geometry) -> measurement_id ("" if no
-# device has a gap-free 3C window in the range). Wired by main_window so the
-# widget stays free of ArchiveReader / storage construction (M5-D).
+# (groups, t_start, t_end, settings, geometry) -> measurement_id ("" only in
+# the degenerate no-reader-for-any-device case). The slicing runs on the
+# array worker (M6): a range with no gap-free 3C window on any device is
+# announced asynchronously via arrayArchiveNoData, together with WHICH
+# archive root(s) were searched. Wired by main_window so the widget stays
+# free of ArchiveReader / storage construction (M5-D).
 ArrayArchiveHandler = Callable[
     [dict[str, dict[str, str]], UTCDateTime, UTCDateTime, HvsrSettings, "StationGeometry"],
     str,
@@ -323,6 +326,7 @@ class HvsrArrayWidget(QWidget):
         self._array.arrayWindowCounts.connect(self._on_window_counts)
         self._array.arrayBackpressure.connect(self._on_backpressure)
         self._array.arrayMeasurementStopped.connect(self._on_stopped)
+        self._array.arrayArchiveNoData.connect(self._on_archive_no_data)
 
     # ------------------------------------------------------------------
     # Device selection
@@ -518,28 +522,48 @@ class HvsrArrayWidget(QWidget):
             groups, t_start, t_end, self.current_settings(), geometry
         )
         if not measurement_id:
+            # Degenerate case only (M6): no checked device has an archive
+            # reader — a range with no data is announced asynchronously
+            # via arrayArchiveNoData instead.
             self._measurement_id = None
             self._status_label.setText(
-                "No archived data with full 3C coverage on any checked station "
-                "in that range."
+                "No archive is available for any checked station."
             )
             return
         self._measurement_id = measurement_id
-        # Seed the honest sliced-window totals: the engine's start-time
-        # counts emit fires before this handler returns the id, so it is
-        # pulled here instead of received (reviewer F3).
-        summary = self._array.active_measurement()
-        if summary is not None and summary.measurement_id == measurement_id:
-            self._counts = dict(summary.window_counts)
-        else:
-            self._counts = dict.fromkeys(groups, (0, 0))
+        # Counts start at zero: the slicing now runs on the array worker
+        # (M6) and the honest sliced-window totals arrive with the cycle's
+        # arrayWindowCounts emit.
+        self._counts = dict.fromkeys(groups, (0, 0))
         self._title.setToolTip("")
         self._title.setText(
             "HVSR array — " + ", ".join(sorted(groups)) + f" (archive {t_start} to {t_end})"
         )
-        self._status_label.setText("Computing array HVSR over the archived range…")
+        self._status_label.setText("Reading the archived range and computing array HVSR…")
         self._update_position_note(tuple(groups), geometry)
         self._rebuild_table()
+        self._update_start_enabled()
+
+    @Slot(str, object)
+    def _on_archive_no_data(self, measurement_id: str, roots: object) -> None:
+        """Async no-data outcome of an archive run (M6): say WHERE we looked."""
+        if measurement_id != self._measurement_id:
+            return
+        self._measurement_id = None
+        # The discarded run never produced anything: drop the rows/counts
+        # seeded at click time, or the table would show 0/0 "accumulating…"
+        # under a "no measurement" title forever.
+        self._clear_views()
+        self._active_groups = {}
+        self._rebuild_table()
+        self._title.setText(_NO_MEASUREMENT_TITLE)
+        message = (
+            "No archived data with full 3C coverage on any checked station "
+            "in that range."
+        )
+        if isinstance(roots, tuple) and roots:
+            message += " Searched archive root(s): " + ", ".join(str(r) for r in roots)
+        self._status_label.setText(message)
         self._update_start_enabled()
 
     # ------------------------------------------------------------------

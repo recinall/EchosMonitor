@@ -364,3 +364,173 @@ def test_stop_joins_within_bound_during_slow_compute(qtbot, tmp_path, monkeypatc
     elapsed = time.monotonic() - t0
     assert elapsed < 8.5, f"stop took {elapsed:.1f}s (should join within the bound)"
     assert hv.active_measurement() is None
+
+
+def test_restart_after_join_timeout_rebuilds_worker(qtbot, tmp_path, monkeypatch) -> None:
+    """M6 port of the array engine's auditor-F2 fix: a stop whose bounded
+    join times out leaves the thread finishing an uninterruptible compute
+    with a quit() pending; once that slot returns, exec() exits DISCARDING
+    queued events (the recorded postmortem race) and nothing restarts the
+    thread — a new measurement dispatched into it hangs in COMPUTING
+    forever. _boot_worker must detect the poisoned thread and rebuild, so
+    the new run's compute actually lands."""
+    import echosmonitor.core.hvsr_engine as hvsr_engine_mod
+
+    calls: list[int] = []
+
+    def _compute(self: hvsr_mod.HvsrAccumulator) -> HvsrResult:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            time.sleep(2.0)  # the uninterruptible first compute
+        return _dummy_result()
+
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", _compute)
+    engine = StreamingEngine(_cfg(200.0, tmp_path / "arch"))
+    hv = HvsrEngine(engine, None)
+    rng = np.random.default_rng(0)
+
+    def _seed(n: int) -> None:
+        m = hv._measurement
+        assert m is not None
+        for _ in range(n):
+            m.accumulator.add_window(
+                rng.standard_normal(50),
+                rng.standard_normal(50),
+                rng.standard_normal(50),
+                UTCDateTime(0),
+                100.0,
+            )
+
+    try:
+        first = hv.start_measurement(_DEVICE, _GROUP, HvsrSettings(window_length_s=0.5))
+        _seed(3)
+        m = hv._measurement
+        assert m is not None
+        hv._request_recompute(m, force=True)
+        qtbot.waitUntil(lambda: bool(calls), timeout=2000)  # compute in flight
+        # Force the join to time out while the 2 s compute is still running.
+        monkeypatch.setattr(hvsr_engine_mod, "_THREAD_JOIN_MS", 50)
+        hv.stop_measurement()
+        assert hv._join_timed_out
+        monkeypatch.setattr(hvsr_engine_mod, "_THREAD_JOIN_MS", 8000)
+        # Immediate restart: must rebuild (the old thread is still busy)
+        # and the new run's forced compute must land, not hang.
+        second = hv.start_measurement(_DEVICE, _GROUP, HvsrSettings(window_length_s=0.5))
+        assert second != first
+        assert hv._abandoned, "expected the poisoned worker/thread to be abandoned"
+        _seed(3)
+        m2 = hv._measurement
+        assert m2 is not None
+        with qtbot.waitSignal(hv.hvsrUpdated, timeout=5000):
+            hv._request_recompute(m2, force=True)
+    finally:
+        hv.shutdown()  # drains the abandoned thread (bounded)
+        engine.stop()
+    assert not hv._abandoned
+
+
+def test_worker_drops_superseded_compute(qtbot, tmp_path, monkeypatch) -> None:
+    """Latest-wins token (skill §2, M6 port from the array worker): a stale
+    queued compute from a stopped/superseded run dies at the first check
+    instead of burning a full JIT-scale compute ahead of the new run's
+    first honest result.
+
+    The worker slot is called directly (deterministic — the real path is a
+    posted event surviving quit() and dispatching on the next thread start).
+    """
+    from echosmonitor.core.hvsr_engine import _ComputeRequest
+
+    calls: list[int] = []
+
+    def _compute(self: hvsr_mod.HvsrAccumulator) -> HvsrResult:
+        calls.append(len(calls))
+        return _dummy_result()
+
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", _compute)
+    engine = StreamingEngine(_cfg(200.0, tmp_path / "arch"))
+    hv = HvsrEngine(engine, None)
+    rng = np.random.default_rng(0)
+    try:
+        mid = hv.start_measurement(_DEVICE, _GROUP, HvsrSettings(window_length_s=0.5))
+        m = hv._measurement
+        assert m is not None
+        for _ in range(3):
+            m.accumulator.add_window(
+                rng.standard_normal(50),
+                rng.standard_normal(50),
+                rng.standard_normal(50),
+                UTCDateTime(0),
+                100.0,
+            )
+        emitted: list[object] = []
+        # Direct: the slot must run inside the compute() call itself, not on
+        # a later event-loop turn (the assertions are immediate).
+        hv._worker.computed.connect(emitted.append, Qt.ConnectionType.DirectConnection)
+        snapshot = m.accumulator.snapshot()
+        # A request from a DEAD measurement: dropped before any compute runs.
+        hv._worker.compute(_ComputeRequest("hvsr-999", snapshot))
+        assert calls == [] and emitted == []
+        # The live measurement's request still computes and announces.
+        hv._worker.compute(_ComputeRequest(mid, snapshot))
+        assert calls == [0] and len(emitted) == 1
+        # After stop the token is cleared: even the old live id is dead.
+        hv.stop_measurement()
+        hv._worker.compute(_ComputeRequest(mid, snapshot))
+        assert calls == [0] and len(emitted) == 1
+    finally:
+        hv.shutdown()
+        engine.stop()
+
+
+def test_shutdown_keeps_unjoined_abandoned_thread_referenced(
+    qtbot, tmp_path, monkeypatch
+) -> None:
+    """M6 auditor: shutdown must never drop the last reference to a
+    still-running abandoned QThread (destroyed-while-running aborts);
+    the pair stays in _abandoned until a later drain joins it."""
+    import echosmonitor.core.hvsr_engine as hvsr_engine_mod
+
+    calls: list[int] = []
+
+    def _compute(self: hvsr_mod.HvsrAccumulator) -> HvsrResult:
+        calls.append(len(calls))
+        if len(calls) == 1:
+            time.sleep(2.0)  # the uninterruptible first compute
+        return _dummy_result()
+
+    monkeypatch.setattr(hvsr_mod.HvsrAccumulator, "compute", _compute)
+    engine = StreamingEngine(_cfg(200.0, tmp_path / "arch"))
+    hv = HvsrEngine(engine, None)
+    rng = np.random.default_rng(0)
+
+    def _seed(n: int) -> None:
+        m = hv._measurement
+        assert m is not None
+        for _ in range(n):
+            m.accumulator.add_window(
+                rng.standard_normal(50),
+                rng.standard_normal(50),
+                rng.standard_normal(50),
+                UTCDateTime(0),
+                100.0,
+            )
+
+    try:
+        hv.start_measurement(_DEVICE, _GROUP, HvsrSettings(window_length_s=0.5))
+        _seed(3)
+        m = hv._measurement
+        assert m is not None
+        hv._request_recompute(m, force=True)
+        qtbot.waitUntil(lambda: bool(calls), timeout=2000)  # compute in flight
+        monkeypatch.setattr(hvsr_engine_mod, "_THREAD_JOIN_MS", 50)
+        hv.stop_measurement()  # join times out → poisoned
+        hv.start_measurement(_DEVICE, _GROUP, HvsrSettings(window_length_s=0.5))
+        assert hv._abandoned  # rebuilt; old pair abandoned, still busy
+        hv.stop_measurement()
+        hv.shutdown()  # 50 ms bound: the busy thread cannot join yet
+        assert hv._abandoned, "a running abandoned thread must stay referenced"
+    finally:
+        monkeypatch.setattr(hvsr_engine_mod, "_THREAD_JOIN_MS", 8000)
+        hv.shutdown()  # full bound: drains for real
+        engine.stop()
+    assert not hv._abandoned
