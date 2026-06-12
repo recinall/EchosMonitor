@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -137,6 +138,46 @@ def stationxml_coordinates(xml: str) -> tuple[float, float, float] | None:
             elevation = float(station.elevation) if station.elevation is not None else 0.0
             return (latitude, longitude, elevation)
     return None
+
+
+# Mean Earth radius (IUGG). Array-scale distances (metres to a few km)
+# are insensitive to the ellipsoid; the haversine error at that scale is
+# far below GNSS accuracy.
+_EARTH_RADIUS_M = 6_371_000.0
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in metres between two WGS84 points.
+
+    Pure (no Qt, no I/O) — shared by the Map tab's inter-device
+    distance readout (M4-B) and the M5 array-geometry layer.
+    """
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    half_dphi = (phi2 - phi1) / 2.0
+    half_dlambda = math.radians(lon2 - lon1) / 2.0
+    a = math.sin(half_dphi) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(half_dlambda) ** 2
+    return 2.0 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def local_east_north(
+    lat: float, lon: float, lat0: float, lon0: float
+) -> tuple[float, float]:
+    """Project a point onto a local tangent frame centred on ``(lat0, lon0)``.
+
+    Returns ``(east_m, north_m)``. Equirectangular small-area
+    approximation — exact enough (≪ 1 m error) at deployment scale
+    (a few km), which is all the Map tab and array HVSR ever see.
+    The longitude delta is normalised into [-180°, 180°) so a pair
+    straddling the antimeridian projects sanely (review note: a
+    centroid averaged from raw longitudes near ±180° is still poor —
+    don't deploy an array across the date line and expect a pretty
+    map). Pure (no Qt, no I/O).
+    """
+    dlon = math.remainder(lon - lon0, 360.0)
+    east = _EARTH_RADIUS_M * math.radians(dlon) * math.cos(math.radians(lat0))
+    north = _EARTH_RADIUS_M * math.radians(lat - lat0)
+    return east, north
 
 
 def _default_client_factory(query: PositionQuery) -> EchosApiClient:
@@ -491,5 +532,7 @@ __all__ = [
     "PositionResolver",
     "PositionSource",
     "ResolvedPosition",
+    "haversine_m",
+    "local_east_north",
     "stationxml_coordinates",
 ]

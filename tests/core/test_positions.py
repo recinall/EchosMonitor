@@ -26,6 +26,8 @@ from echosmonitor.core.positions import (
     PositionQuery,
     PositionResolver,
     ResolvedPosition,
+    haversine_m,
+    local_east_north,
     stationxml_coordinates,
 )
 from tests.core.echos_fake import FakeEchosFirmware
@@ -118,6 +120,26 @@ def test_stationxml_coordinates_rejects_garbage() -> None:
 def test_stationxml_coordinates_treats_null_island_as_absent() -> None:
     xml = FakeEchosFirmware().stationxml.replace("45.4", "0.0").replace("11.9", "0.0")
     assert stationxml_coordinates(xml) is None
+
+
+def test_haversine_known_distances() -> None:
+    # One degree of longitude on the equator ≈ 111.195 km (mean-radius arc).
+    assert abs(haversine_m(0.0, 0.0, 0.0, 1.0) - 111_195.0) < 50.0
+    # Symmetric, zero on identity.
+    assert haversine_m(45.4, 11.9, 45.4, 11.9) == 0.0
+    assert haversine_m(45.0, 11.0, 45.1, 11.2) == haversine_m(45.1, 11.2, 45.0, 11.0)
+    # ~0.01° of longitude at 45°N ≈ 786 m.
+    assert abs(haversine_m(45.0, 11.0, 45.0, 11.01) - 786.0) < 2.0
+
+
+def test_local_east_north_projection() -> None:
+    east, north = local_east_north(45.0, 11.01, 45.0, 11.0)
+    assert abs(east - 786.0) < 2.0  # matches the haversine at array scale
+    assert abs(north) < 1e-9
+    east, north = local_east_north(45.01, 11.0, 45.0, 11.0)
+    assert abs(east) < 1e-9
+    assert abs(north - 1112.0) < 2.0
+    assert local_east_north(45.0, 11.0, 45.0, 11.0) == (0.0, 0.0)
 
 
 # ----------------------------------------------------------------------

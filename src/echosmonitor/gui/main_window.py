@@ -73,6 +73,7 @@ from echosmonitor.core.echos_status import EchosStatusWorker
 from echosmonitor.core.hvsr_engine import HvsrEngine
 from echosmonitor.core.info_worker import InfoWorker
 from echosmonitor.core.models import EchosPollTarget
+from echosmonitor.core.positions import PositionQuery, PositionResolver
 from echosmonitor.core.response import ResponseProvider
 from echosmonitor.core.session import resolve_base_archive_root
 from echosmonitor.core.streaming_engine import StreamingEngine
@@ -89,6 +90,7 @@ from echosmonitor.gui.widgets.dock_title_bar import DockTitleBar
 from echosmonitor.gui.widgets.hvsr_widget import HvsrWidget
 from echosmonitor.gui.widgets.live_stack import LiveStack
 from echosmonitor.gui.widgets.live_tabs import LiveTabs
+from echosmonitor.gui.widgets.map_widget import MapWidget
 from echosmonitor.gui.widgets.psd_widget import PsdWidget
 from echosmonitor.gui.widgets.session_toolbar import SessionToolbar
 from echosmonitor.gui.widgets.spectrogram_dock import SpectrogramDock
@@ -375,6 +377,15 @@ class MainWindow(QMainWindow):
             self._echos_worker, "start", Qt.ConnectionType.QueuedConnection
         )
 
+        # M4: the ONE shared device-position resolver (rule 16) — the Map
+        # tab and the multi-device HVSR (M5) both consume this instance.
+        # Public credential-less GETs on its own worker thread (it can
+        # never trip the auth lockout); like the status poller, position
+        # resolution is passive fleet metadata, not acquisition, so rule
+        # 13 is untouched. Query push + tab wiring happen in
+        # ``_wire_engine`` (the Map tab exists by then).
+        self._position_resolver = PositionResolver(parent=self)
+
         # M11 B: instrument-response deconvolution for the detail pane.
         # The provider is pure config-driven; the worker runs on its OWN
         # dedicated QThread — NOT the engine's science DSP thread (where
@@ -646,6 +657,11 @@ class MainWindow(QMainWindow):
         table_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         self._detection_table.setSizePolicy(table_policy)
 
+        # M4-B: device map. Pure consumer — positions arrive from the
+        # shared PositionResolver, state colours from the engine, both
+        # wired in ``_wire_engine``.
+        self._map_widget = MapWidget(parent=self)
+
         self._central_tabs = QTabWidget(self)
         self._central_tabs.setObjectName("CentralTabs")
         self._central_tabs.addTab(self._detections_splitter, "Detections")
@@ -653,6 +669,7 @@ class MainWindow(QMainWindow):
         self._central_tabs.addTab(self._psd_widget, "PSD")
         self._central_tabs.addTab(self._hvsr_widget, "HVSR")
         self._central_tabs.addTab(self._archive_tab, "Archive")
+        self._central_tabs.addTab(self._map_widget, "Map")
         self._central_tabs.setCurrentWidget(self._detections_splitter)
         self.setCentralWidget(self._central_tabs)
         # Show the existing "Select a detection…" empty hint from the start.
@@ -1401,6 +1418,54 @@ class MainWindow(QMainWindow):
         # (devices added/removed/edited in the dialog).
         self._push_echos_targets()
         self._store.configChanged.connect(self._push_echos_targets)
+        # M4-B: Map tab wiring. The resolver re-emits on the GUI thread,
+        # so widget connections are same-thread; the engine's
+        # acquisition-state emit is wired Queued for the same reentrancy
+        # reason as the panel badge above.
+        self._position_resolver.positionResolved.connect(self._map_widget.on_position)
+        self._position_resolver.positionFailed.connect(self._map_widget.on_position_failed)
+        self._map_widget.refreshRequested.connect(self._position_resolver.refresh)
+        self._map_widget.deviceSelected.connect(self._device_panel.select_device)
+        self._engine.acquisitionStateChanged.connect(
+            self._map_widget.on_acquisition_state,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
+        self._engine.deviceStateChanged.connect(self._map_widget.on_device_state)
+        self._push_position_queries()
+        self._store.configChanged.connect(self._push_position_queries)
+
+    def _push_position_queries(self) -> None:
+        """Rebuild the position-resolver query set from config (M4, rule 16).
+
+        Every configured device is queried: Echos nodes resolve via
+        override/StationXML/GNSS; generic SeedLink devices (no ``echos``
+        section, hence no override either) are honestly ``unavailable``.
+        The Map tab learns the device set FIRST so results arriving on
+        later event-loop turns always find their device known, then gets
+        the cache snapshot configure() preserved.
+        """
+        devices = self._store.root.devices
+        queries = tuple(
+            PositionQuery(
+                name=d.name,
+                host=d.host,
+                http_port=d.echos.http_port if d.echos is not None else 80,
+                has_rest=d.echos is not None,
+                override=(
+                    (
+                        d.echos.position_override.lat,
+                        d.echos.position_override.lon,
+                        d.echos.position_override.elev_m,
+                    )
+                    if d.echos is not None and d.echos.position_override is not None
+                    else None
+                ),
+            )
+            for d in devices
+        )
+        self._map_widget.set_devices(tuple(d.name for d in devices))
+        self._position_resolver.configure(queries)
+        self._map_widget.set_positions(self._position_resolver.positions())
 
     def _push_echos_targets(self) -> None:
         """Rebuild the Echos poll-target set from config (M1-C).
@@ -2360,6 +2425,10 @@ class MainWindow(QMainWindow):
         self._echos_thread.quit()
         if not self._echos_thread.wait(_ECHOS_THREAD_JOIN_MS):
             _log.warning("echos_thread_join_timeout")
+        # M4: the position resolver owns its thread + bounded join; its
+        # stop() cancels an in-flight fetch via the asyncio task nudge.
+        # Terminal — a later configChanged push is refused, not revived.
+        self._position_resolver.shutdown()
         # M11 B: stop the dedicated deconvolution thread. It runs a plain
         # Qt event loop dispatching one-shot ``compute`` slots (no parked
         # blocking loop), so ``quit()`` returns it promptly.

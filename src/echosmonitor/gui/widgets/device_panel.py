@@ -538,6 +538,21 @@ class DevicePanel(QDockWidget):
         device_item.setExpanded(True)
         self._stream_items[key] = child
 
+    @Slot(str)
+    def select_device(self, device_name: str) -> None:
+        """Select + reveal a device row (Map tab marker click, M4-B).
+
+        Unknown names are a no-op — a marker click can race a config
+        removal, and resurrecting a row here would be the same ghost
+        class the echos-snapshot guard exists for.
+        """
+        item = self._device_items.get(device_name)
+        if item is None:
+            return
+        self._tree.setCurrentItem(item)
+        self._tree.scrollToItem(item)
+        self.raise_()
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

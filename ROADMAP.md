@@ -580,10 +580,22 @@ Goal: a Map tab showing each device's position and live state.
         dispatch; rapid refreshes coalesce to one sweep); override path
         pre-emit stop check; `shutdown()` is terminal (dispatch refused,
         thread never restarted into a stopped worker).
-- [ ] **B. Map widget**: decision recorded here → tiles (QtWebEngine/Leaflet,
-      offline-capable?) vs pyqtgraph scatter with background image. Markers:
-      device name, state colour (Idle/Monitoring/Recording/Error), click →
-      select device in panel. Inter-device distance readout (needed by M5).
+- [x] **B. Map widget**: Done 2026-06-12. **Decision (open question 4):
+      pyqtgraph scatter in a local east/north metre frame — NO web tiles,
+      NO QtWebEngine** (decision log). Markers: device name label, state
+      colour (Idle grey / Monitoring green / Recording red — the Devices
+      dock hexes — plus amber "trouble" when a non-idle device's socket
+      is not CONNECTED), hover tip with lat/lon/elev/source, click →
+      `DevicePanel.select_device`. Inter-device distance table
+      (haversine, sorted; M5's readout), unpositioned devices listed with
+      their failure kind. `MapWidget` is a pure consumer (signals in/out,
+      holds no resolver/engine reference); MainWindow owns the ONE
+      resolver, pushes `PositionQuery`s on every configChanged, and
+      shuts the resolver down in closeEvent (terminal + idempotent).
+      Pure `haversine_m` / `local_east_north` (antimeridian-normalised)
+      live in `core/positions.py` for M5 reuse. Reviewer minors fixed:
+      unchanged-state early-out (no plot churn on flapping retries),
+      dead assert dropped, ghost-device `select_device` no-op pinned.
 - [ ] **C. HVSR/M5 hooks**: expose station geometry (distances matrix).
 
 ## M5 — Multi-device HVSR
@@ -720,6 +732,8 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M4-A: an unreachable/timeout StationXML fetch fails fast WITHOUT trying `/api/status`; protocol-level failures DO fall back | A dead host would only burn a second HTTP timeout on the same socket; an endpoint-specific failure (404, bad body) says nothing about `/api/status`. Pinned by `test_unreachable_device_fails_fast_without_status_fallback`. |
 | 2026-06-12 | M4-A: `positionFailed` vocabulary = `EchosErrorKind` + **`"unavailable"`** (no position anywhere / no source at all); a no-REST no-override device is `unavailable`, not an error | "This device has no position" is honest domain state the Map tab must render (grey marker / absent), not a transport failure; widening the closed set beats overloading `protocol`. A failed refresh keeps the last known cached position — stale-but-labeled beats blank. |
 | 2026-06-12 | M4-A: `configure` AND `refresh` bump the latest-wins generation (written to the worker even when the dispatch set is empty); `refresh_device` deliberately does not; `shutdown()` is terminal | Both reviewers: an empty/fully-cached configure left the in-flight sweep fetching removed devices (results discarded but network work wasted), and N rapid refreshes queued N un-superseded full sweeps (rule 5 — the only unbounded seam in the file). A single-device refresh bumping the global generation would discard every other device's in-flight result to save one duplicate fetch. Regression tests verified to fail pre-fix. |
+| 2026-06-12 | M4-B (open question 4): the Map tab is a **pyqtgraph scatter in a local east/north metre frame** — no tile stack, no QtWebEngine, no new dependency | The fleet is a handful of nodes deployed metres-to-km apart for array work: the user needs *relative geometry* (who is where, how far — exactly what M5 consumes), not basemap context. pyqtgraph is offline-by-construction (field laptops) and is the stack every other tab ships; CLAUDE.md already prefers this. The frame is metres E/N of the positioned-device centroid, aspect-locked 1:1 so the on-screen shape IS the array shape; absolute lat/lon/elev/source live in the marker hover tip. Revisit web tiles only on a real field need, as an isolated optional widget. |
+| 2026-06-12 | M4-B: position resolution runs from launch (configure on every configChanged), like the M1-C status poller | Rule 13's "nothing starts without the user" governs *acquisition* (the engine); positions are passive credential-less fleet metadata, the same sanctioned class as the status poller. The Map tab also works before any device is started — which is when the field user is placing instruments. |
 
 ## Open questions (resolve before the milestone that needs them)
 
@@ -732,7 +746,9 @@ launch on a clean machine of each OS and complete the M2 happy path
    *M2-A interim:* current behaviour kept (a monitoring device with STA/LTA
    creates the DAO and persists detections); final call belongs to M2-B's
    session model.
-4. M4: tile stack choice (offline requirement? QtWebEngine weight?).
+4. ~~M4: tile stack choice (offline requirement? QtWebEngine weight?)~~
+   **Resolved 2026-06-12: pyqtgraph scatter, local E/N metre frame, no
+   tiles, no QtWebEngine** (see decision log).
 5. M5: common-window vs per-device windows for array HVSR (see M5-A).
 6. M7: signing — is a Windows cert / Apple Developer account available, or
    do we ship unsigned with documented bypass instructions?
