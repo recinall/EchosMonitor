@@ -116,9 +116,14 @@ class ArchiveConfig(_Base):
     # 5 s ≈ 12 fsyncs/min/file. The DB metadata index is gated on
     # fsync (DB-after-fsync invariant), so this also bounds DB lag.
     fsync_interval_s: Annotated[float, Field(ge=0.5, le=60.0)] = 5.0
-    # Cap on the engine-side bounded queue draining packets into the
-    # storage QThread. Drop-oldest backpressure when full. Sized for
-    # ~10 s of headroom at 100 packets/s/stream x 16 streams.
+    # In-flight WARN threshold for the archive seam (M6.5-A). The
+    # engine posts recorded packets straight to the storage QThread and
+    # NEVER drops them (the archive is the science sink — the old
+    # engine-side drop-oldest inbox lost recorded data during a replay
+    # burst on the first field run); when more than this many traces
+    # are in flight (sent minus writer-acked) the engine logs + emits
+    # ``archiveBackpressure``, throttled. The name is kept for config
+    # compatibility.
     queue_max: Annotated[int, Field(ge=16, le=1_000_000)] = 1024
 
 

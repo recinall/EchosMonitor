@@ -37,9 +37,15 @@ Design invariants:
   ``os.fstat(fd)`` (for the ``files.bytes`` UPSERT, whose
   replace-by-path semantics demand the cumulative durable size, not
   a delta — POSTMORTEMS 2026-05-10).
-* **Backpressure** lives on the engine side via a bounded ``deque``
-  (drop-oldest, rate-limited warn-log). The writer simply processes
-  whatever the queued signal layer hands it.
+* **Terminal-signal invariant (M6.5-A).** Every ``write_trace`` call
+  emits exactly ONE terminal signal: ``writeOk`` XOR ``writeFailed``.
+  The engine's archive in-flight gauge (its replacement for the old
+  engine-side drop-oldest inbox) counts these acks against packets
+  sent; a silent return here would make the gauge read permanently
+  high and cry wolf about backpressure. The writer simply processes
+  whatever the queued signal layer hands it — the only drops it ever
+  performs itself are the slow-IO/ENOSPC pause paths, and those are
+  ``writeFailed``-acknowledged per trace.
 """
 
 from __future__ import annotations
@@ -182,6 +188,13 @@ class MseedWriter(QObject):
 
     @Slot(str, object)
     def write_trace(self, nslc: str, trace: object) -> None:
+        # Terminal-signal invariant (module docstring): every call past
+        # the ``_closed`` guard emits exactly one ``writeOk`` XOR one
+        # ``writeFailed`` — ``_write_one`` failures emit it and abort
+        # the loop, so a midnight-split pair can never double-emit.
+        # Post-close calls are unreachable in practice: the engine
+        # discards the device's gauge before the blocking ``close_all``,
+        # and queued ``write_trace`` events dispatch FIFO before it.
         if self._closed:
             return
         if not isinstance(trace, _Trace):  # defensive: Qt types as object
@@ -323,8 +336,13 @@ class MseedWriter(QObject):
         )
         now = time.monotonic()
         if path in self._paused_until and self._paused_until[path] > now:
-            # Path is paused after recent slow writes; drop silently
-            # (the pause itself was already logged + signalled).
+            # Path is paused after recent slow writes / ENOSPC. The drop
+            # is NOT silent (terminal-signal invariant): the engine's
+            # in-flight gauge needs exactly one ack per trace, and a
+            # paused path dropping recorded data is worth surfacing on
+            # ``archive_last_error`` anyway. No log here — the pause
+            # itself was already logged once.
+            self.writeFailed.emit(self._device_name, nslc, "path paused; trace dropped")
             return None
 
         try:
@@ -376,7 +394,7 @@ class MseedWriter(QObject):
             self.writeFailed.emit(self._device_name, nslc, f"short write {n}/{len(encoded)}")
             return None
 
-        self._note_write_timing(path, elapsed_ms, nslc)
+        self._note_write_timing(path, elapsed_ms)
         self._note_pending(path, nslc, trace, n)
         return n, path, chosen_encoding
 
@@ -509,7 +527,7 @@ class MseedWriter(QObject):
                 lost_bytes=size - last_good,
             )
 
-    def _note_write_timing(self, path: Path, elapsed_ms: float, nslc: str) -> None:
+    def _note_write_timing(self, path: Path, elapsed_ms: float) -> None:
         if elapsed_ms <= _SLOW_IO_WARN_MS:
             self._slow_writes[path] = 0
             return
@@ -524,13 +542,20 @@ class MseedWriter(QObject):
             now = time.monotonic()
             self._paused_until[path] = now + _PAUSE_DURATION_S
             self._slow_writes[path] = 0
+            # No writeFailed here (terminal-signal invariant): this runs
+            # on the SUCCESS path of the write that tripped the pause,
+            # and write_trace will emit writeOk for it — a second
+            # terminal would inject a spurious ack into the engine's
+            # in-flight gauge, under-reporting backpressure exactly when
+            # the filesystem is struggling. The very next write to the
+            # paused path emits the per-trace "path paused" writeFailed,
+            # which carries the news to ``archive_last_error``.
             self._log.error(
                 "mseed_writer_path_paused",
                 path=str(path),
                 pause_seconds=_PAUSE_DURATION_S,
                 reason="filesystem unresponsive",
             )
-            self.writeFailed.emit(self._device_name, nslc, "filesystem unresponsive")
 
     def _note_pending(self, path: Path, nslc: str, trace: Trace, bytes_added: int) -> None:
         existing = self._pending.get(path)

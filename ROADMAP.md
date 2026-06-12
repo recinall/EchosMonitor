@@ -880,8 +880,23 @@ credential store), Monitor, Record (project `Test_1`), Archive
 browse/waveform load and Map click all worked. The recording also
 surfaced real problems — this milestone fixes them.
 
-- [ ] **A. Archive sample loss under burst (CRITICAL — recorded data
-      was dropped).** Log evidence from the run:
+- [x] **A. Archive sample loss under burst (CRITICAL — recorded data
+      was dropped).** FIXED 2026-06-12: the engine-side archive inbox
+      is gone — recorded packets post straight to the storage thread
+      from ``_on_packet`` (no drop point on the science sink; the old
+      deque was drained only by the flush tick, which the replay burst
+      starved — the field archive shows a contiguous 32.8 s hole of
+      LIVE data per channel). Rule-5 observability is an in-flight
+      gauge (sent − writer-acked, terminal-signal invariant pinned in
+      MseedWriter) warn-logged + signalled above ``queue_max`` (field
+      repurposed as the warn threshold). Regression:
+      ``test_replay_burst_loses_no_recorded_samples`` (fake-server
+      ``burst_records`` replay, mutation-verified) +
+      ``test_archive_inflight_gauge_warns_without_dropping`` +
+      ``test_exactly_one_terminal_signal_per_write_including_pause``.
+      The storage thread was never the bottleneck at this seam (the
+      drain only posted queued events); writer-side profiling moved to
+      item C. Log evidence from the run:
       `streaming_engine_archive_backpressure dropped=29` during steady
       recording (17:45:28), then the device disconnected mid-recording
       (17:47:55), the worker reconnected in ~1 s and the device
@@ -1068,6 +1083,8 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6 wizard: performs NO device writes — "set admin password" means STORE in the OS keyring (off-thread, bounded 15 s, accept-with-warning on timeout/close); changing the password ON the device stays in the device dialog | `POST /api/auth/password` is still unexercised on real firmware (M1 closure) and needs the CURRENT password anyway; the wizard's job is to leave a working config + credential, not to mutate a factory-fresh device. The device write lands BEFORE the credential wait, so no close path can lose it (persisted-before-announced). |
 | 2026-06-12 | M6 wizard: the worker thread starts LAZILY on the first page action; an undriven wizard owns no running thread | A wizard constructed but never driven (Help-menu open + patched/closed exec) never reaches done()/teardown — an eagerly-started thread then gets GC'd while running, a hard Qt abort (crashed the menubar tests for real). Queued events posted before start are delivered when exec() runs, so laziness costs nothing. |
 | 2026-06-12 | M6 settings: `ui.theme` scope is the PLOTS (pyqtgraph background/foreground at bootstrap), not the widget chrome; all settings labeled "next launch" | Restyling every Qt widget is a large fragile surface for no field value (the chrome follows the system); pyqtgraph reads its config at item creation so a runtime switch would leave existing plots in the old colors — honest "next launch" beats a half-applied hot toggle. `ui.recent_detections_limit` stays out of the dialog until the M3 prefill that consumes it lands. |
+| 2026-06-12 | M6.5-A: the archive seam has **no engine-side queue and no drop point** — `_on_packet` posts each recorded packet straight to the storage thread; rule 5's bound becomes an **in-flight gauge** (sent − writer-acked) warn-logged + `archiveBackpressure`-signalled above `queue_max` (field kept, repurposed as the warn threshold) | The old bounded deque was drained only by the flush tick and the drain emitted per-entry anyway — pure added latency plus a drop hazard; a replay burst starves the tick (Qt posted-event flood) and drop-oldest ate 33 s of LIVE recorded data in the field. The archive is the science sink (ROADMAP A: correctness > liveness; rule 11 protects display, not this path); the physical bound is the device ring + live rate, and sustained writer slowness still trips the writer's own slow-IO pause valve. `DeviceStatus.archive_drops_total` removed (no readers; nothing can drop there now). |
+| 2026-06-12 | M6.5-A: MseedWriter **terminal-signal invariant** — exactly one `writeOk` XOR `writeFailed` per `write_trace`; the paused-path drop emits `writeFailed` (was silent), the pause-TRIP write emits only its `writeOk` (the old `writeFailed("filesystem unresponsive")` on the success path is gone) | The in-flight gauge counts terminal acks against sends; a silent drop inflates the gauge forever (false backpressure), a double terminal injects spurious acks that mask real backpressure exactly when the filesystem struggles (both reviewers flagged the latter). The teardown close barrier logs inflight + elapsed (rule 7) since its wait now scales with the backlog. |
 
 ## Open questions (resolve before the milestone that needs them)
 

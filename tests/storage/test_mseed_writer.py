@@ -504,3 +504,44 @@ def test_close_is_idempotent(writer_factory: Any) -> None:
     writer = writer_factory()
     writer.close_all()
     writer.close_all()  # must not raise
+
+
+def test_exactly_one_terminal_signal_per_write_including_pause(
+    writer_factory: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal-signal invariant (M6.5-A): every ``write_trace`` call
+    emits exactly one ``writeOk`` XOR ``writeFailed`` — including the
+    write that TRIPS the slow-IO pause (which must stay a success, not
+    double-emit) and the subsequent writes dropped while paused (which
+    must be ``writeFailed``-acknowledged, not silent). The engine's
+    archive in-flight gauge counts these acks against packets sent; any
+    deviation skews it.
+    """
+    import echosmonitor.storage.mseed_writer as mw
+
+    writer = writer_factory()
+    nslc = "IU.ANMO.00.BHZ"
+    t0 = UTCDateTime("2026-05-09T12:00:00")
+
+    # Force every write to register as "slow" so the third one trips
+    # the pause; the writes themselves still succeed.
+    monkeypatch.setattr(mw, "_SLOW_IO_WARN_MS", -1.0)
+
+    ok: list[tuple[Any, ...]] = writer._test_ok
+    failed: list[tuple[Any, ...]] = writer._test_failed
+    for i in range(mw._SLOW_IO_THRESHOLD):
+        writer.write_trace(nslc, _make_int32_trace(starttime=t0 + i * 5.12, npts=512))
+    # All three wrote successfully; the third tripped the pause but must
+    # NOT have emitted a second (writeFailed) terminal for itself.
+    assert len(ok) == mw._SLOW_IO_THRESHOLD
+    assert failed == []
+
+    # While paused, each dropped trace gets exactly one writeFailed ack.
+    for i in range(2):
+        writer.write_trace(nslc, _make_int32_trace(starttime=t0 + 100 + i * 5.12, npts=512))
+    assert len(ok) == mw._SLOW_IO_THRESHOLD
+    assert len(failed) == 2
+    assert all("paused" in f[2] for f in failed)
+    # Invariant across the whole sequence: one terminal per call.
+    assert len(ok) + len(failed) == mw._SLOW_IO_THRESHOLD + 2

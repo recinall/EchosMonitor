@@ -411,10 +411,13 @@ class DeviceStatus:
     # attached by ``start_recording``, never by config).
     # ``archive_files_open`` is the count of distinct SDS paths the
     # writer has *touched* this session (not the LRU live-fd count).
+    # ``archive_drops_total`` was removed in M6.5-A: the engine no
+    # longer has a drop point on the archive seam (recorded packets are
+    # posted straight to the storage thread; backpressure is the
+    # advisory in-flight gauge on ``StreamingEngine.archiveBackpressure``).
     archive_enabled: bool = False
     archive_bytes_written: int = 0
     archive_files_open: int = 0
-    archive_drops_total: int = 0
     archive_last_write_at: UTCDateTime | None = None
     archive_last_error: str | None = None
 

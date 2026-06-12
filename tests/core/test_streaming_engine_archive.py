@@ -13,8 +13,9 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pytest
-from obspy import read
+from obspy import Stream, read
 
 from echosmonitor.config.schema import (
     AppConfig,
@@ -27,8 +28,11 @@ from echosmonitor.config.schema import (
 )
 from echosmonitor.core.models import StreamID
 from echosmonitor.core.streaming_engine import StreamingEngine
-from tests.core.fakes import FakeSeedLinkServer
+from tests.core.fakes import FakeSeedLinkServer, FakeSeedLinkServerConfig
 from tests.core.test_seedlink_worker import fake_server, loop_thread  # noqa: F401
+from tests.core.test_streaming_engine_multi import (
+    make_fake_server,  # noqa: F401  pytest fixture re-export
+)
 
 
 def _make_root_cfg(devices: list[DeviceConfig], *, archive_root: Path | None = None) -> RootConfig:
@@ -253,6 +257,174 @@ def test_archive_engine_stop_within_budget(
     engine.stop()
     elapsed = time.monotonic() - t0
     assert elapsed < 5.0, f"engine.stop() took {elapsed:.2f}s, budget is 5s"
+
+
+def test_replay_burst_loses_no_recorded_samples(
+    qtbot,
+    tmp_path: Path,
+    make_fake_server,  # noqa: F811
+) -> None:
+    """M6.5-A regression: a FETCH replay burst far larger than
+    ``archive.queue_max`` reaches disk complete and gap-free.
+
+    The first field run (2026-06-12, real echos.local, 500 Hz x 3 ch)
+    lost 33 s of RECORDED data: a reconnect replay burst arrived faster
+    than the engine's flush tick and the old bounded archive inbox
+    applied drop-oldest to the science sink. The fake server sends
+    ``burst_records`` back-to-back records on connect — many times
+    ``queue_max`` — so the pre-fix engine drops most of them, while the
+    fixed engine (direct per-packet post to the storage thread, no
+    engine-side drop point) must archive every sample of the burst with
+    no gaps.
+    """
+    burst = 400
+    n = 100
+    server_cfg = FakeSeedLinkServerConfig(
+        network="XX",
+        station="BURST",
+        location="00",
+        channel="HHZ",
+        sampling_rate=500.0,
+        samples_per_record=n,
+        packet_interval_s=0.1,
+        burst_records=burst,
+    )
+    server = make_fake_server(server_cfg)
+    archive_root = tmp_path / "archive"
+    cfg = _make_root_cfg(
+        devices=[
+            DeviceConfig(
+                name="dev",
+                host=server.host,
+                port=server.port,
+                reconnect=ReconnectConfig(initial_delay_s=1.0, max_delay_s=60.0),
+                selectors=[
+                    StreamSelectorConfig(
+                        network="XX", station="BURST", location="00", channel="HHZ"
+                    )
+                ],
+                archive=ArchiveConfig(
+                    enabled=True,
+                    fsync_interval_s=0.5,
+                    # Schema minimum — the burst is 25x this, so the old
+                    # drop-oldest inbox cannot pass this test.
+                    queue_max=16,
+                ),
+            ),
+        ],
+        archive_root=archive_root,
+    )
+    engine = StreamingEngine(cfg)
+    engine.start_session("burst", ["dev"])
+    try:
+        target = burst * n
+
+        def _samples_on_disk() -> int:
+            total = 0
+            for f in archive_root.rglob("*.D.*"):
+                if not f.is_file():
+                    continue
+                # Safe to read mid-recording: appends are whole
+                # 512-byte records via a single os.write.
+                for tr in read(str(f)):
+                    total += tr.stats.npts
+            return total
+
+        # Generous bound: the dev machine runs a production instance
+        # and the suite is timing-flaky under load.
+        assert _wait_until(lambda: _samples_on_disk() >= target, timeout_s=30.0, qtbot=qtbot), (
+            f"only {_samples_on_disk()}/{target} burst samples reached the "
+            f"archive — recorded samples were dropped"
+        )
+
+        # Completeness is not enough: drop-oldest punched HOLES in the
+        # field archive. The fake stream is perfectly contiguous, so
+        # everything on disk must merge into one unmasked trace.
+        merged = Stream()
+        for f in archive_root.rglob("*.D.*"):
+            if f.is_file():
+                merged += read(str(f))
+        merged.merge(method=0)
+        assert len(merged) == 1, (
+            f"archive is fragmented into {len(merged)} segments: gaps "
+            f"were introduced into a contiguous recorded stream"
+        )
+        assert not np.ma.isMaskedArray(merged[0].data) or not np.ma.is_masked(merged[0].data), (
+            "merged archive stream contains masked gap samples"
+        )
+    finally:
+        engine.stop()
+
+
+def test_archive_inflight_gauge_warns_without_dropping(
+    qtbot,
+    tmp_path: Path,
+    capture_structlog,
+) -> None:
+    """The in-flight gauge replaces the inbox drop counter (M6.5-A):
+    when sent-minus-acked exceeds ``queue_max`` the engine warn-logs and
+    emits ``archiveBackpressure`` (throttled), but every trace is still
+    posted to the storage seam — nothing is dropped.
+
+    Driven directly against ``_enqueue_for_archive`` with a sender
+    whose signal has no receiver, so the writer never acks and the
+    gauge climbs deterministically.
+    """
+    from obspy import Trace, UTCDateTime
+
+    from echosmonitor.core.streaming_engine import _ArchiveSender
+
+    cfg = _make_root_cfg(
+        devices=[
+            DeviceConfig(
+                name="dev",
+                host="192.0.2.1",
+                port=18000,
+                reconnect=ReconnectConfig(
+                    initial_delay_s=3600.0, max_delay_s=3600.0, connect_timeout_s=0.5
+                ),
+            )
+        ],
+        archive_root=tmp_path / "archive",
+    )
+    engine = StreamingEngine(cfg)
+    fired: list[tuple[str, int]] = []
+    engine.archiveBackpressure.connect(lambda d, n_: fired.append((d, n_)))
+    try:
+        sender = _ArchiveSender(engine)
+        engine._archive_senders["dev"] = sender
+        engine._archive_sent["dev"] = 0
+        engine._archive_acked["dev"] = 0
+        engine._archive_inflight_warn["dev"] = 16
+        tr = Trace(
+            data=np.arange(10, dtype=np.int32),
+            header={
+                "network": "XX",
+                "station": "GAUGE",
+                "location": "00",
+                "channel": "HHZ",
+                "sampling_rate": 100.0,
+                "starttime": UTCDateTime(),
+            },
+        )
+        for _ in range(20):
+            engine._enqueue_for_archive("dev", "XX.GAUGE.00.HHZ", tr)
+        hits = [
+            r
+            for r in capture_structlog
+            if r.get("event") == "streaming_engine_archive_backpressure"
+        ]
+        assert len(hits) == 1, hits  # throttled: one line despite 4 over-threshold posts
+        assert hits[0]["inflight"] == 17
+        assert "dropped" not in hits[0]
+        assert fired == [("dev", 17)]
+        # Acks bring the gauge back down; clamped so over-acking can
+        # never underflow below zero.
+        for _ in range(25):
+            engine._ack_archive_trace("dev")
+        assert engine._archive_acked["dev"] == engine._archive_sent["dev"] == 20
+    finally:
+        engine.stop()
 
 
 def test_resolve_archive_root_falls_back_to_app(

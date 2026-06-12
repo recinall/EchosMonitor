@@ -8,6 +8,10 @@ Devices with a non-empty ``dsp_chain`` configuration get a per-stream
 ``DspChain`` installed on the dedicated DSP ``QThread``. The DSP work
 runs off both the network thread and the GUI thread; per-stream
 bounded deques apply drop-oldest backpressure (CLAUDE.md rule 5).
+The ARCHIVE path is the exception by design (M6.5-A): recorded
+packets are posted straight to the storage thread and are never
+dropped engine-side — backpressure there is an observable in-flight
+gauge, not a loss point.
 
 Multi-device isolation (M3 part 1)
 ----------------------------------
@@ -200,11 +204,13 @@ class _StreamCoalescer(QObject):
 class _ArchiveSender(QObject):
     """Per-device QObject whose ``request`` signal fires the writer slot.
 
-    The engine's ``_flush_all`` drains each device's bounded inbox and
-    emits ``request`` once per dequeued packet. The signal is connected
-    to the writer's ``write_trace`` slot via ``QueuedConnection`` so the
-    work runs on the storage thread without the engine having to hold
-    a reference to that thread's event-loop machinery.
+    ``_enqueue_for_archive`` emits ``request`` once per recorded packet,
+    directly from ``_on_packet`` on the engine thread (M6.5-A — there is
+    no engine-side inbox and no drop point on this seam). The signal is
+    connected to the writer's ``write_trace`` slot via
+    ``QueuedConnection`` so the work runs on the storage thread without
+    the engine having to hold a reference to that thread's event-loop
+    machinery.
     """
 
     request = Signal(str, object)  # nslc, trace
@@ -269,10 +275,12 @@ class StreamingEngine(QObject):
     # ``device_status()`` once per UI tick instead.
     archiveWriteOk = Signal(str, str, int, object, bool, str)  # noqa: N815
     archiveWriteFailed = Signal(str, str, str)  # noqa: N815
-    # ``archiveBackpressure(device, dropped_count)`` — fired at most every
-    # ``_DROP_LOG_INTERVAL_S`` seconds per device, mirroring
-    # :meth:`_note_drop` for ring buffers. ``dropped_count`` is the
-    # cumulative count since the last emit.
+    # ``archiveBackpressure(device, inflight_count)`` — advisory (M6.5-A):
+    # NO samples were dropped. Fired at most every
+    # ``_DROP_LOG_INTERVAL_S`` seconds per device when the in-flight
+    # trace count toward the storage thread exceeds
+    # ``archive.queue_max``, i.e. the storage thread is draining slower
+    # than packets arrive (replay catch-up or a slow filesystem).
     archiveBackpressure = Signal(str, int)  # noqa: N815
 
     # ----- M6 PSD signals ---------------------------------------------
@@ -553,12 +561,26 @@ class StreamingEngine(QObject):
         self._archive_thread: QThread | None = None
         self._archive_writers: dict[str, MseedWriter] = {}
         self._archive_senders: dict[str, _ArchiveSender] = {}
-        # Per-device bounded inbox: drop-oldest backpressure happens
-        # naturally via ``deque(maxlen=...)``. Drained on every flush
-        # tick into the per-device sender → writer pipeline.
-        self._archive_inboxes: dict[str, deque[tuple[str, object]]] = {}
-        self._archive_drops_pending: dict[str, int] = {}
-        self._archive_drops_last_log: dict[str, float] = {}
+        # M6.5-A: packets are posted to the storage thread DIRECTLY from
+        # ``_on_packet`` (per-packet QueuedConnection emit) — there is no
+        # engine-side inbox and no drop point on this seam. The archive
+        # is the SCIENCE sink (the field run lost 33 s of recorded data
+        # to the old bounded deque when a replay burst starved the flush
+        # tick); recording correctness beats liveness here, and rule 11
+        # protects the DISPLAY consumers, not this path. Rule 5's
+        # observability is kept via an in-flight gauge: ``sent`` counts
+        # emits, ``acked`` counts the writer's terminal signals (exactly
+        # one ``writeOk`` XOR ``writeFailed`` per trace — invariant
+        # pinned in ``MseedWriter.write_trace``); the difference is the
+        # depth of the storage thread's event queue, warn-logged +
+        # signalled (throttled) above ``archive.queue_max``. The real
+        # bound is physical: a replay burst can never exceed the device
+        # ring, and sustained writer slowness trips the writer's own
+        # slow-IO pause valve.
+        self._archive_sent: dict[str, int] = {}
+        self._archive_acked: dict[str, int] = {}
+        self._archive_inflight_warn: dict[str, int] = {}
+        self._archive_inflight_last_log: dict[str, float] = {}
         # Distinct SDS paths the writer has touched this session per
         # device. ``len(set)`` populates ``DeviceStatus.archive_files_open``.
         self._archive_paths_seen: dict[str, set[Path]] = {}
@@ -1052,15 +1074,12 @@ class StreamingEngine(QObject):
         if self._store is not None:
             with contextlib.suppress(RuntimeError, TypeError):
                 self._store.configChanged.disconnect(self._on_config_changed)
-        # Drain any packets still buffered in the per-device archive
-        # inboxes BEFORE stopping the flush timer; without this, packets
-        # in flight at ``stop()`` time would be silently dropped — the
-        # writer would never see them and the disk file would lack
-        # those samples. This final drain is best-effort and only
-        # covers the steady state; packets dropped earlier by the
-        # bounded deque (rule-5 backpressure) are still lost as
-        # documented.
-        self._drain_archive()
+        # Archive packets need no drain here (M6.5-A): every packet was
+        # already posted to the storage thread's event queue at receive
+        # time, and the per-device ``close_all`` barrier below
+        # (BlockingQueuedConnection in ``_teardown_archive_writer``)
+        # dispatches strictly after those queued ``write_trace`` events,
+        # so everything in flight reaches disk before the writer closes.
         self._flush_timer.stop()
         # Phase 1: stop every worker. ``worker.stop()`` blocks until
         # ``run()`` has fully unwound (capped internally at 2 s); we
@@ -1253,7 +1272,6 @@ class StreamingEngine(QObject):
                 archive_enabled=s.archive_enabled,
                 archive_bytes_written=s.archive_bytes_written,
                 archive_files_open=s.archive_files_open,
-                archive_drops_total=s.archive_drops_total,
                 archive_last_write_at=s.archive_last_write_at,
                 archive_last_error=s.archive_last_error,
                 archive_gaps_total=s.archive_gaps_total,
@@ -1570,8 +1588,9 @@ class StreamingEngine(QObject):
 
         # Archive consumes RAW packets in parallel with the DSP path —
         # rule 8 (persistence boundary). Same packet object; the writer
-        # never mutates the trace. Bounded deque applies drop-oldest.
-        if device_name in self._archive_inboxes:
+        # never mutates the trace. Posted straight to the storage
+        # thread — never dropped on this seam (M6.5-A).
+        if device_name in self._archive_senders:
             self._observe_gap(device_name, nslc, key, fs, trace)
             self._enqueue_for_archive(device_name, nslc, trace)
 
@@ -1743,7 +1762,7 @@ class StreamingEngine(QObject):
 
     @Slot()
     def _flush_all(self) -> None:
-        """Tick handler: dispatch DSP work + drain archive, then flush render.
+        """Tick handler: dispatch DSP work, then flush render.
 
         Runs on the engine/GUI thread. The DSP dispatch step snapshots
         each stream's bounded queue under lock and posts the snapshot to
@@ -1751,9 +1770,13 @@ class StreamingEngine(QObject):
         the bounded queue are reported via ``chainDropped`` at most every
         ``_DROP_LOG_INTERVAL_S`` seconds per stream.
 
+        Archive packets do NOT pass through this tick (M6.5-A — they
+        are posted to the storage thread per-packet in ``_on_packet``,
+        so a starved tick cannot touch the science sink).
+
         Ordering matters for CLAUDE.md rule 11: the FULL-RATE science
-        drains (DSP-queue snapshot → ``_drainRequested`` toward detection,
-        and ``_drain_archive`` toward storage) run FIRST, before the
+        drain (DSP-queue snapshot → ``_drainRequested`` toward detection)
+        runs FIRST, before the
         coalescer flush that re-emits ``traceReady`` for the best-effort
         render path. The widget render slots are wired ``QueuedConnection``
         in ``main_window._wire_engine`` so render never runs synchronously
@@ -1799,9 +1822,10 @@ class StreamingEngine(QObject):
             )
             self.chainDropped.emit(device_name, nslc, count)
 
-        # Storage drain BEFORE the render flush, so a slow render can never
-        # gate the archive inbox toward the writer thread (rule 8 + 11).
-        self._drain_archive()
+        # Archive packets do not pass through this tick (M6.5-A): they
+        # are posted to the storage thread directly from ``_on_packet``,
+        # so a starved tick can no longer delay — let alone drop — the
+        # science sink (rule 8).
 
         # Best-effort render LAST. ``coalescer.flushed`` re-emits
         # ``traceReady`` on this thread (cheap concatenate + emit); the
@@ -2305,7 +2329,12 @@ class StreamingEngine(QObject):
 
         self._archive_writers[name] = writer
         self._archive_senders[name] = sender
-        self._archive_inboxes[name] = deque(maxlen=dev_cfg.archive.queue_max)
+        self._archive_sent[name] = 0
+        self._archive_acked[name] = 0
+        # ``queue_max`` is the in-flight WARN threshold (M6.5-A): above
+        # this many unacknowledged traces toward the storage thread the
+        # engine logs + signals backpressure — without dropping.
+        self._archive_inflight_warn[name] = dev_cfg.archive.queue_max
         self._archive_paths_seen[name] = set()
         status = self._status.get(name)
         if status is not None:
@@ -2337,33 +2366,17 @@ class StreamingEngine(QObject):
         """
         writer = self._archive_writers.pop(name, None)
         sender = self._archive_senders.pop(name, None)
-        inbox = self._archive_inboxes.pop(name, None)
-        # Final drain, mirroring stop()'s _drain_archive call: packets
-        # still in the bounded inbox at teardown time must reach the
-        # writer or they are silently lost (the per-device paths —
-        # downgrade, stop(name), hot-reload restart — don't pass through
-        # the global drain). FIFO posting from this thread guarantees
-        # the queued write_trace calls dispatch on the storage thread
-        # BEFORE the BlockingQueuedConnection close_all below, so the
-        # drained packets are fsynced by the close pass.
-        if inbox and sender is not None:
-            while inbox:
-                drained_nslc, drained_trace = inbox.popleft()
-                sender.request.emit(drained_nslc, drained_trace)
-        # Rule 5: drops accumulated since the last throttled log must
-        # not vanish with the counters — surface them once at teardown.
-        pending_drops = self._archive_drops_pending.pop(name, 0)
-        if pending_drops > 0:
-            _log.warning(
-                "streaming_engine_archive_backpressure",
-                device=name,
-                dropped=pending_drops,
-                at="writer_teardown",
-            )
-            status_for_drops = self._status.get(name)
-            if status_for_drops is not None:
-                status_for_drops.archive_drops_total += pending_drops
-        self._archive_drops_last_log.pop(name, None)
+        # No inbox to drain (M6.5-A): every packet was posted to the
+        # storage thread at receive time, and those queued write_trace
+        # events dispatch FIFO on the storage thread BEFORE the
+        # BlockingQueuedConnection close_all below — so everything in
+        # flight is fsynced by the close pass. The in-flight gauge for
+        # this device is discarded, but its final reading is logged
+        # around the close barrier below (rule 7): the barrier's wait is
+        # proportional to this backlog.
+        inflight_at_close = self._archive_sent.pop(name, 0) - self._archive_acked.pop(name, 0)
+        self._archive_inflight_warn.pop(name, None)
+        self._archive_inflight_last_log.pop(name, None)
         self._archive_paths_seen.pop(name, None)
         # Clear DAO row-id caches and stage-B gap state for every
         # stream that belonged to this device. Without this, a
@@ -2384,8 +2397,13 @@ class StreamingEngine(QObject):
             with contextlib.suppress(RuntimeError, TypeError):
                 sender.request.disconnect()
             sender.deleteLater()
-        # Disconnect engine-side listeners BEFORE the close call so a
-        # late writeOk landing on a torn-down engine slot is impossible.
+        # Disconnect engine-side listeners BEFORE the close call so the
+        # close pass posts no NEW writeOk/writeFailed events. Terminal
+        # events already queued on the engine thread still deliver after
+        # this disconnect (Qt does not cancel posted QMetaCallEvents) —
+        # that is harmless: the receiving slots guard on dicts this
+        # teardown has already cleared (``_ack_archive_trace`` membership,
+        # ``_archive_paths_seen.get``, ``_status.get``).
         # ``flushedFile`` is DELIBERATELY left connected: ``close_all``'s
         # final fsync pass emits the last durability claims through it,
         # and ``_on_archive_flushed_file`` (the receiver: the engine,
@@ -2400,59 +2418,67 @@ class StreamingEngine(QObject):
         # QueuedConnection here would race ``thread.quit()`` exactly the
         # way the M3p2 / M4 closure flake demonstrated for the DSP
         # router (POSTMORTEMS 2026-05-10 entry "Flaky multi-device
-        # tests resolved").
+        # tests resolved"). The barrier dispatches after every queued
+        # write_trace already in flight (FIFO), so its wait scales with
+        # the backlog — start/elapsed logged per rule 7; the backlog is
+        # physically bounded by the device ring + live rate.
+        close_t0 = time.monotonic()
+        if inflight_at_close > 0:
+            _log.info(
+                "streaming_engine_archive_close_start",
+                device=name,
+                inflight=inflight_at_close,
+            )
         QMetaObject.invokeMethod(
             writer,
             "close_all",
             Qt.ConnectionType.BlockingQueuedConnection,
         )
+        close_elapsed_ms = (time.monotonic() - close_t0) * 1000.0
+        if close_elapsed_ms > 1000.0:
+            _log.warning(
+                "streaming_engine_archive_close_slow",
+                device=name,
+                inflight=inflight_at_close,
+                elapsed_ms=round(close_elapsed_ms, 1),
+            )
         writer.deleteLater()
         status = self._status.get(name)
         if status is not None:
             status.archive_enabled = False
 
     def _enqueue_for_archive(self, device_name: str, nslc: str, trace: object) -> None:
-        deque_ = self._archive_inboxes.get(device_name)
-        if deque_ is None:
-            return
-        if len(deque_) == deque_.maxlen:
-            self._archive_drops_pending[device_name] = (
-                self._archive_drops_pending.get(device_name, 0) + 1
-            )
-        deque_.append((nslc, trace))
+        """Post one recorded packet straight to the storage thread.
 
-    def _drain_archive(self) -> None:
-        """Per-tick: drain each device's bounded inbox to the writer.
-
-        Runs in :meth:`_flush_all` after the DSP drain block. Drops are
-        rate-limited per device exactly like ring-buffer drops
-        (CLAUDE.md rule 5) — at most once every ``_DROP_LOG_INTERVAL_S``
-        seconds the cumulative drop count is logged + signalled, then
-        zeroed.
+        Never drops (M6.5-A — the archive is the science sink; the
+        field run lost 33 s of recorded data to the old bounded-deque
+        drop-oldest when a replay burst starved the flush tick). The
+        rule-5 seam observability lives in the in-flight gauge: the
+        difference between packets sent and the writer's terminal
+        acks is the storage event-queue depth; above
+        ``archive.queue_max`` it is warn-logged + signalled, throttled
+        to one line per ``_DROP_LOG_INTERVAL_S`` per device.
         """
-        now = time.monotonic()
-        for name, inbox in self._archive_inboxes.items():
-            sender = self._archive_senders.get(name)
-            if sender is not None:
-                while inbox:
-                    nslc, trace = inbox.popleft()
-                    sender.request.emit(nslc, trace)
-
-            pending = self._archive_drops_pending.get(name, 0)
-            if pending > 0:
-                last = self._archive_drops_last_log.get(name, 0.0)
-                if now - last >= _DROP_LOG_INTERVAL_S:
-                    _log.warning(
-                        "streaming_engine_archive_backpressure",
-                        device=name,
-                        dropped=pending,
-                    )
-                    self.archiveBackpressure.emit(name, pending)
-                    status = self._status.get(name)
-                    if status is not None:
-                        status.archive_drops_total += pending
-                    self._archive_drops_pending[name] = 0
-                    self._archive_drops_last_log[name] = now
+        sender = self._archive_senders.get(device_name)
+        if sender is None:
+            return
+        sender.request.emit(nslc, trace)
+        sent = self._archive_sent.get(device_name, 0) + 1
+        self._archive_sent[device_name] = sent
+        inflight = sent - self._archive_acked.get(device_name, 0)
+        if inflight > self._archive_inflight_warn.get(device_name, 1024):
+            now = time.monotonic()
+            last = self._archive_inflight_last_log.get(device_name, 0.0)
+            if now - last >= _DROP_LOG_INTERVAL_S:
+                self._archive_inflight_last_log[device_name] = now
+                _log.warning(
+                    "streaming_engine_archive_backpressure",
+                    device=device_name,
+                    inflight=inflight,
+                    warn_threshold=self._archive_inflight_warn.get(device_name),
+                    note="no samples dropped; storage thread is lagging",
+                )
+                self.archiveBackpressure.emit(device_name, inflight)
 
     @Slot(str, str, int, object, bool, str)
     def _on_archive_write_ok(
@@ -2464,6 +2490,7 @@ class StreamingEngine(QObject):
         split: bool,
         encoding_chosen: str,
     ) -> None:
+        self._ack_archive_trace(device_name)
         status = self._status.get(device_name)
         if status is not None:
             status.archive_bytes_written += int(bytes_written)
@@ -2477,10 +2504,28 @@ class StreamingEngine(QObject):
 
     @Slot(str, str, str)
     def _on_archive_write_failed(self, device_name: str, nslc: str, reason: str) -> None:
+        self._ack_archive_trace(device_name)
         status = self._status.get(device_name)
         if status is not None:
             status.archive_last_error = reason
         self.archiveWriteFailed.emit(device_name, nslc, reason)
+
+    def _ack_archive_trace(self, device_name: str) -> None:
+        """Count one writer terminal signal toward the in-flight gauge.
+
+        Accuracy relies on the writer's terminal-signal invariant
+        (exactly one ``writeOk`` XOR ``writeFailed`` per ``write_trace``
+        — pinned in the MseedWriter module docstring). The clamp to
+        ``sent`` prevents underflow; a stale ack from a previous writer
+        incarnation dispatching after a teardown→re-setup can still
+        transiently make the gauge read LOWER (by at most the backlog
+        at teardown) until it self-corrects — an accepted imprecision
+        on an advisory signal.
+        """
+        if device_name not in self._archive_sent:
+            return  # writer already torn down; gauge discarded
+        acked = self._archive_acked.get(device_name, 0) + 1
+        self._archive_acked[device_name] = min(acked, self._archive_sent[device_name])
 
     @Slot(str, str, object, object, object, int, int)
     def _on_archive_flushed_file(

@@ -118,6 +118,12 @@ class FakeSeedLinkServerConfig:
     # ``test_worker_recovers_when_server_starts_accepting`` test flips
     # this field while the server is already running.
     reject_all_stations: bool = False
+    # M6.5-A: number of records sent back-to-back (no inter-packet
+    # sleep) at the start of every streaming session, simulating the
+    # FETCH replay burst a real Echos device sends from its ring buffer
+    # after a reconnect. The steady ``packet_interval_s`` pacing
+    # resumes after the burst.
+    burst_records: int = 0
 
 
 class FakeSeedLinkServer:
@@ -454,6 +460,7 @@ class FakeSeedLinkServer:
         n = cfg.samples_per_record
         sr = cfg.sampling_rate
         start = UTCDateTime()
+        burst_left = cfg.burst_records
         try:
             while not session.closed:
                 packet_t = start + (session.sample_idx / sr)
@@ -466,7 +473,12 @@ class FakeSeedLinkServer:
                 await session.writer.drain()
                 session.seq = (session.seq + 1) & 0xFFFFFF
                 session.sample_idx += n
-                await asyncio.sleep(cfg.packet_interval_s)
+                if burst_left > 0:
+                    # Replay-burst mode: flood with no pacing, like a
+                    # real device draining its ring after a reconnect.
+                    burst_left -= 1
+                else:
+                    await asyncio.sleep(cfg.packet_interval_s)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
