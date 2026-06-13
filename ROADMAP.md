@@ -974,6 +974,25 @@ surfaced real problems — this milestone fixes them.
       toggle, joined bounded in `shutdown_basemap` (MainWindow
       closeEvent) with the M6-0 abandoned-retention pattern.
       Visual orientation check against the real site rides item E.
+      **Superseded by M6.5-F below**: the original static-per-extent
+      basemap did not follow pan/zoom (user: "spostandosi la mappa
+      non si aggiorna"); it now does.
+- [x] **F. Basemap follows the viewport (pan/zoom).** Added
+      2026-06-13 after the field user reported the M6.5-D basemap only
+      covered the device's surroundings and never updated on
+      pan/scroll. The map now refetches the tiles for the VISIBLE
+      region: `sigRangeChanged` → debounced (200 ms) → inverse-project
+      the viewport to a lat/lon box (`positions.east_north_to_latlon`,
+      round-trip-tested) → zoom from the viewport span → fetch only the
+      missing tiles. Tiles persist in an LRU (cap 96, rule 5/8) so a
+      pan-back reuses them; finer zoom draws above coarser
+      (zValue per zoom) so a zoom transition never flashes blank. The
+      single-device degenerate-view rescue (M6.5-E) still fires, but
+      only recentres on toggle/origin-change — once the user pans to
+      the surroundings an arriving tile never yanks the view back.
+      Widget now self-cleans on `closeEvent` (stop debounce + join
+      thread). Verified end-to-end headless against real Esri tiles
+      for the site (toggle → pan → zoom all render full imagery).
 - [x] **F. Wizard wrote into the BUNDLED default.yaml (fixed
       2026-06-12, same day).** The field run exposed it: with no user
       config, `load_config(None)` returned the bundled
@@ -1017,7 +1036,8 @@ surfaced real problems — this milestone fixes them.
       log), `Fit view` floors each axis at 50 m, and a headless
       render-grab of the real site imagery verified placement,
       tile-seam continuity and north-up orientation (also pinned by a
-      render-sampling test) — please re-check on screen; (2) one
+      render-sampling test); the basemap now follows pan/zoom (M6.5-F,
+      2026-06-13) — please re-check scrolling/zooming on screen; (2) one
       GUI-driven monitor→record→browse→HVSR→report pass (those code
       paths are gate-covered and untouched by M6.5, but eyes beat
       tests).
@@ -1144,6 +1164,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-12 | M6.5-B: gap-detector jitter tolerance is **absolute milliseconds** (`archive.jitter_tolerance_ms`, default 10, half-sample floor), and in-tolerance packets are **snapped onto the reconstructed grid** before archiving (`last_end` follows the grid, not the device stamps) | The field jitter is device clock wobble — a time property (±5.1 ms on echos.local), so a sample-scaled tolerance would be wrong at other rates and "≤ half a sample" (the ROADMAP sketch) was already in place and demonstrably too small. Snapping (not just suppressing the event) is what fixes the REAL damage — 17 on-disk segments/440 s that fragment reads and HVSR windows; `last_end` following the grid is what stops zero-mean jitter from emitting pairs forever. Honest cost, documented in code + schema: a real discontinuity ≤ tolerance is absorbed as ≤ 10 ms persistent timing bias (no `gaps` row) until the next over-tolerance event re-anchors — inside the device's own stamping noise, and irrelevant to single- and multi-station HVSR (no cross-station phase coherence used). Display/DSP keep the raw stamps; only the archive branch mutates, after every other consumer captured its values. |
 | 2026-06-12 | M6.5-C: the writer binds obspy's `_write_mseed` **directly** (one import) instead of `Stream.write(format="MSEED")`, and skips the per-packet `trace.copy()` on the no-cast hot path | The plugin dispatch inside `Stream.write` resolves the MSEED entry point via importlib.metadata on EVERY call — ~3 ms + an email-header parse per 108-sample packet, 54 % of the writer's CPU in the M6.5-C profile. `_write_mseed` IS the function the entry point resolves to, it accepts BytesIO, and it never mutates the input trace; the round-trip tests pin the private binding so an obspy upgrade fails the gate loudly. Per-packet records stay (crash-tight write-on-arrival; coalescing's ~4.7× size win is not worth the in-memory crash window until the field says size hurts). |
 | 2026-06-12 | M6.5-D (revises M4-B / open question 4): the Map tab gets a **satellite raster layer** — Esri World Imagery XYZ tiles fetched by a `core/map_tiles.py` worker (httpx, ≤36 tiles/batch, 10 s/tile, latest-wins generation, disk-cached) and drawn as pyqtgraph ImageItems under the scatter; **still no QtWebEngine, no slippy-map stack** | The field run produced the real need M4-B deferred to: siting context when placing instruments. A static per-extent raster keeps every M4-B virtue (offline-by-construction once cached, no new GUI stack, relative geometry intact — tiles are placed through the same `local_east_north`, sub-metre mismatch at array zooms) while QtWebEngine+Leaflet remains the documented fallback only if imagery needs ever outgrow this. Source/terms: Esri World Imagery public tile endpoint; attribution ("Esri — Esri, Maxar, Earthstar Geographics, and the GIS User Community") is rendered whenever the basemap is on, and a failed batch shows an honest "imagery unavailable" note instead. Contract amendments: rule 2 networking list + rule 8 sanctioned-cache exception (cache is an accelerator, never truth — fsync'd atomic writes, undecodable entries evicted + refetched). |
+| 2026-06-13 | M6.5-F (revises M6.5-D's "static patch per array extent"): the satellite basemap **follows the viewport** — pan/zoom debounce-refetch the visible region's tiles, kept in an LRU (cap 96) with per-zoom zValue layering | M6.5-D fetched one fixed batch around the array; the field user panned/zoomed and nothing updated ("la mappa non si aggiorna"). Following the viewport is what a map is expected to do; it stays within the M4-B/D spirit (no QtWebEngine, no slippy-map *library* — just our own bounded tile fetches over a worker) because each gesture is one debounced ≤36-tile batch, disk-cached, and the item count is LRU-bounded. The inverse projection (`east_north_to_latlon`) is the new pure primitive; the degenerate-view rescue now recentres only on toggle/origin-change so a deliberate pan to the surroundings is never undone. The widget self-cleans on closeEvent (the debounce timer could otherwise spawn a tile thread mid-teardown — caught as a test interpreter-abort). |
 | 2026-06-12 | M6.5-E fix: the map viewport **rescues itself onto the basemap extent** when imagery is requested or arrives into a degenerate (≤2 m span — covers both the auto-range-collapsed single-marker view and the never-ranged `[0,1]` default) or non-intersecting view; `Fit view` floors each axis at 50 m independently; a healthy user viewport is never touched | The first real Satellite toggle showed NOTHING: one positioned device is a lone point at the frame origin, pyqtgraph auto-ranges to ~1e-153 m at PAINT time (i.e. AFTER request-time checks — hence the second rescue on tile arrival), the pixel-sized marker still renders but data-sized tiles cannot. Landmine for the next reader: pyqtgraph's auto-range can undo your view fix between your check and the next paint; rescue at the consumer (tile arrival), not only at the producer. Orientation/placement verified by an offscreen render-grab of real site imagery + a north-red/south-blue render-sampling test. |
 | 2026-06-12 | M6.5-A: MseedWriter **terminal-signal invariant** — exactly one `writeOk` XOR `writeFailed` per `write_trace`; the paused-path drop emits `writeFailed` (was silent), the pause-TRIP write emits only its `writeOk` (the old `writeFailed("filesystem unresponsive")` on the success path is gone) | The in-flight gauge counts terminal acks against sends; a silent drop inflates the gauge forever (false backpressure), a double terminal injects spurious acks that mask real backpressure exactly when the filesystem struggles (both reviewers flagged the latter). The teardown close barrier logs inflight + elapsed (rule 7) since its wait now scales with the backlog. |
 

@@ -208,6 +208,24 @@ def test_local_east_north_projection() -> None:
     assert local_east_north(45.0, 11.0, 45.0, 11.0) == (0.0, 0.0)
 
 
+def test_east_north_to_latlon_round_trips_local_east_north() -> None:
+    """M6.5-F: the Map tab inverse-projects a viewport (metres) back to
+    a lat/lon box to choose its tiles; it must round-trip the forward
+    projection to ≪ 1 m at deployment scale."""
+    from echosmonitor.core.positions import east_north_to_latlon
+
+    lat0, lon0 = 45.88524, 11.06091  # the real echos.local site
+    for dlat, dlon in [(0.0, 0.0), (0.004, 0.006), (-0.01, 0.012), (0.02, -0.018)]:
+        lat, lon = lat0 + dlat, lon0 + dlon
+        east, north = local_east_north(lat, lon, lat0, lon0)
+        rlat, rlon = east_north_to_latlon(east, north, lat0, lon0)
+        # < 1 mm in degrees → well under a metre on the ground.
+        assert abs(rlat - lat) < 1e-9
+        assert abs(rlon - lon) < 1e-9
+    # Origin maps to itself.
+    assert east_north_to_latlon(0.0, 0.0, lat0, lon0) == (lat0, lon0)
+
+
 # ----------------------------------------------------------------------
 # Source priority (decision log 2026-06-12: override > stationxml > gnss)
 # ----------------------------------------------------------------------

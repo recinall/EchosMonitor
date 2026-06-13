@@ -352,35 +352,117 @@ def test_position_change_rerequests_with_fresh_generation(
     assert requests[-1].generation > first.generation
 
 
+def _feed_request_tiles(widget: MapWidget, req: TileRequest) -> None:
+    """Deliver every tile of a request as a blank image (test helper)."""
+    for x, y in req.tiles:
+        widget._on_tile_ready(
+            TileResult(
+                generation=req.generation,
+                zoom=req.zoom,
+                x=x,
+                y=y,
+                image=np.zeros((256, 256, 4), dtype=np.uint8),
+            )
+        )
+
+
 def test_state_only_rebuild_does_not_blank_or_refetch_basemap(
     qtbot: QtBot, monkeypatch
 ) -> None:
     """Marker recolours / connection flaps rebuild the scatter but must
-    not churn the basemap: same extent → no new TileRequest and the
-    already-drawn tiles stay."""
+    not churn the basemap: with every wanted tile already drawn, the
+    same viewport wants nothing new → no TileRequest, tiles stay."""
     widget = _widget(qtbot, ("dev-a", "dev-b"))
     requests = _stub_tile_worker(widget, monkeypatch)
     widget.on_position(_resolved("dev-a", _POS_A))
     widget.on_position(_resolved("dev-b", _POS_B))
     widget._satellite_button.setChecked(True)
-    req = requests[-1]
+    _feed_request_tiles(widget, requests[-1])
+    n_tiles = len(widget._tile_items)
     n_requests = len(requests)
-    x, y = req.tiles[0]
-    widget._on_tile_ready(
-        TileResult(
-            generation=req.generation,
-            zoom=req.zoom,
-            x=x,
-            y=y,
-            image=np.zeros((256, 256, 4), dtype=np.uint8),
-        )
-    )
+    assert n_tiles >= 1
     # A flapping connection (the scatter-churn guard's own case).
     widget.on_acquisition_state("dev-a", int(AcquisitionState.MONITORING))
     widget.on_device_state("dev-a", int(ConnState.WAITING_RETRY))
     widget.set_f0_overlay({"dev-a": 2.0})
-    assert len(requests) == n_requests, "state-only rebuilds must not refetch tiles"
-    assert len(widget._tile_items) == 1, "state-only rebuilds must not blank the basemap"
+    assert len(requests) == n_requests, "state-only rebuilds must not refetch present tiles"
+    assert len(widget._tile_items) == n_tiles, "state-only rebuilds must not blank the basemap"
+
+
+def test_pan_fetches_newly_revealed_tiles_and_keeps_old(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    """M6.5-F: panning the viewport fetches the tiles for the newly
+    visible region (the user's 'spostandosi la mappa non si aggiorna'
+    report) while existing tiles stay (no blank, reused on pan-back)."""
+    widget = _widget(qtbot, ("dev-a",))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    _feed_request_tiles(widget, requests[-1])
+    drawn_before = set(widget._tile_items)
+    n_requests = len(requests)
+    # Pan ~500 m east/north — well beyond the current viewport.
+    view_box = widget._plot.getPlotItem().getViewBox()
+    (e0, e1), (n0, n1) = view_box.viewRange()
+    view_box.setRange(xRange=(e0 + 500, e1 + 500), yRange=(n0 + 500, n1 + 500), padding=0.0)
+    widget._refresh_basemap_for_viewport()  # synchronous stand-in for the debounce
+    assert len(requests) > n_requests, "pan did not fetch the newly-revealed region"
+    new_req = requests[-1]
+    # The new batch is tiles NOT already drawn.
+    assert all((new_req.zoom, x, y) not in drawn_before for x, y in new_req.tiles)
+    # Old tiles are still present (within the LRU cap).
+    assert drawn_before.issubset(set(widget._tile_items))
+
+
+def test_zoom_out_refetches_at_a_coarser_level(qtbot: QtBot, monkeypatch) -> None:
+    """Zooming changes the tile zoom level; coarser tiles are fetched
+    and layered under the finer ones (different zValue → no flash)."""
+    widget = _widget(qtbot, ("dev-a",))
+    requests = _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    fine_zoom = requests[-1].zoom
+    _feed_request_tiles(widget, requests[-1])
+    # Zoom out 4x.
+    view_box = widget._plot.getPlotItem().getViewBox()
+    (e0, e1), (n0, n1) = view_box.viewRange()
+    cx, cy = (e0 + e1) / 2, (n0 + n1) / 2
+    hw, hh = (e1 - e0) * 2, (n1 - n0) * 2
+    view_box.setRange(xRange=(cx - hw, cx + hw), yRange=(cy - hh, cy + hh), padding=0.0)
+    widget._refresh_basemap_for_viewport()
+    coarse = requests[-1]
+    assert coarse.zoom < fine_zoom, "zoom-out did not drop to a coarser tile level"
+    _feed_request_tiles(widget, coarse)
+    zooms = {z for (z, _x, _y) in widget._tile_items}
+    assert fine_zoom in zooms and coarse.zoom in zooms, "both levels should coexist (no flash)"
+    # Finer tiles draw above coarser over the same ground.
+    fine_item = next(it for (z, *_r), it in widget._tile_items.items() if z == fine_zoom)
+    coarse_item = next(it for (z, *_r), it in widget._tile_items.items() if z == coarse.zoom)
+    assert fine_item.zValue() > coarse_item.zValue()
+
+
+def test_tile_items_bounded_by_lru_cap(qtbot: QtBot, monkeypatch) -> None:
+    """Accumulating tiles across many pans never exceeds the LRU cap
+    (rule 5/8: the seam is bounded)."""
+    from echosmonitor.gui.widgets.map_widget import _MAX_TILE_ITEMS
+
+    widget = _widget(qtbot, ("dev-a",))
+    _stub_tile_worker(widget, monkeypatch)
+    widget.on_position(_resolved("dev-a", _POS_A))
+    widget._satellite_button.setChecked(True)
+    # Feed far more distinct tiles than the cap.
+    for i in range(_MAX_TILE_ITEMS + 40):
+        widget._on_tile_ready(
+            TileResult(
+                generation=widget._tile_generation,
+                zoom=17,
+                x=1000 + i,
+                y=2000,
+                image=np.zeros((256, 256, 4), dtype=np.uint8),
+            )
+        )
+    assert len(widget._tile_items) <= _MAX_TILE_ITEMS
 
 
 def test_batch_failure_shows_honest_note_and_recovery_restores_credit(

@@ -180,6 +180,26 @@ def local_east_north(
     return east, north
 
 
+def east_north_to_latlon(
+    east: float, north: float, lat0: float, lon0: float
+) -> tuple[float, float]:
+    """Inverse of :func:`local_east_north`: local metres → ``(lat, lon)``.
+
+    Same equirectangular tangent-plane approximation, so it round-trips
+    ``local_east_north`` to ≪ 1 m at deployment scale. The Map tab uses
+    it to turn a pyqtgraph viewport (east/north metres) back into the
+    lat/lon box whose satellite tiles cover it. Pure (no Qt, no I/O).
+    """
+    lat = lat0 + math.degrees(north / _EARTH_RADIUS_M)
+    cos_lat0 = math.cos(math.radians(lat0))
+    # cos(lat0) only vanishes at the poles; no Echos array deploys there,
+    # but guard so a degenerate origin can never divide-by-zero.
+    if abs(cos_lat0) < 1e-12:
+        return lat, lon0
+    lon = lon0 + math.degrees(east / (_EARTH_RADIUS_M * cos_lat0))
+    return lat, lon
+
+
 @dataclass(frozen=True, slots=True)
 class StationGeometry:
     """Resolved positions + pairwise distances for a station set (M4-C).

@@ -57,7 +57,7 @@ import math
 import numpy as np
 import pyqtgraph as pg
 import structlog
-from PySide6.QtCore import QMetaObject, QPointF, QRectF, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QMetaObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -81,6 +81,7 @@ from echosmonitor.core.map_tiles import (
 from echosmonitor.core.models import AcquisitionState, ConnState
 from echosmonitor.core.positions import (
     ResolvedPosition,
+    east_north_to_latlon,
     local_east_north,
     station_geometry,
 )
@@ -112,12 +113,30 @@ _TILE_Z_VALUE = -10.0
 # invisible. Found on the first real Satellite use (M6.5-E checklist).
 _FIT_MIN_SPAN_M = 50.0
 # Margin factor applied around the array extent when choosing the
-# basemap coverage, and the floor for a degenerate (single-station)
-# extent so one node still gets a recognisable patch of imagery.
+# INITIAL basemap coverage (the rescue extent for a single node), and
+# the floor for a degenerate (single-station) extent so one node still
+# gets a recognisable patch of imagery on first show.
 _BASEMAP_MARGIN = 2.0
 _BASEMAP_MIN_SPAN_M = 200.0
 # Bounded join for the tile worker thread at shutdown (rule 7).
 _TILE_THREAD_JOIN_MS = 2000
+
+# Viewport-following basemap (M6.5-F). Pan/zoom recompute the tiles for
+# the VISIBLE region — the basemap is no longer a single static patch.
+# A pan/zoom gesture fires many sigRangeChanged signals; coalesce them
+# behind a single-shot debounce so one gesture = one fetch batch.
+_BASEMAP_REFRESH_DEBOUNCE_MS = 200
+# Fetch slightly beyond the visible edges so a small pan reveals
+# already-loaded imagery (fraction of the viewport span per side).
+_BASEMAP_VIEWPORT_MARGIN = 0.15
+# LRU cap on drawn ImageItems across all zoom levels (rule 5/8: the
+# seam is bounded). ~36 visible at one zoom + history for smooth
+# pan/zoom and zoom-transition overlap. Least-recently-touched evicted.
+_MAX_TILE_ITEMS = 96
+# zValue spread per zoom level so a finer tile draws ABOVE a coarser one
+# covering the same ground — no blank flash during a zoom transition,
+# and still far below the scatter (z 0). z=19 → _TILE_Z_VALUE + 0.019.
+_Z_PER_ZOOM = 0.001
 
 # Tile worker/thread pairs whose bounded join timed out at shutdown.
 # Retained for the process lifetime: dropping the last reference to a
@@ -180,24 +199,34 @@ class MapWidget(QWidget):
         self._f0_overlay: dict[str, float] = {}  # device -> f0 Hz (M5-B)
         self._labels: list[pg.TextItem] = []
 
-        # ----- M6.5-D satellite basemap state -------------------------
+        # ----- M6.5-D/F satellite basemap state -----------------------
         # Worker + thread are lazily created on the first Satellite
         # toggle (an unused map owns no running thread — the M6 wizard
         # lesson). ``_frame_origin`` is the centroid the CURRENT tiles
-        # were placed against; a rebuild that moves it re-requests.
+        # were placed against; if it moves, every drawn rect is stale
+        # and the tiles are cleared before the next viewport fetch.
         self._tile_fetcher: TileFetcher | None = None
         self._tile_thread: QThread | None = None
+        # Sticky terminal flag: once the widget is shut down, no path
+        # (a stray debounce tick, a programmatic refresh) may re-spawn
+        # the worker thread — the same canon as PositionResolver.
+        self._basemap_shutdown = False
+        # ``_tile_items`` is an LRU keyed by (zoom, x, y); insertion
+        # order = recency, oldest evicted past ``_MAX_TILE_ITEMS``.
         self._tile_items: dict[tuple[int, int, int], pg.ImageItem] = {}
         self._tile_generation = 0
         self._frame_origin: tuple[float, float] | None = None
-        # Memo of the last issued request (origin, zoom, tiles): a
-        # rebuild that does not move the basemap (marker recolours,
-        # f0 overlay, connection flaps) must not blank + refetch it.
-        # Cleared on batch failure so the next rebuild retries.
-        self._last_basemap_key: tuple[object, ...] | None = None
-        # East/north extent (e0, n0, e1, n1) of the last-requested
-        # basemap; used to rescue a degenerate or elsewhere-pointing
-        # view so requested imagery is never invisible.
+        # The (lat0, lon0) the currently-drawn tiles were placed against
+        # — compared on rebuild so an origin move clears stale rects.
+        self._tiles_origin: tuple[float, float] | None = None
+        # Memo of the last viewport fetch (zoom, frozenset of wanted
+        # tiles): a refresh that wants exactly what is already drawn is
+        # a no-op (marker recolours, f0 overlay, connection flaps, a
+        # sub-tile pan). Cleared on batch failure so a retry can run.
+        self._basemap_memo: tuple[object, ...] | None = None
+        # East/north extent (e0, n0, e1, n1) of the array bounding box;
+        # the rescue target so requested imagery is never invisible on
+        # the degenerate single-device view.
         self._basemap_extent: tuple[float, float, float, float] | None = None
 
         root = QVBoxLayout(self)
@@ -255,6 +284,16 @@ class MapWidget(QWidget):
         self._scatter.sigClicked.connect(self._on_spot_clicked)
         plot_item.addItem(self._scatter)
         splitter.addWidget(self._plot)
+
+        # Viewport-following basemap (M6.5-F): pan/zoom → debounced
+        # refetch of the visible region's tiles. The timer is a GUI-
+        # thread child of the widget; ``sigRangeChanged`` only schedules
+        # work while the Satellite layer is on.
+        self._basemap_refresh_timer = QTimer(self)
+        self._basemap_refresh_timer.setSingleShot(True)
+        self._basemap_refresh_timer.setInterval(_BASEMAP_REFRESH_DEBOUNCE_MS)
+        self._basemap_refresh_timer.timeout.connect(self._refresh_basemap_for_viewport)
+        plot_item.getViewBox().sigRangeChanged.connect(self._schedule_basemap_refresh)
 
         side = QWidget(self)
         side_layout = QVBoxLayout(side)
@@ -476,17 +515,30 @@ class MapWidget(QWidget):
     @Slot(bool)
     def _on_satellite_toggled(self, checked: bool) -> None:
         if not checked:
+            self._basemap_refresh_timer.stop()
             self._tile_generation += 1  # supersede anything in flight
             if self._tile_fetcher is not None:
                 self._tile_fetcher.supersede(self._tile_generation)
             self._clear_tiles()
-            self._last_basemap_key = None
+            self._basemap_memo = None
             self._basemap_extent = None
+            self._tiles_origin = None
             self._attribution_label.setVisible(False)
             return
         self._attribution_label.setText(ATTRIBUTION)
         self._attribution_label.setVisible(True)
         self._update_basemap(self._positioned())
+
+    @Slot()
+    def _schedule_basemap_refresh(self, *_args: object) -> None:
+        """Debounced trigger for pan/zoom (``sigRangeChanged``).
+
+        A single pan/zoom gesture fires many range-changed signals;
+        coalesce them into one fetch batch (rule 5). No-op while the
+        Satellite layer is off.
+        """
+        if self._satellite_button.isChecked() and not self._basemap_shutdown:
+            self._basemap_refresh_timer.start()
 
     def _ensure_tile_worker(self) -> TileFetcher:
         """Lazily boot the tile worker thread (first Satellite toggle).
@@ -514,18 +566,23 @@ class MapWidget(QWidget):
         return self._tile_fetcher
 
     def _update_basemap(self, positioned: list[tuple[str, ResolvedPosition]]) -> None:
-        """(Re)request imagery for the current array extent.
+        """React to a positions / frame-origin change while the basemap is on.
 
-        Called from ``_rebuild`` (positions may have moved the frame
-        origin — old tiles would be misplaced, so they are dropped
-        before the re-request; the disk cache makes the refetch cheap)
-        and from the Satellite toggle. No-op when the basemap is off.
+        Sets the rescue extent (the array bounding box), clears the
+        drawn tiles when the frame origin actually moved (their rects
+        were placed against the OLD origin), recentres a degenerate
+        single-device view, and kicks an immediate viewport fetch.
+        Pan/zoom go through the debounced ``_schedule_basemap_refresh``
+        instead — this is the positions-changed entry only. No-op when
+        the basemap is off.
         """
         if not self._satellite_button.isChecked():
             return
         if not positioned or self._frame_origin is None:
             self._clear_tiles()
-            self._last_basemap_key = None
+            self._basemap_memo = None
+            self._basemap_extent = None
+            self._tiles_origin = None
             return
         lat0, lon0 = self._frame_origin
         east_north = [
@@ -534,29 +591,6 @@ class MapWidget(QWidget):
         span_e = max(e for e, _ in east_north) - min(e for e, _ in east_north)
         span_n = max(n for _, n in east_north) - min(n for _, n in east_north)
         span_m = max(span_e, span_n, _BASEMAP_MIN_SPAN_M) * _BASEMAP_MARGIN
-        zoom = zoom_for_span(span_m, lat0)
-        # Pad the lat/lon box by half the (margined) span on each side.
-        half_span_deg_lat = (span_m / 2.0) / 111_320.0
-        cos_lat = max(0.01, math.cos(math.radians(lat0)))
-        half_span_deg_lon = (span_m / 2.0) / (111_320.0 * cos_lat)
-        lats = [p.latitude for _, p in positioned]
-        lons = [p.longitude for _, p in positioned]
-        tiles = tiles_for_extent(
-            min(lats) - half_span_deg_lat,
-            max(lats) + half_span_deg_lat,
-            min(lons) - half_span_deg_lon,
-            max(lons) + half_span_deg_lon,
-            zoom,
-        )
-        # Rebuilds that did not move the basemap (marker recolours, f0
-        # overlay, connection flaps) must not blank + refetch it.
-        basemap_key = (lat0, lon0, zoom, tuple(tiles))
-        if basemap_key == self._last_basemap_key:
-            return
-        self._clear_tiles()
-        self._last_basemap_key = basemap_key
-        # Extent of the imagery patch in the local frame: the padded
-        # span centred on the array bounding box.
         centre_e = (max(e for e, _ in east_north) + min(e for e, _ in east_north)) / 2.0
         centre_n = (max(n for _, n in east_north) + min(n for _, n in east_north)) / 2.0
         half_span = span_m / 2.0
@@ -566,7 +600,71 @@ class MapWidget(QWidget):
             centre_e + half_span,
             centre_n + half_span,
         )
-        self._ensure_view_shows_basemap()
+        if self._tiles_origin != (lat0, lon0):
+            # Frame origin moved: every drawn tile rect (computed at the
+            # old origin) is now misplaced. Drop them; the disk cache
+            # makes the immediate refetch cheap.
+            self._clear_tiles()
+            self._basemap_memo = None
+            self._tiles_origin = (lat0, lon0)
+        self._ensure_view_shows_basemap(recenter_if_outside=True)
+        self._refresh_basemap_for_viewport()
+        # The rescue's setRange emits sigRangeChanged, which armed the
+        # debounce; the immediate refresh above already covered this
+        # viewport, so cancel the echo (it would re-request the same,
+        # still-in-flight tiles under a fresh generation). A genuine
+        # later pan/zoom re-arms it.
+        self._basemap_refresh_timer.stop()
+
+    def _refresh_basemap_for_viewport(self) -> None:
+        """Fetch the satellite tiles covering the CURRENT viewport (M6.5-F).
+
+        The basemap follows pan/zoom: the visible east/north rectangle
+        is inverse-projected to a lat/lon box, a zoom is chosen from the
+        viewport span, and the covering tiles are fetched — only the
+        ones not already drawn. Tiles that scroll out of view are left
+        alone (the LRU cap reclaims them) so a back-and-forth pan reuses
+        them straight from memory.
+        """
+        if (
+            self._basemap_shutdown
+            or not self._satellite_button.isChecked()
+            or self._frame_origin is None
+        ):
+            return
+        view_box = self._plot.getPlotItem().getViewBox()
+        (e0, e1), (n0, n1) = view_box.viewRange()
+        if (e1 - e0) <= 2.0 or (n1 - n0) <= 2.0:
+            # Degenerate view (the single-device collapse); the rescue
+            # owns this case — fetching here would request garbage.
+            return
+        lat0, lon0 = self._frame_origin
+        margin_e = (e1 - e0) * _BASEMAP_VIEWPORT_MARGIN
+        margin_n = (n1 - n0) * _BASEMAP_VIEWPORT_MARGIN
+        lat_a, lon_a = east_north_to_latlon(e0 - margin_e, n0 - margin_n, lat0, lon0)
+        lat_b, lon_b = east_north_to_latlon(e1 + margin_e, n1 + margin_n, lat0, lon0)
+        span_m = max(e1 - e0, n1 - n0)
+        zoom = zoom_for_span(span_m, lat0)
+        wanted = tiles_for_extent(
+            min(lat_a, lat_b),
+            max(lat_a, lat_b),
+            min(lon_a, lon_b),
+            max(lon_a, lon_b),
+            zoom,
+        )
+        memo = (zoom, frozenset(wanted))
+        missing = [(x, y) for (x, y) in wanted if (zoom, x, y) not in self._tile_items]
+        if memo == self._basemap_memo and not missing:
+            return  # viewport unchanged and everything wanted is drawn
+        self._basemap_memo = memo
+        # Touch already-drawn wanted tiles to the LRU tail so an
+        # incoming batch's eviction can't drop what is on screen.
+        for x, y in wanted:
+            key = (zoom, x, y)
+            if key in self._tile_items:
+                self._tile_items[key] = self._tile_items.pop(key)
+        if not missing:
+            return
         # A fresh request always restores the credit line: a stale
         # "imagery unavailable" note must never caption tiles that DO
         # arrive (Esri usage terms).
@@ -578,39 +676,40 @@ class MapWidget(QWidget):
             "map_basemap_requested",
             generation=self._tile_generation,
             zoom=zoom,
-            n_tiles=len(tiles),
+            n_tiles=len(missing),
             span_m=round(span_m, 1),
         )
         self._tileRequested.emit(
             TileRequest(
                 generation=self._tile_generation,
                 zoom=zoom,
-                tiles=tuple(tiles),
+                tiles=tuple(missing),
             )
         )
 
-    def _ensure_view_shows_basemap(self) -> None:
-        """Rescue the viewport when requested imagery would be invisible.
+    def _ensure_view_shows_basemap(self, *, recenter_if_outside: bool) -> None:
+        """Rescue the viewport so requested imagery is never invisible.
 
-        Two ways the user can request a basemap and see nothing (the
-        first real Satellite use hit case 1): (1) a single positioned
-        device autoRanges the view to a degenerate ~0 m span — tiles
-        are data-sized, so an infinitely-zoomed view shows none of
-        them; (2) the user panned/zoomed somewhere that doesn't
-        intersect the imagery patch. In both cases snap the view to
-        the basemap extent; otherwise leave the user's viewport alone.
+        Always fixes a DEGENERATE view: a single positioned device
+        autoRanges to a ~0 m span (the never-ranged ``[0, 1]`` default
+        is degenerate too), so the data-sized tiles vanish behind the
+        pixel-sized marker — the original "la tendina map NON
+        visualizza la mappa satellitare". When ``recenter_if_outside``
+        (positions/origin changed, or first toggle), also snaps a view
+        that does not intersect the array onto it. Pan/zoom callers
+        pass ``False``: once the user has deliberately panned to the
+        surroundings, an arriving tile must NOT yank the view back to
+        the array (M6.5-F).
         """
         if self._basemap_extent is None:
             return
         view_box = self._plot.getPlotItem().getViewBox()
         (x0, x1), (y0, y1) = view_box.viewRange()
         east_0, north_0, east_1, north_1 = self._basemap_extent
-        # "Degenerate" covers both the auto-range-collapsed single-point
-        # view (~1e-153 m) and the never-ranged ViewBox default ([0, 1],
-        # width exactly 1.0 — strictly-less-than 1.0 missed it). No
-        # legitimate imagery viewport is narrower than a couple metres.
         degenerate = (x1 - x0) <= 2.0 or (y1 - y0) <= 2.0
-        outside = x1 < east_0 or x0 > east_1 or y1 < north_0 or y0 > north_1
+        outside = recenter_if_outside and (
+            x1 < east_0 or x0 > east_1 or y1 < north_0 or y0 > north_1
+        )
         if degenerate or outside:
             view_box.setRange(
                 xRange=(east_0, east_1),
@@ -638,7 +737,10 @@ class MapWidget(QWidget):
         image = np.ascontiguousarray(payload.image[::-1])
         item = pg.ImageItem(image, axisOrder="row-major")
         item.setRect(QRectF(east_w, north_s, east_e - east_w, north_n - north_s))
-        item.setZValue(_TILE_Z_VALUE)
+        # Finer zoom draws above coarser over the same ground, so a
+        # zoom transition never flashes blank; still far below the
+        # scatter (z 0).
+        item.setZValue(_TILE_Z_VALUE + payload.zoom * _Z_PER_ZOOM)
         # ignoreBounds: "Fit view" keeps fitting the ARRAY, not the
         # (much larger) imagery patch.
         self._plot.getPlotItem().addItem(item, ignoreBounds=True)
@@ -646,14 +748,27 @@ class MapWidget(QWidget):
         previous = self._tile_items.pop(key, None)
         if previous is not None:
             self._plot.getPlotItem().removeItem(previous)
-        self._tile_items[key] = item
+        self._tile_items[key] = item  # newest at the LRU tail
+        self._evict_tiles_over_cap()
         # The request-time rescue can be undone between request and
         # arrival: pyqtgraph's auto-range (enabled until the first
         # explicit setRange) collapses a single-marker view at PAINT
-        # time, after `_update_basemap` checked it. Re-check now that
-        # imagery is actually on screen; a healthy user viewport is
-        # left untouched.
-        self._ensure_view_shows_basemap()
+        # time, after `_update_basemap` checked it. Re-fix a DEGENERATE
+        # view now that imagery is on screen — but never recentre a
+        # view the user has panned to the surroundings (M6.5-F).
+        self._ensure_view_shows_basemap(recenter_if_outside=False)
+
+    def _evict_tiles_over_cap(self) -> None:
+        """Drop the least-recently-touched tiles past the LRU cap.
+
+        Bounds the drawn-ImageItem count (rule 5/8) as pan/zoom
+        accumulate tiles; recently-viewed tiles survive a back-and-forth
+        pan, and the disk cache makes any re-fetch cheap.
+        """
+        plot_item = self._plot.getPlotItem()
+        while len(self._tile_items) > _MAX_TILE_ITEMS:
+            old_key = next(iter(self._tile_items))  # LRU front = oldest
+            plot_item.removeItem(self._tile_items.pop(old_key))
 
     @Slot(int, str)
     def _on_tile_batch_failed(self, generation: int, reason: str) -> None:
@@ -661,9 +776,9 @@ class MapWidget(QWidget):
             return
         # Honest offline state on the attribution line — the map keeps
         # working without imagery (field laptops). Clearing the memo
-        # lets the next rebuild retry instead of believing the failed
+        # lets the next refresh retry instead of believing the failed
         # batch is still on screen.
-        self._last_basemap_key = None
+        self._basemap_memo = None
         self._attribution_label.setText(f"Satellite imagery unavailable: {reason}")
 
     def _clear_tiles(self) -> None:
@@ -678,6 +793,8 @@ class MapWidget(QWidget):
         Called from MainWindow.closeEvent. Idempotent; a widget whose
         Satellite button was never toggled owns no running thread.
         """
+        self._basemap_shutdown = True
+        self._basemap_refresh_timer.stop()
         if self._tile_thread is None:
             return
         fetcher = self._tile_fetcher
@@ -719,6 +836,19 @@ class MapWidget(QWidget):
             _log.warning("map_tile_thread_join_timeout", abandoned=len(_ABANDONED))
         self._tile_fetcher = None
         self._tile_thread = None
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt override
+        """Stop the debounce timer + join the tile thread on widget close.
+
+        MainWindow joins the basemap explicitly in its own closeEvent
+        (Qt does not propagate closeEvent to docked children), so in the
+        app this is belt-and-suspenders; for a standalone widget (tests,
+        future embeds) it is the only cleanup — without it a debounce
+        tick could spawn a tile thread mid-teardown. ``shutdown_basemap``
+        is idempotent.
+        """
+        self.shutdown_basemap()
+        super().closeEvent(event)  # type: ignore[arg-type]
 
     def _spot_tip(self, x: float, y: float, data: object) -> str:
         if not isinstance(data, str):
