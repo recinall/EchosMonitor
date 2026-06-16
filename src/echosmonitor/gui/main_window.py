@@ -93,6 +93,7 @@ from echosmonitor.gui.widgets.hvsr_array_widget import HvsrArrayWidget
 from echosmonitor.gui.widgets.hvsr_widget import HvsrWidget
 from echosmonitor.gui.widgets.live_stack import LiveStack
 from echosmonitor.gui.widgets.live_tabs import LiveTabs
+from echosmonitor.gui.widgets.log_widget import LogWidget
 from echosmonitor.gui.widgets.map_widget import MapWidget
 from echosmonitor.gui.widgets.psd_widget import PsdWidget
 from echosmonitor.gui.widgets.session_toolbar import SessionToolbar
@@ -100,6 +101,7 @@ from echosmonitor.gui.widgets.spectrogram_dock import SpectrogramDock
 from echosmonitor.gui.widgets.station_browser import StationBrowser
 from echosmonitor.storage.sessions import sweep_dirty_sessions
 from echosmonitor.utils.docs import find_manual_tests
+from echosmonitor.utils.logging import QtLogSink
 
 if TYPE_CHECKING:
     import numpy as np
@@ -252,10 +254,14 @@ class MainWindow(QMainWindow):
         config: RootConfig,
         config_path: Path,
         parent: QWidget | None = None,
+        log_sink: QtLogSink | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
         self._config_path = config_path
+        # M6.6-D: the in-app Log tab's source. None (e.g. headless tests)
+        # keeps the dock a placeholder so the layout/objectName is stable.
+        self._log_sink = log_sink
 
         self.setWindowTitle("EchosMonitor")
         self.resize(_DEFAULT_WIDTH, _DEFAULT_HEIGHT)
@@ -311,6 +317,7 @@ class MainWindow(QMainWindow):
         self._live_tabs: LiveTabs | None = None
         self._live_stack: LiveStack | None = None
         self._station_browser: StationBrowser | None = None
+        self._log_widget: LogWidget | None = None
 
         # --- Focus-mode (M7 A1) state ---------------------------------
         # ``_focus_active`` gates the Esc shortcut and tells callers
@@ -734,7 +741,7 @@ class MainWindow(QMainWindow):
         )
         self._spectrogram_dock.setWidget(self._spectrogram_widget)
         self._spectrogram_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
-        self._log_dock = self._make_placeholder_dock(_DOCK_LOG)
+        self._log_dock = self._make_log_dock()
 
         self._apply_dock_minimum_sizes()
         self._install_title_bars()
@@ -788,6 +795,23 @@ class MainWindow(QMainWindow):
         body = QLabel(f"{name} (placeholder)")
         body.setAlignment(Qt.AlignmentFlag.AlignCenter)
         dock.setWidget(body)
+        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        return dock
+
+    def _make_log_dock(self) -> QDockWidget:
+        """The Log tab dock (M6.6-D).
+
+        Same identity (``windowTitle``/``objectName``) as the prior
+        placeholder so saved QSettings layouts and dock tests keep working;
+        only the body changes. With no sink (headless tests) it degrades to
+        the placeholder body.
+        """
+        if self._log_sink is None:
+            return self._make_placeholder_dock(_DOCK_LOG)
+        dock = QDockWidget(_DOCK_LOG, self)
+        dock.setObjectName(f"Dock_{_DOCK_LOG}")
+        self._log_widget = LogWidget(self._log_sink, parent=dock)
+        dock.setWidget(self._log_widget)
         dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         return dock
 

@@ -24,7 +24,7 @@ from echosmonitor.config.loader import user_config_path
 from echosmonitor.core.firstrun import is_first_run
 from echosmonitor.gui.dialogs.first_run_wizard import FirstRunWizard
 from echosmonitor.gui.main_window import MainWindow
-from echosmonitor.utils.logging import configure_logging
+from echosmonitor.utils.logging import configure_logging, install_gui_log_sink
 
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
@@ -65,6 +65,10 @@ def main(argv: list[str] | None = None) -> int:
     log_level = args.log_level or cfg.app.log_level
     log_json = cfg.app.log_json if args.log_json is None else args.log_json
     configure_logging(level=log_level, json_output=log_json)
+    # M6.6-D: in-app Log tab sink. Installed right after configure_logging
+    # so worker- and GUI-thread logs from here on feed the tab; it buffers
+    # into a bounded deque until MainWindow's LogWidget connects + prefills.
+    log_sink = install_gui_log_sink(max_lines=cfg.app.log_max_lines)
 
     log = structlog.get_logger(__name__)
     log.info("config_loaded", path=str(cfg_path), devices=len(cfg.devices))
@@ -88,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     sigint_keepalive.start(200)
     sigint_keepalive.timeout.connect(lambda: None)
 
-    window = MainWindow(cfg, cfg_path)
+    window = MainWindow(cfg, cfg_path, log_sink=log_sink)
 
     # M4 stage C — first-run wizard. Detection is "no user config file
     # on disk AND zero devices in the loaded config" (see

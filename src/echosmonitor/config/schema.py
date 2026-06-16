@@ -33,6 +33,9 @@ class AppConfig(_Base):
     # Per-device ``archive.root_dir`` overrides this when set; this field is
     # the default applied to every device whose ``archive.root_dir`` is null.
     archive_root: Path | None = None
+    # M6.6-D: max lines retained by the in-app Log tab's bounded buffer
+    # (drop-oldest). Caps both the sink deque and the view's block count.
+    log_max_lines: Annotated[int, Field(ge=1, le=100000)] = 1000
 
 
 class UiConfig(_Base):

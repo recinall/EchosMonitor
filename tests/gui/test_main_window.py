@@ -70,6 +70,40 @@ def test_main_window_smoke(qtbot: QtBot) -> None:
     window.close()
 
 
+def test_main_window_log_dock_drives_record_end_to_end(qtbot: QtBot) -> None:
+    """M6.6-D: with a sink, the Log dock holds a live LogWidget that a
+    worker-thread log reaches via the queued bridge, and the dock keeps its
+    identity (windowTitle/objectName) so saved layouts still apply."""
+    import logging
+    import threading
+
+    from echosmonitor.utils.logging import QtLogSink
+
+    sink = QtLogSink(max_lines=50)
+    cfg, _ = load_config(None)
+    window = MainWindow(cfg, Path("/tmp/cfg.yaml"), log_sink=sink)
+    qtbot.addWidget(window)
+
+    log_dock = window.findChild(QDockWidget, "Dock_Log")
+    assert log_dock is not None
+    assert log_dock.windowTitle() == "Log"
+
+    logger = logging.getLogger("test.m66d.mainwindow")
+    logger.handlers = [sink]
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    marker = "mainwindow_log_dock_marker"
+    thread = threading.Thread(target=lambda: logger.warning(marker))
+    with qtbot.waitSignal(sink.bridge.recordReady, timeout=2000):
+        thread.start()
+    thread.join()
+    assert window._log_widget is not None
+    qtbot.waitUntil(lambda: marker in window._log_widget._view.toPlainText(), timeout=2000)
+
+    window.close()
+
+
 def _detection(t_on: str, t_off: str | None = None) -> Detection:
     return Detection(
         device="dev",

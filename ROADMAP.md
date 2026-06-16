@@ -1180,7 +1180,18 @@ designed together).
       (`last_packet` on diagnostics). Skills: `echos-rest-api` +
       `qt-worker-threading`. qt-concurrency-auditor REQUIRED.
 
-- [ ] **D. Implement the Log tab (currently a placeholder).** The
+- [x] **D. Implement the Log tab (currently a placeholder).** DONE
+      2026-06-16: `utils/logging.py` gains `QtLogSink` (bounded
+      `deque(maxlen)` under a lock, `Signal(object)` bridge,
+      `install_gui_log_sink`); new `gui/widgets/log_widget.py` (level
+      filter, autoscroll, pause, clear, copy, atomic export via new
+      `storage/log_export.py`); `__main__` installs the sink and hands it
+      to MainWindow; `app.log_max_lines` knob (default 1000). Tests:
+      `tests/utils/test_logging.py`, `tests/gui/test_log_widget.py`,
+      `tests/storage/test_log_export.py`, schema bounds + a MainWindow
+      end-to-end record from a worker thread. qt-concurrency-auditor PASS,
+      code-reviewer APPROVE (after routing the export through storage/ +
+      QMessageBox on failure). Original plan follows. ▸ The
       bottom dock's Log tab is `_make_placeholder_dock(_DOCK_LOG)` — a
       centered QLabel (`main_window.py:737,785-792`). Logging is
       structlog→stdlib with a SINGLE `StreamHandler(sys.stderr)`

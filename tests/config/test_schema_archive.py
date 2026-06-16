@@ -91,6 +91,21 @@ def test_app_config_archive_root_accepts_path() -> None:
     assert app.archive_root == Path("/tmp/archive")
 
 
+def test_app_config_log_max_lines_default() -> None:
+    """M6.6-D: the Log tab buffer cap defaults to 1000 lines."""
+    assert AppConfig().log_max_lines == 1000
+
+
+def test_app_config_log_max_lines_bounds() -> None:
+    """ge=1, le=100000: zero/negative and absurd values are rejected."""
+    assert AppConfig(log_max_lines=1).log_max_lines == 1
+    assert AppConfig(log_max_lines=100000).log_max_lines == 100000
+    with pytest.raises(ValidationError):
+        AppConfig(log_max_lines=0)
+    with pytest.raises(ValidationError):
+        AppConfig(log_max_lines=100001)
+
+
 def test_device_config_archive_default_factory() -> None:
     """Every DeviceConfig has its own ArchiveConfig instance, defaulted."""
     dev = DeviceConfig(name="x", host="example.com")
