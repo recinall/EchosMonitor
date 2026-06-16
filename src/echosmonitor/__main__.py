@@ -15,7 +15,7 @@ from pathlib import Path
 
 import qasync
 import structlog
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 
 from echosmonitor import __version__
@@ -84,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
 
     app = QApplication.instance() or QApplication(sys.argv)
     assert isinstance(app, QApplication)
+    # Settings are an INI FILE on every OS, never the Windows registry: this
+    # governs the no-argument QSettings() calls (e.g. live_stack); the explicit
+    # window/layout store goes through gui.qsettings_util.open_settings, which
+    # passes IniFormat directly. Portable + redirectable in tests (M7-C).
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     # M7-A: window/taskbar branding. app_icon() never raises — a missing
     # resource just yields an empty icon and the app launches unbranded.
     from echosmonitor.gui.resources import app_icon

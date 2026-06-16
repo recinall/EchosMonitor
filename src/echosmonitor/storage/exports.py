@@ -69,7 +69,11 @@ def write_window_mseed(stream: Stream, path: Path) -> int:
     tmp = _atomic_tmp(path)
     try:
         contiguous.write(str(tmp), format="MSEED")
-        with open(tmp, "rb") as fh:
+        # Reopen writable ("rb+", not "rb"): obspy wrote+closed the file, and
+        # on Windows os.fsync (FlushFileBuffers) raises EBADF on a read-only
+        # fd. "rb+" gives a writable handle without truncating; POSIX is happy
+        # too. The file always exists here (just written).
+        with open(tmp, "rb+") as fh:
             os.fsync(fh.fileno())
         n_bytes = tmp.stat().st_size
         os.replace(tmp, path)

@@ -539,7 +539,10 @@ def write_hvsr_array_pdf(
                 station_ctx = _station_ctx(ctx, device)
                 _pdf_page_plots(plt, pdf, r, station_ctx)
                 _pdf_page_numbers(plt, pdf, r, station_ctx)
-        with tmp.open("rb") as fh:
+        # Reopen writable ("rb+", not "rb"): matplotlib wrote+closed the PDF,
+        # and on Windows os.fsync (FlushFileBuffers) raises EBADF on a
+        # read-only fd. "rb+" gives a writable handle without truncating.
+        with tmp.open("rb+") as fh:
             os.fsync(fh.fileno())
         os.replace(tmp, path)
     except BaseException:

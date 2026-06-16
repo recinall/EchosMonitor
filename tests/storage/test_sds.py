@@ -78,7 +78,11 @@ def test_sds_path_year_boundary() -> None:
         UTCDateTime("2024-12-31T23:59:59.999"),
         StreamID("IU", "ANMO", "00", "BHZ"),
     )
-    assert "/2024/" in str(p)
+    # Assert on path components, not a separator-literal string: on Windows
+    # ``str(p)`` uses backslashes, so ``"/2024/"`` would spuriously fail
+    # (the SDS layout itself is unchanged — separators are not stored in any
+    # segment name, so a Windows-written tree is readable on POSIX and back).
+    assert "2024" in p.parts
     assert p.name.endswith(".2024.366")  # 2024 is a leap year
 
 

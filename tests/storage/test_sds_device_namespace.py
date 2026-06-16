@@ -138,9 +138,11 @@ def test_two_devices_same_nslc_write_distinct_files(qapp: Any, tmp_path: Path) -
     assert path_a != path_b
     assert path_a.exists()
     assert path_b.exists()
-    # Each lives under its OWN device_sds_root subtree.
-    assert str(path_a).startswith(str(device_sds_root(base, _DEVICE_A)) + "/")
-    assert str(path_b).startswith(str(device_sds_root(base, _DEVICE_B)) + "/")
+    # Each lives under its OWN device_sds_root subtree (``in .parents`` is
+    # OS-agnostic; a ``startswith(... + "/")`` string check fails on Windows
+    # where the separator is a backslash).
+    assert device_sds_root(base, _DEVICE_A) in path_a.parents
+    assert device_sds_root(base, _DEVICE_B) in path_b.parents
     # The leaf SDS filenames are identical (same NSLC) — only the device
     # segment disambiguates them.
     assert path_a.name == path_b.name
