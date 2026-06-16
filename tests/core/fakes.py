@@ -27,6 +27,7 @@ import io
 import logging
 import socket
 import struct
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -203,7 +204,10 @@ class FakeSeedLinkServer:
         leaves an `EasySeedLinkClient` in a 0-byte recv loop indefinitely
         until its 120 s network timeout fires.
         """
-        linger_off = struct.pack("ii", 1, 0)
+        # ``struct linger`` is two ints on POSIX but two u_shorts on Windows;
+        # packing "ii" (8 bytes) on Windows makes setsockopt fail with EINVAL
+        # (suppressed below) → no RST → the worker never sees the disconnect.
+        linger_off = struct.pack("HH", 1, 0) if sys.platform == "win32" else struct.pack("ii", 1, 0)
         for session in list(self._sessions):
             transport = session.writer.transport
             sock = transport.get_extra_info("socket")

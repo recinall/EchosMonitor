@@ -81,6 +81,7 @@ from echosmonitor.core.session import resolve_base_archive_root
 from echosmonitor.core.streaming_engine import StreamingEngine
 from echosmonitor.gui.dialogs.first_run_wizard import FirstRunWizard
 from echosmonitor.gui.dialogs.shortcuts_dialog import ShortcutsDialog
+from echosmonitor.gui.qsettings_util import open_settings
 from echosmonitor.gui.widgets.archive_tab import ArchiveTab
 from echosmonitor.gui.widgets.detection_detail import (
     NO_RESPONSE_TOOLTIP,
@@ -2603,11 +2604,11 @@ class MainWindow(QMainWindow):
     # Persistence / lifecycle
     # ------------------------------------------------------------------
     def _settings(self) -> QSettings:
-        return QSettings(_ORG_NAME, _APP_NAME)
+        return open_settings(_ORG_NAME, _APP_NAME)
 
     def _restore_state(self) -> None:
         settings = self._settings()
-        if not settings.allKeys() and QSettings(_LEGACY_ORG_NAME, _LEGACY_APP_NAME).allKeys():
+        if not settings.allKeys() and open_settings(_LEGACY_ORG_NAME, _LEGACY_APP_NAME).allKeys():
             _log.info(
                 "qsettings_reset_after_rename",
                 legacy_org=_LEGACY_ORG_NAME,

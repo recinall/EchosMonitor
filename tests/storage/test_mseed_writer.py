@@ -399,6 +399,59 @@ def test_int64_overflow_emits_write_failed(writer_factory: Any, tmp_path: Path) 
     assert "encoding error" in reason
 
 
+def test_int32_canonicalization_targets_obspy_sampletype_key() -> None:
+    """The dtype class we canonicalise int32 samples to is the one obspy maps.
+
+    Regression for the Windows ``KeyError(<class 'numpy.intc'>)``: an
+    int32-WIDTH array can carry a scalar class (``np.intc``) that is ``==``
+    by dtype yet absent from obspy's ``SAMPLETYPE`` map, so ``_write_mseed``
+    KeyErrors. ``_encode`` ``.view(np.int32)``s such data; this pins that
+    (a) our target class is exactly obspy's key, and (b) a ``.view(np.int32)``
+    yields it — so an obspy reshuffle of that map fails the gate loudly
+    (the M6.5-C private-binding-pin discipline).
+    """
+    from obspy.io.mseed.headers import SAMPLETYPE
+
+    from echosmonitor.storage.mseed_writer import _OBSPY_INT32_TYPE
+
+    assert _OBSPY_INT32_TYPE in SAMPLETYPE
+    assert np.arange(8, dtype=np.int32).view(np.int32).dtype.type is _OBSPY_INT32_TYPE
+
+
+def test_uint16_round_trips_via_int32_steim2(writer_factory: Any, tmp_path: Path) -> None:
+    """Unsigned samples (the ``kind=='u'`` encode branch) cast to int32.
+
+    uint16 is always within int32 range, so it round-trips through STEIM2
+    with values preserved — exercising the width/kind-change branch that the
+    Windows-intc fix split out from the hot path.
+    """
+    writer = writer_factory(encoding="STEIM2")
+    starttime = UTCDateTime("2026-05-09T12:00:00")
+    nslc = "IU.ANMO.00.BHZ"
+    net, sta, loc, cha = nslc.split(".")
+    samples = (np.arange(512, dtype=np.uint16) * 3) % 65500
+    trace = Trace(
+        data=samples,
+        header={
+            "network": net,
+            "station": sta,
+            "location": loc,
+            "channel": cha,
+            "starttime": starttime,
+            "sampling_rate": 100.0,
+        },
+    )
+    writer.write_trace(nslc, trace)
+    writer.close_all()
+
+    assert writer._test_failed == []
+    assert len(writer._test_ok) == 1
+    assert writer._test_ok[0][5] == "STEIM2"
+    path = sds_path(_expected_root(tmp_path), starttime, StreamID(net, sta, loc, cha))
+    rt = read(str(path))[0]
+    np.testing.assert_array_equal(rt.data.astype(np.int64), samples.astype(np.int64))
+
+
 # ---------------------------------------------------------------------------
 # flushedFile signal (for stage B's DAO)
 # ---------------------------------------------------------------------------

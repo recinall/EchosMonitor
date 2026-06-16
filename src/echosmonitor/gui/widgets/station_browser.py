@@ -70,6 +70,7 @@ from echosmonitor.config.schema import (
 )
 from echosmonitor.core.exceptions import ConfigError
 from echosmonitor.core.models import ConnState
+from echosmonitor.gui.qsettings_util import open_settings
 
 if TYPE_CHECKING:
     from PySide6.QtGui import QCloseEvent
@@ -599,7 +600,7 @@ class StationBrowser(QWidget):
             by_network: dict[str, list[StationInfo]] = {}
             for sta in stations:
                 by_network.setdefault(sta.network, []).append(sta)
-            settings = QSettings(_ORG_NAME, _APP_NAME)
+            settings = open_settings(_ORG_NAME, _APP_NAME)
             saved_expanded_raw = settings.value(_SETTINGS_EXPANDED, "")
             saved_last_device = settings.value(_SETTINGS_LAST_DEVICE, "")
             saved_expanded = (
@@ -945,7 +946,7 @@ class StationBrowser(QWidget):
     # Persistence
     # ------------------------------------------------------------------
     def _settings(self) -> QSettings:
-        return QSettings(_ORG_NAME, _APP_NAME)
+        return open_settings(_ORG_NAME, _APP_NAME)
 
     def _restore_settings(self) -> None:
         settings = self._settings()

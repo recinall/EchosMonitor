@@ -22,6 +22,11 @@ from echosmonitor.core.models import ConnState, StreamSelector
 from echosmonitor.core.seedlink_worker import SeedLinkWorker
 from tests.core.fakes import FakeSeedLinkServer, FakeSeedLinkServerConfig
 
+# Worker/thread pairs whose bounded join timed out at shutdown. Held for the
+# rest of the process so a still-running QThread is never garbage-collected
+# (a "QThread destroyed while running" abort) — see `_WorkerHarness.shutdown`.
+_ABANDONED_THREADS: list[tuple[QThread, SeedLinkWorker]] = []
+
 
 # ----------------------------------------------------------------------
 # Async loop / fake-server fixtures
@@ -36,7 +41,12 @@ class _LoopThread:
 
     def start(self) -> None:
         def _run() -> None:
-            self.loop = asyncio.new_event_loop()
+            # Force a SelectorEventLoop. On Windows the default is the
+            # ProactorEventLoop, where transport.get_extra_info("socket")
+            # does not expose the raw socket the way inject_disconnect()
+            # needs to set SO_LINGER and force a TCP RST — so the worker
+            # never sees the server-side disconnect (the reconnect test).
+            self.loop = asyncio.SelectorEventLoop()
             asyncio.set_event_loop(self.loop)
             self._ready.set()
             self.loop.run_forever()
@@ -120,7 +130,18 @@ class _WorkerHarness(QObject):
         t0 = time.monotonic()
         self.worker.stop()
         self.thread.quit()
-        self.thread.wait(int(deadline_s * 1000))
+        finished = self.thread.wait(int(deadline_s * 1000))
+        if not finished:
+            # The join timed out — obspy's blocking recv has not unwound yet
+            # (seen on macOS loopback, where stop()'s socket-close takes
+            # longer to surface). Dropping the last reference to a RUNNING
+            # QThread is a hard Qt abort ("destroyed while running") that
+            # crashes the whole interpreter — and it crashed a LATER test's
+            # GC, not this one. Retain the pair so it is never GC'd while
+            # running (the same precaution the HVSR engines take on a
+            # timed-out join — see the M6-0 decision-log entry). The thread
+            # finishes on its own once the fake_server fixture tears down.
+            _ABANDONED_THREADS.append((self.thread, self.worker))
         return time.monotonic() - t0
 
     def wait_until(self, predicate: object, timeout_s: float, qtbot: object) -> bool:

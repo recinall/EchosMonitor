@@ -92,6 +92,20 @@ _SLOW_IO_WARN_MS: float = 1000.0
 _SLOW_IO_THRESHOLD = 3
 _PAUSE_DURATION_S: float = 30.0
 
+# The scalar-type class obspy's ``SAMPLETYPE`` map (obspy.io.mseed.headers)
+# keys on for 32-bit integer samples — built the same way, ``np.dtype(
+# np.int32).type``. On most platforms this *is* ``np.int32``, but on Windows
+# an int32-WIDTH array can carry a different scalar class (``np.intc``) that is
+# ``==``-equal by dtype yet absent from obspy's map, so ``_write_mseed``
+# raises ``KeyError(<class 'numpy.intc'>)``. We canonicalise to this exact
+# class before handing data to obspy (see :meth:`MseedWriter._encode`).
+_OBSPY_INT32_TYPE = np.dtype(np.int32).type
+
+# Open flag forcing binary (untranslated) I/O. On Windows os.open defaults to
+# TEXT mode, which mangles 0x0A bytes in the binary MiniSEED stream; this flag
+# is Windows-only (0 elsewhere), so the OR is a no-op on POSIX.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 _log = structlog.get_logger(__name__)
 
 
@@ -430,14 +444,27 @@ class MseedWriter(QObject):
             if kind in ("i", "u"):
                 # STEIM requires int32. Cast carefully: int64 may
                 # overflow; uint may exceed int32 range.
-                if data.dtype != np.int32:
+                if kind == "i" and data.dtype.itemsize == 4:
+                    # Already int32-width and in range by construction. The
+                    # only thing that can be wrong is the platform scalar-type
+                    # class (Windows ``intc`` vs the ``int32`` obspy keys on):
+                    # canonicalise with a zero-copy ``.view`` *only* when it
+                    # actually differs, so the M6.5-C no-copy hot path
+                    # (``data is trace.data``) survives where it already
+                    # matches (Linux/macOS).
+                    if data.dtype.type is not _OBSPY_INT32_TYPE:
+                        data = data.view(np.int32)
+                else:
+                    # Real width/kind change (int8/16, any uint, int64): a
+                    # range-checked copy. ``astype`` produces the canonical
+                    # ``np.dtype(np.int32)``, so its ``.type`` matches obspy.
                     info = np.iinfo(np.int32)
                     if data.min() < info.min or data.max() > info.max:
                         raise _EncodingError(
                             f"int{data.dtype.itemsize * 8} sample value "
                             f"out of int32 range; cannot encode as {configured}"
                         )
-                    data = data.astype(np.int32, copy=False)
+                    data = data.astype(np.int32)
                 chosen = configured
             elif kind == "f":
                 # Float data cannot be STEIM-encoded; fall back to
@@ -513,7 +540,11 @@ class MseedWriter(QObject):
             self._validate_or_truncate(path)
             self._validated_paths.add(path)
 
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        # ``_O_BINARY`` is mandatory on Windows: without it os.open uses TEXT
+        # mode and translates every 0x0A byte in the binary MiniSEED to
+        # 0x0D 0x0A on write, corrupting record alignment (obspy then reads
+        # "Not a SEED record"). It is 0 on POSIX, so this is a no-op there.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o644)
         self._open_files[path] = fd
         return fd
 

@@ -72,14 +72,20 @@ def test_dock_contents_have_minimum_sizes(
 ) -> None:
     window = _build_window(qtbot)
 
+    # ``>=`` not ``==``: the code sets these as the design FLOOR, but a
+    # widget's effective minimum can be driven larger by its own content
+    # (child size hints with wider fonts — notably on Windows/macOS, where
+    # the exact value is 282 vs the 220 floor). The contract under test is
+    # "the dock is never smaller than the floor", which ``>=`` captures
+    # portably; a removed floor still fails on the tightest-font platform.
     assert window._device_panel is not None
-    assert window._device_panel.minimumWidth() == _SIDE_DOCK_MIN_WIDTH_PX
+    assert window._device_panel.minimumWidth() >= _SIDE_DOCK_MIN_WIDTH_PX
     assert window._station_browser is not None
-    assert window._station_browser.minimumWidth() == _SIDE_DOCK_MIN_WIDTH_PX
+    assert window._station_browser.minimumWidth() >= _SIDE_DOCK_MIN_WIDTH_PX
     assert window._live_tabs is not None
-    assert window._live_tabs.minimumHeight() == _LIVE_MIN_HEIGHT_PX
-    assert window._spectrogram_widget.minimumHeight() == _SPECTROGRAM_MIN_HEIGHT_PX
-    assert window._psd_widget.minimumWidth() == _PSD_MIN_WIDTH_PX
+    assert window._live_tabs.minimumHeight() >= _LIVE_MIN_HEIGHT_PX
+    assert window._spectrogram_widget.minimumHeight() >= _SPECTROGRAM_MIN_HEIGHT_PX
+    assert window._psd_widget.minimumWidth() >= _PSD_MIN_WIDTH_PX
 
     window.close()
 

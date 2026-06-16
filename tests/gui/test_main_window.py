@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from obspy import UTCDateTime
-from PySide6.QtCore import QByteArray, QSettings
+from PySide6.QtCore import QByteArray
 from PySide6.QtWidgets import QDockWidget, QLabel, QTabWidget, QToolBar
 from pytestqt.qtbot import QtBot
 
@@ -23,6 +23,7 @@ from echosmonitor.config.schema import (
 from echosmonitor.core.models import AcquisitionState, Detection
 from echosmonitor.gui import main_window as main_window_mod
 from echosmonitor.gui.main_window import MainWindow
+from echosmonitor.gui.qsettings_util import open_settings
 
 
 def _root_cfg(devices: list[DeviceConfig]) -> RootConfig:
@@ -153,10 +154,11 @@ def test_central_minimum_width_stays_bounded(qtbot: QtBot) -> None:
     cfg, _ = load_config(None)
     window = MainWindow(cfg, Path("/tmp/cfg.yaml"))
     qtbot.addWidget(window)
-    try:
-        long_det = Detection(
-            device="a-very-long-device-name-for-the-title-bar",
-            nslc="XX.LONGSTATION.00.HHZ",
+
+    def _det(device: str, nslc: str) -> Detection:
+        return Detection(
+            device=device,
+            nslc=nslc,
             kind="sta_lta",
             t_on=UTCDateTime("2026-06-01T00:00:30"),
             t_off=UTCDateTime("2026-06-01T00:09:33"),
@@ -164,19 +166,36 @@ def test_central_minimum_width_stays_bounded(qtbot: QtBot) -> None:
             detected_at=UTCDateTime("2026-06-01T00:00:30"),
             meta={"sta_s": 1.0, "lta_s": 10.0},
         )
+
+    try:
         latest = UTCDateTime("2026-06-01T00:10:00")
         samples = np.random.default_rng(1).standard_normal(6000).astype(np.float32)
-        window._detail_pane.show_detection(long_det, samples, 100.0, latest)
-        qtbot.wait(10)
 
-        assert window._central_tabs.minimumSizeHint().width() < 400
+        # Baseline with a SHORT title. The absolute minimum is platform/font
+        # dependent (Linux ≈ 350, Windows ≈ 570), so assert the *relative*
+        # property the regression is about: a pathological title must not
+        # inflate the minimum (it is elided), and a hidden tab must not feed
+        # its size hint into the aggregate (the old QStackedWidget MAX trap).
+        window._detail_pane.show_detection(_det("dev", "XX.STA.00.HHZ"), samples, 100.0, latest)
+        qtbot.wait(10)
+        base = window._central_tabs.minimumSizeHint().width()
+
+        window._detail_pane.show_detection(
+            _det("a-very-long-device-name-for-the-title-bar", "XX.LONGSTATION.00.HHZ"),
+            samples,
+            100.0,
+            latest,
+        )
+        qtbot.wait(10)
+        assert window._central_tabs.minimumSizeHint().width() == base
+
         # Switching to PSD and back must not let any page inflate the
         # aggregate minimum.
         window._central_tabs.setCurrentWidget(window._psd_widget)
         qtbot.wait(10)
         window._central_tabs.setCurrentWidget(window._detections_splitter)
         qtbot.wait(10)
-        assert window._central_tabs.minimumSizeHint().width() < 400
+        assert window._central_tabs.minimumSizeHint().width() == base
     finally:
         window.close()
 
@@ -187,7 +206,9 @@ def _seed_legacy_qsettings() -> None:
     The autouse ``_redirect_qsettings`` fixture routes both org/app pairs
     into the per-test tmp dir, so this never touches the user's machine.
     """
-    legacy = QSettings(main_window_mod._LEGACY_ORG_NAME, main_window_mod._LEGACY_APP_NAME)
+    # Seed via the same IniFormat helper the app reads with — NativeFormat
+    # would be the Windows registry, which the redirect fixture cannot reach.
+    legacy = open_settings(main_window_mod._LEGACY_ORG_NAME, main_window_mod._LEGACY_APP_NAME)
     legacy.setValue("windowState", QByteArray(b"stale-pre-rename-blob"))
     legacy.sync()
 
@@ -241,7 +262,7 @@ def test_qsettings_reset_log_is_one_time(
     first = MainWindow(_root_cfg([]), Path("/tmp/cfg.yaml"))
     qtbot.addWidget(first)
     first.close()  # closeEvent persists geometry/windowState to the new store
-    assert QSettings(main_window_mod._ORG_NAME, main_window_mod._APP_NAME).allKeys()
+    assert open_settings(main_window_mod._ORG_NAME, main_window_mod._APP_NAME).allKeys()
 
     second = MainWindow(_root_cfg([]), Path("/tmp/cfg.yaml"))
     qtbot.addWidget(second)

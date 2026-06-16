@@ -359,6 +359,14 @@ class StreamingEngine(QObject):
         self._chain_max_q = max(1, self._refresh_hz * _CHAIN_QUEUE_FACTOR)
         self._threads: dict[str, QThread] = {}
         self._workers: dict[str, SeedLinkWorker] = {}
+        # (QThread, SeedLinkWorker) pairs whose bounded join timed out during
+        # teardown — held for the engine's lifetime so the still-running
+        # QThread is never garbage-collected (a hard "QThread: Destroyed while
+        # thread is still running" abort). This mirrors the HVSR engines'
+        # abandoned-thread retention (M6-0 decision log). Seen on macOS, where
+        # obspy's blocking recv can outlive the stop() deadline; the thread
+        # finishes on its own once the socket finally unwinds.
+        self._abandoned_threads: list[tuple[QThread, SeedLinkWorker]] = []
         self._bridges: dict[str, _DeviceBridge] = {}
         # Per-stream state is keyed by ``device_stream_key(device, nslc)``
         # so two devices with overlapping NSLC remain independent. The
@@ -1117,6 +1125,7 @@ class StreamingEngine(QObject):
         # dispatches strictly after those queued ``write_trace`` events,
         # so everything in flight reaches disk before the writer closes.
         self._flush_timer.stop()
+        self._drain_abandoned_threads()
         # Phase 1: stop every worker. ``worker.stop()`` blocks until
         # ``run()`` has fully unwound (capped internally at 2 s); we
         # run all of them concurrently on helper threads so the engine
@@ -1165,6 +1174,11 @@ class StreamingEngine(QObject):
         for name, thread in self._threads.items():
             if not thread.wait(_THREAD_JOIN_MS):
                 _log.warning("streaming_engine_thread_join_timeout", device=name)
+                # Retain the still-running pair so the `_threads.clear()` below
+                # cannot drop its last reference and trigger a Qt abort.
+                stuck_worker = self._workers.get(name)
+                if stuck_worker is not None:
+                    self._abandon_worker_thread(name, stuck_worker, thread)
 
         # Stop the DSP thread. Both ``_clearChainsRequested`` and
         # ``_clearSpectrogramsRequested`` are wired with
@@ -1958,6 +1972,60 @@ class StreamingEngine(QObject):
         status.since_first_attempt_at = diag.since_first_attempt_at
         status.last_failure_detail = diag.last_failure_detail
 
+    def _abandon_worker_thread(
+        self, name: str, worker: SeedLinkWorker, thread: QThread
+    ) -> None:
+        """Sever then retain a worker/thread pair whose bounded join timed out.
+
+        Mirrors ``HvsrEngine._disconnect_worker`` + the abandoned-thread
+        retention (M6-0 decision log). The worker may still be parked in
+        obspy's blocking ``recv`` (seen on macOS); severing its outbound
+        signals from the bridge guarantees a late in-flight emit can never
+        reach a soon-to-be-torn-down slot, and keeping the Python reference
+        stops a later GC from destroying a still-running ``QThread`` (a hard
+        "QThread: Destroyed while thread is still running" abort). The pair is
+        re-joined and reclaimed by ``_drain_abandoned_threads`` on a later
+        ``stop()`` once the socket finally unwinds.
+        """
+        worker._stop = True
+        bridge = self._bridges.get(name)
+        if bridge is not None:
+            for signal, slot in (
+                (worker.packetReceived, bridge._fwd_packet),
+                (worker.stateChanged, bridge._fwd_state),
+                (worker.errorOccurred, bridge._fwd_error),
+                (worker.statsUpdated, bridge._fwd_stats),
+                (worker.diagnosticsUpdated, bridge._fwd_diagnostics),
+            ):
+                with contextlib.suppress(RuntimeError, TypeError):
+                    signal.disconnect(slot)
+        self._abandoned_threads.append((thread, worker))
+
+    def _drain_abandoned_threads(self) -> None:
+        """Re-join previously abandoned threads; reclaim the finished ones.
+
+        A pair lands in ``_abandoned_threads`` when its join timed out (obspy
+        recv slow to unwind on macOS); by a later ``stop()`` the socket has
+        usually closed and the thread finished, so a bounded re-join reclaims
+        it. Still-running pairs stay REFERENCED — dropping the last reference
+        to a running ``QThread`` aborts. Mirrors ``HvsrEngine.shutdown``'s
+        drain; the retained count is logged per rule 5.
+        """
+        if not self._abandoned_threads:
+            return
+        still_running: list[tuple[QThread, SeedLinkWorker]] = []
+        for thread, worker in self._abandoned_threads:
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(_THREAD_JOIN_MS):
+                    still_running.append((thread, worker))
+        self._abandoned_threads = still_running
+        if self._abandoned_threads:
+            _log.warning(
+                "streaming_engine_abandoned_threads_retained",
+                abandoned=len(self._abandoned_threads),
+            )
+
     # ------------------------------------------------------------------
     # Internal device lifecycle (selective stop/start) — wired from
     # tests today; M3 part 2 exposes a public surface on top of this.
@@ -1984,6 +2052,10 @@ class StreamingEngine(QObject):
             thread.quit()
             if not thread.wait(_THREAD_JOIN_MS):
                 _log.warning("streaming_engine_thread_join_timeout", device=name)
+                # Retain the still-running pair so the pops below cannot drop
+                # its last reference and trigger a Qt abort (see stop()).
+                if worker is not None:
+                    self._abandon_worker_thread(name, worker, thread)
         if bridge is not None:
             for signal in (
                 bridge.packetReceivedNamed,
