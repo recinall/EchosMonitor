@@ -41,6 +41,13 @@ def main() -> None:
     master.resize(_ICNS_SIZE, Image.LANCZOS).save(icns_path, format="ICNS")
     print(f"wrote {icns_path} ({icns_path.stat().st_size} bytes)")
 
+    # 256x256 PNG for the Linux AppImage / hicolor theme — committed so the
+    # AppImage build script needs no Pillow at package time (the GitHub runner's
+    # system python has none).
+    png256_path = _OUT / "EchosMonitor-256.png"
+    master.resize((256, 256), Image.LANCZOS).save(png256_path, format="PNG")
+    print(f"wrote {png256_path} ({png256_path.stat().st_size} bytes)")
+
 
 if __name__ == "__main__":
     main()

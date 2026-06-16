@@ -23,14 +23,10 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 # The whole one-dir bundle goes under usr/bin (exe + _internal next to it).
 cp -a "$BUNDLE"/. "$APPDIR/usr/bin/"
 
-# Icon: 256x256 PNG at the AppDir root (appimagetool reads it) + the hicolor
-# theme path the .desktop Icon= key resolves against.
-ICON_SRC="src/echosmonitor/resources/EchosMonitor.png"
-python3 - "$ICON_SRC" "$APPDIR/echosmonitor.png" <<'PY'
-import sys
-from PIL import Image
-Image.open(sys.argv[1]).convert("RGBA").resize((256, 256), Image.LANCZOS).save(sys.argv[2])
-PY
+# Icon: the committed 256x256 PNG at the AppDir root (appimagetool reads it) +
+# the hicolor theme path the .desktop Icon= key resolves against. Pre-generated
+# by packaging/make_icons.py so no Pillow is needed at package time.
+cp packaging/icons/EchosMonitor-256.png "$APPDIR/echosmonitor.png"
 cp "$APPDIR/echosmonitor.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/echosmonitor.png"
 
 cat > "$APPDIR/echosmonitor.desktop" <<EOF
