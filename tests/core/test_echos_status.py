@@ -36,6 +36,7 @@ class _Trigger(QObject):
     queued, exactly as the GUI's ``_echosTargetsChanged`` signal does."""
 
     configureRequested = Signal(object)  # noqa: N815
+    fetchRequested = Signal(object)  # noqa: N815 — StationXML one-shot (M6.6-B)
 
 
 class _HangingTransport(httpx.AsyncBaseTransport):
@@ -82,6 +83,9 @@ def _spawn(qtbot: Any, factory: Any) -> tuple[EchosStatusWorker, QThread, _Trigg
     trigger = _Trigger()
     trigger.configureRequested.connect(
         worker.configure, type=Qt.ConnectionType.QueuedConnection
+    )
+    trigger.fetchRequested.connect(
+        worker.fetch_stationxml, type=Qt.ConnectionType.QueuedConnection
     )
     thread.start()
     qtbot.waitUntil(thread.isRunning, timeout=1000)
@@ -239,5 +243,63 @@ def test_stopped_worker_emits_nothing(qtbot: Any) -> None:
         qtbot.wait(700)  # > one scheduler tick
         assert emitted == []
         assert fw.requests == []
+    finally:
+        _shutdown(worker, thread)
+
+
+class _StationXmlErrorTransport(httpx.AsyncBaseTransport):
+    """Answers /api/stationxml with a 500 so the fetch helper returns None."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+
+def test_stationxml_fetch_crosses_thread(qtbot: Any) -> None:
+    """M6.6-B: a one-shot fetch returns the device XML on the GUI thread."""
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        with qtbot.waitSignal(worker.stationXmlReady, timeout=_SNAPSHOT_DEADLINE_MS) as blocker:
+            trigger.fetchRequested.emit((_target(),))
+        device, xml = blocker.args
+        assert device == "echos-field-01"
+        assert isinstance(xml, str)
+        assert "FDSNStationXML" in xml
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_stationxml_fetch_failure_emits_none(qtbot: Any) -> None:
+    """A transport error degrades to None (graceful) without raising."""
+
+    def factory(target: EchosPollTarget) -> EchosApiClient:
+        return EchosApiClient(
+            target.host,
+            target.http_port,
+            transport=_StationXmlErrorTransport(),
+            get_retries=0,
+            retry_delay_s=0.0,
+        )
+
+    worker, thread, trigger = _spawn(qtbot, factory)
+    try:
+        with qtbot.waitSignal(worker.stationXmlReady, timeout=_SNAPSHOT_DEADLINE_MS) as blocker:
+            trigger.fetchRequested.emit((_target(),))
+        device, xml = blocker.args
+        assert device == "echos-field-01"
+        assert xml is None
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_stationxml_bad_payload_is_ignored(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        emitted: list[object] = []
+        worker.stationXmlReady.connect(lambda *a: emitted.append(a))
+        trigger.fetchRequested.emit("not-a-tuple")
+        qtbot.wait(300)
+        assert emitted == []
     finally:
         _shutdown(worker, thread)

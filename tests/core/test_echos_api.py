@@ -31,6 +31,7 @@ from echosmonitor.core.echos_api import (
     SeedlinkClientInfo,
     SeedlinkServerConfig,
     SeedlinkServerStatus,
+    fetch_stationxml,
 )
 from echosmonitor.core.exceptions import (
     EchosApiProtocolError,
@@ -135,6 +136,31 @@ async def test_get_stationxml_verbatim(fw: FakeEchosFirmware, client: EchosApiCl
     xml = await client.get_stationxml()
     assert xml == fw.stationxml
     assert "<Latitude>45.4</Latitude>" in xml
+
+
+async def test_fetch_stationxml_returns_xml(client: EchosApiClient) -> None:
+    """M6.6-B: the never-raising helper returns the document on success."""
+    xml = await fetch_stationxml(client)
+    assert xml is not None
+    assert "FDSNStationXML" in xml
+
+
+async def test_fetch_stationxml_none_on_error(fw: FakeEchosFirmware) -> None:
+    """A transport failure yields None (degrade to counts), never raises."""
+    fw.flaky["/api/stationxml"] = 10**6  # unreachable forever
+    async with EchosApiClient(
+        "echos-test.local", transport=fw.transport, get_retries=0, retry_delay_s=0.0
+    ) as client:
+        assert await fetch_stationxml(client) is None
+
+
+async def test_fetch_stationxml_none_on_empty(fw: FakeEchosFirmware) -> None:
+    """An empty body is treated as a failed fetch (None)."""
+    fw.stationxml = "   "
+    async with EchosApiClient(
+        "echos-test.local", transport=fw.transport, get_retries=0, retry_delay_s=0.0
+    ) as client:
+        assert await fetch_stationxml(client) is None
 
 
 async def test_get_ota_status_typed(client: EchosApiClient) -> None:

@@ -877,6 +877,31 @@ class StreamingEngine(QObject):
         """The active session's frozen snapshot, or ``None``."""
         return self._session
 
+    def persist_session_stationxml(self, device_name: str, xml_blob: str) -> bool:
+        """Persist a fetched StationXML blob for the active session (M6.6-B).
+
+        Scoped to the session that recorded with it (rule 14): a no-op
+        unless a recording session is open AND ``device_name`` is one of its
+        members. Writes via the session DAO and commits immediately, exactly
+        like the session row itself (the DAO funnels metadata writes; rule 8
+        DB-after-fsync is satisfied by the immediate commit). Returns whether
+        the blob was persisted. Called on the GUI thread.
+        """
+        if self._archive_dao is None or self._archive_session_id is None:
+            return False
+        if self._session is None or device_name not in self._session.devices:
+            return False
+        self._archive_dao.upsert_session_stationxml(
+            self._archive_session_id, device_name, xml_blob
+        )
+        _log.info(
+            "session_stationxml_persisted",
+            device=device_name,
+            session_id=self._archive_session_id,
+            blob_bytes=len(xml_blob),
+        )
+        return True
+
     def _finalize_session(self, *, reensure_detection_dao: bool) -> None:
         """Close the session row + DAO and announce the session's end.
 

@@ -28,7 +28,10 @@ Design constraints (CLAUDE.md):
 
 from __future__ import annotations
 
+import hashlib
+import io
 import math
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -102,6 +105,34 @@ _FORMAT_MAP: dict[str, str] = {
 # fresh mtime (file rewritten) yields a new key, so the cache invalidates
 # itself naturally without an explicit eviction path.
 _INVENTORY_CACHE: dict[tuple[str, float], Inventory] = {}
+
+# M6.6-B: parsed-inventory cache for StationXML BLOBS (persisted device
+# XML, not a file). Keyed on the blob's sha1 so a re-parse of the same
+# bytes is free; a changed blob is a new key. Bounded by the small number
+# of distinct device StationXML documents in play.
+_BLOB_INVENTORY_CACHE: dict[str, Inventory] = {}
+
+
+def inventory_from_stationxml_blob(xml: str) -> Inventory:
+    """Parse a raw FDSN StationXML string into an ObsPy :class:`Inventory`.
+
+    Cached by blob hash (see :data:`_BLOB_INVENTORY_CACHE`). Mirrors
+    :func:`load_inventory` but sources the bytes from memory (the device
+    StationXML persisted per session, M6.6-B) rather than a file.
+
+    Raises:
+        ResponseError: the blob cannot be parsed as StationXML.
+    """
+    key = hashlib.sha1(xml.encode("utf-8")).hexdigest()
+    cached = _BLOB_INVENTORY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        inv = obspy.read_inventory(io.BytesIO(xml.encode("utf-8")), format="STATIONXML")
+    except Exception as exc:  # obspy raises a broad family here
+        raise ResponseError(f"failed to parse StationXML blob: {exc}") from exc
+    _BLOB_INVENTORY_CACHE[key] = inv
+    return inv
 
 
 def load_inventory(path: Path, fmt: str = "auto") -> Inventory:
@@ -494,11 +525,38 @@ class ResponseProvider:
         """
         self._devices = {d.name: d for d in devices}
         self._config_dir = config_dir
+        # M6.6-B: per-device persisted/fetched StationXML blobs. Written on
+        # the GUI thread (set_stationxml_blob) and read by the decon/HVSR
+        # workers via remover_for, so a lock guards the dict (response.py is
+        # not a rule-2 pure module; a small lock is sanctioned here).
+        self._blobs: dict[str, str] = {}
+        self._blob_lock = threading.Lock()
+
+    def set_stationxml_blob(self, device_name: str, xml_blob: str | None) -> None:
+        """Register (or clear) a device's StationXML blob (M6.6-B).
+
+        ``xml_blob=None`` clears it. The config-file ``response_metadata``
+        override still WINS over a registered blob (rule 16: explicit
+        override > fetched StationXML). Call on the GUI thread.
+        """
+        with self._blob_lock:
+            if xml_blob is None:
+                self._blobs.pop(device_name, None)
+            else:
+                self._blobs[device_name] = xml_blob
 
     def is_configured(self, device_name: str) -> bool:
-        """Whether ``device_name`` has a response-metadata path set."""
+        """Whether ``device_name`` has resolvable response metadata.
+
+        True when a config-file ``response_metadata.path`` is set OR a
+        persisted/fetched StationXML blob is registered (M6.6-B) — both
+        yield a :class:`ResponseRemover` from :meth:`remover_for`.
+        """
         dev = self._devices.get(device_name)
-        return dev is not None and dev.response_metadata.path is not None
+        if dev is not None and dev.response_metadata.path is not None:
+            return True
+        with self._blob_lock:
+            return device_name in self._blobs
 
     def _resolve_path(self, device_name: str) -> Path | None:
         dev = self._devices.get(device_name)
@@ -521,11 +579,18 @@ class ResponseProvider:
                 silently disabling physical units).
         """
         path = self._resolve_path(device_name)
-        if path is None:
-            return None
-        dev = self._devices[device_name]
-        inv = load_inventory(path, dev.response_metadata.format)
-        return ResponseRemover(inv, pre_filt_override=dev.response_metadata.pre_filt)
+        if path is not None:
+            dev = self._devices[device_name]
+            inv = load_inventory(path, dev.response_metadata.format)
+            return ResponseRemover(inv, pre_filt_override=dev.response_metadata.pre_filt)
+        # No config-file override → fall back to a persisted/fetched
+        # StationXML blob (M6.6-B). Parsing is cached by blob hash.
+        with self._blob_lock:
+            blob = self._blobs.get(device_name)
+        if blob is not None:
+            inv = inventory_from_stationxml_blob(blob)
+            return ResponseRemover(inv)
+        return None
 
     def available_for(self, device_name: str, nslc: str, t: UTCDateTime) -> bool:
         """Whether a usable response exists for ``device_name``/``nslc`` at ``t``.

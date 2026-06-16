@@ -74,7 +74,7 @@ from echosmonitor.core.echos_status import EchosStatusWorker
 from echosmonitor.core.hvsr_array import ArrayHvsrResult, HvsrArrayEngine
 from echosmonitor.core.hvsr_engine import HvsrEngine
 from echosmonitor.core.info_worker import InfoWorker
-from echosmonitor.core.models import EchosPollTarget
+from echosmonitor.core.models import AcquisitionState, EchosPollTarget
 from echosmonitor.core.positions import PositionQuery, PositionResolver
 from echosmonitor.core.response import ResponseProvider
 from echosmonitor.core.session import resolve_base_archive_root
@@ -107,7 +107,7 @@ if TYPE_CHECKING:
     import numpy as np
     from obspy import UTCDateTime
 
-    from echosmonitor.core.models import Detection
+    from echosmonitor.core.models import Detection, SessionEntry
 
 _log = structlog.get_logger(__name__)
 
@@ -248,6 +248,10 @@ class MainWindow(QMainWindow):
     # delivered to ``EchosStatusWorker.configure`` across the thread
     # boundary (QueuedConnection). Carries tuple[EchosPollTarget, ...].
     _echosTargetsChanged = Signal(object)  # noqa: N815
+    # M6.6-B: one-shot StationXML fetch request, delivered to
+    # ``EchosStatusWorker.fetch_stationxml`` across the thread boundary
+    # (QueuedConnection). Carries tuple[EchosPollTarget, ...].
+    _stationXmlFetchRequested = Signal(object)  # noqa: N815
 
     def __init__(
         self,
@@ -382,6 +386,18 @@ class MainWindow(QMainWindow):
         self._echosTargetsChanged.connect(
             self._echos_worker.configure, type=Qt.ConnectionType.QueuedConnection
         )
+        # M6.6-B: one-shot StationXML fetch on the same worker thread
+        # (all device REST funnels through this one poller thread).
+        self._stationXmlFetchRequested.connect(
+            self._echos_worker.fetch_stationxml, type=Qt.ConnectionType.QueuedConnection
+        )
+        self._echos_worker.stationXmlReady.connect(
+            self._on_stationxml_ready, type=Qt.ConnectionType.QueuedConnection
+        )
+        # Per-acquisition fetch de-dup + the latest blob per device (so a
+        # monitoring fetch is reused when the device starts recording).
+        self._stationxml_requested: set[str] = set()
+        self._stationxml_blobs: dict[str, str] = {}
         self._echos_thread.start()
         QMetaObject.invokeMethod(
             self._echos_worker, "start", Qt.ConnectionType.QueuedConnection
@@ -1401,6 +1417,13 @@ class MainWindow(QMainWindow):
             self._device_panel.on_acquisition_state,
             type=Qt.ConnectionType.QueuedConnection,
         )
+        # M6.6-B: auto-fetch + persist the device StationXML when a device
+        # enters monitoring/recording (rule 13 — user-triggered, off the
+        # GUI thread via the status-poller worker).
+        self._engine.acquisitionStateChanged.connect(
+            self._on_acquisition_stationxml,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
         self._engine.deviceStateChanged.connect(self._live_tabs.set_device_state)
         self._engine.newStreamSeen.connect(self._device_panel.on_new_stream)
         self._engine.newStreamSeen.connect(self._on_new_stream)
@@ -1564,6 +1587,60 @@ class MainWindow(QMainWindow):
             if d.echos is not None
         )
         self._echosTargetsChanged.emit(targets)
+
+    def _echos_target_for(self, device_name: str) -> EchosPollTarget | None:
+        """Build a one-shot poll target for an Echos device, or None.
+
+        None when the device has no ``echos:`` section (a generic SeedLink
+        server with no REST API).
+        """
+        for d in self._store.root.devices:
+            if d.name == device_name and d.echos is not None:
+                return EchosPollTarget(
+                    name=d.name,
+                    host=d.host,
+                    http_port=d.echos.http_port,
+                    poll_interval_s=d.echos.poll_interval_s,
+                )
+        return None
+
+    def _on_acquisition_stationxml(self, device_name: str, state_int: int) -> None:
+        """Fetch + persist the device StationXML across acquisition changes.
+
+        Idle→(Monitoring|Recording): request one off-thread fetch (de-duped
+        per acquisition). On entering Recording, persist any already-fetched
+        blob immediately (covers Monitoring→Recording, where no new fetch is
+        issued). Returning to Idle clears the de-dup flag so the next
+        acquisition re-fetches fresh metadata (rule 13).
+        """
+        state = AcquisitionState(state_int)
+        if state is AcquisitionState.IDLE:
+            self._stationxml_requested.discard(device_name)
+            return
+        if device_name not in self._stationxml_requested:
+            target = self._echos_target_for(device_name)
+            if target is not None:
+                self._stationxml_requested.add(device_name)
+                self._stationXmlFetchRequested.emit((target,))
+        if state is AcquisitionState.RECORDING:
+            blob = self._stationxml_blobs.get(device_name)
+            if blob is not None:
+                self._engine.persist_session_stationxml(device_name, blob)
+
+    def _on_stationxml_ready(self, device_name: str, xml: object) -> None:
+        """Receive a fetched StationXML blob (worker thread → GUI, queued).
+
+        Payload guarded per rule 4. ``None`` means the fetch failed — the
+        analysis path degrades to counts (the helper already logged one
+        warning). On success, register the blob for live deconvolution and
+        persist it if the device is currently recording.
+        """
+        if not isinstance(xml, str) or not xml:
+            return
+        self._stationxml_blobs[device_name] = xml
+        self._response_provider.set_stationxml_blob(device_name, xml)
+        if self._engine.acquisition_state(device_name) is AcquisitionState.RECORDING:
+            self._engine.persist_session_stationxml(device_name, xml)
 
     def _on_new_stream(self, device_name: str, nslc: str) -> None:
         assert self._live_tabs is not None
@@ -1876,6 +1953,22 @@ class MainWindow(QMainWindow):
             db_path=db_path,
         )
 
+    def _load_archive_stationxml(self, device: str, entry: SessionEntry) -> None:
+        """Preload the selected archive session's StationXML into the provider.
+
+        Makes archive HVSR/deconvolution resolve the real instrument
+        response from the persisted blob (M6.6-B) with NO live device call.
+        ``None`` (pre-v6 DB or no row) clears any stale blob so the archive
+        analysis honestly falls back to counts. Read-only DB read, bounded
+        and small (rule 6) — safe on the GUI thread.
+        """
+        if entry.record.id is None:
+            return
+        from echosmonitor.storage.archive_reader import read_session_stationxml
+
+        blob = read_session_stationxml(Path(entry.db_path), entry.record.id, device)
+        self._response_provider.set_stationxml_blob(device, blob)
+
     def _archive_session_context(self, device: str) -> tuple[str, str | None]:
         """``(archive_root, db_path)`` for an Archive-tab data request.
 
@@ -1886,6 +1979,7 @@ class MainWindow(QMainWindow):
         """
         entry = self._archive_tab.selected_session_entry()
         if entry is not None:
+            self._load_archive_stationxml(device, entry)
             return entry.session_root, entry.db_path
         engine_db = self._engine.archive_db_path()
         return (
@@ -2556,6 +2650,10 @@ class MainWindow(QMainWindow):
         self._echos_thread.quit()
         if not self._echos_thread.wait(_ECHOS_THREAD_JOIN_MS):
             _log.warning("echos_thread_join_timeout")
+        # The bounded join above is what makes leaving snapshotReady /
+        # stationXmlReady connected safe (skill §3): the emitter thread is
+        # fully stopped before MainWindow finishes tearing down, so no
+        # queued worker→GUI signal can fire post-teardown.
         # M4: the position resolver owns its thread + bounded join; its
         # stop() cancels an in-flight fetch via the asyncio task nudge.
         # Terminal — a later configChanged push is refused, not revived.

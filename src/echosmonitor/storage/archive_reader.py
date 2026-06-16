@@ -42,6 +42,34 @@ _log = structlog.get_logger(__name__)
 _MAX_SCAN_DAYS = 400
 
 
+def read_session_stationxml(
+    db_path: Path, session_id: int, device_name: str
+) -> str | None:
+    """Persisted device StationXML for a ``(session, device)``, or None (M6.6-B).
+
+    Opens the session ``archive.db`` READ-ONLY (rule 8 — a browse never
+    migrates or writes the DB; a pre-v6 DB simply has no table and yields
+    None) and returns the raw XML blob. Never raises on a missing/locked DB
+    or a missing row: logs once and returns None so archive analysis
+    degrades to counts. Lets the Archive tab + archive HVSR/deconvolution
+    resolve the real instrument response with NO live device call.
+    """
+    from echosmonitor.storage.dao import ArchiveDao
+
+    try:
+        dao = ArchiveDao(db_path, read_only=True)
+    except Exception as exc:
+        _log.warning("session_stationxml_db_unavailable", db=str(db_path), error=str(exc))
+        return None
+    try:
+        return dao.read_session_stationxml(session_id, device_name)
+    except Exception as exc:
+        _log.warning("session_stationxml_read_failed", db=str(db_path), error=str(exc))
+        return None
+    finally:
+        dao.close()
+
+
 class ArchiveReader:
     """Read trimmed waveform windows from an SDS archive. Read-only."""
 

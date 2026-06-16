@@ -730,3 +730,26 @@ class EchosApiClient:
             raise EchosApiProtocolError(
                 f"device {self._host} response failed {model.__name__} validation: {exc}"
             ) from exc
+
+
+async def fetch_stationxml(client: EchosApiClient) -> str | None:
+    """Best-effort fetch of a device's FDSN StationXML (M6.6-B).
+
+    Wraps the credential-less public ``GET /api/stationxml`` so a fetch
+    NEVER raises across the worker boundary: any transport/protocol error
+    is logged once and yields ``None``, so acquisition proceeds and the
+    analysis path simply degrades to counts (rule 7 — observable, bounded;
+    rule 15 — public GET, never trips the auth lockout).
+    """
+    try:
+        xml = await client.get_stationxml()
+    except EchosApiError as exc:
+        _log.warning("stationxml_fetch_failed", kind=exc.kind, error=str(exc))
+        return None
+    except Exception as exc:  # defensive: never propagate from the helper
+        _log.warning("stationxml_fetch_unexpected_error", error=str(exc))
+        return None
+    if not xml.strip():
+        _log.warning("stationxml_fetch_empty")
+        return None
+    return xml

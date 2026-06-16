@@ -271,6 +271,55 @@ class ArchiveDao:
 
         return self.transactional(_select)
 
+    def upsert_session_stationxml(
+        self, session_id: int, device_name: str, xml_blob: str
+    ) -> None:
+        """Persist the device StationXML for a session (M6.6-B, rule 14).
+
+        UPSERT on ``(session_id, device_name)``: a re-fetch replaces the
+        prior blob. Committed immediately — a session-boundary write, like
+        :meth:`start_session`. ``fetched_at`` is ISO-8601 UTC.
+        """
+
+        def _upsert(cur: sqlite3.Cursor) -> None:
+            cur.execute(
+                "INSERT INTO session_stationxml"
+                "        (session_id, device_name, xml_blob, fetched_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(session_id, device_name)"
+                " DO UPDATE SET xml_blob=excluded.xml_blob,"
+                "               fetched_at=excluded.fetched_at",
+                (session_id, device_name, xml_blob, _now_iso()),
+            )
+
+        self.transactional(_upsert)
+        self.flush_now()
+
+    def read_session_stationxml(self, session_id: int, device_name: str) -> str | None:
+        """The persisted StationXML blob for a ``(session, device)``, or None.
+
+        Guarded against a missing table so a browsed pre-v6 DB (read-only
+        opens never migrate, rule 8) returns None instead of raising.
+        """
+
+        def _select(cur: sqlite3.Cursor) -> str | None:
+            tables = {
+                row[0]
+                for row in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "session_stationxml" not in tables:
+                return None
+            row = cur.execute(
+                "SELECT xml_blob FROM session_stationxml"
+                " WHERE session_id=? AND device_name=?",
+                (session_id, device_name),
+            ).fetchone()
+            return str(row["xml_blob"]) if row is not None else None
+
+        return self.transactional(_select)
+
     def close_dirty_sessions(self) -> int:
         """Close every still-open session as dirty; return how many.
 

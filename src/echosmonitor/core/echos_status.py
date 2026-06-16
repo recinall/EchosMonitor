@@ -51,6 +51,7 @@ import structlog
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from echosmonitor.core.echos_api import EchosApiClient
+from echosmonitor.core.echos_api import fetch_stationxml as _fetch_stationxml_helper
 from echosmonitor.core.exceptions import EchosApiError
 from echosmonitor.core.models import EchosDeviceSnapshot, EchosPollTarget
 
@@ -98,6 +99,10 @@ class EchosStatusWorker(QObject):
     snapshotReady = Signal(object)  # noqa: N815
     # device, kind (closed EchosErrorKind set), human-readable message.
     pollFailed = Signal(str, str, str)  # noqa: N815
+    # M6.6-B: one-shot StationXML result — device, xml (str) or None on
+    # failure (rule 4: Signal(object) payload, isinstance-guarded at the
+    # receiver). Emitted from the worker thread for each requested device.
+    stationXmlReady = Signal(str, object)  # noqa: N815
 
     def __init__(
         self,
@@ -156,6 +161,32 @@ class EchosStatusWorker(QObject):
         # poll on the next tick. Removed devices drop their entry.
         self._next_due = {t.name: self._next_due.get(t.name, 0.0) for t in targets}
         _log.info("echos_status_configured", device_count=len(targets))
+
+    @Slot(object)
+    def fetch_stationxml(self, targets: object) -> None:
+        """One-shot StationXML fetch for each target (queued from the GUI).
+
+        Payload contract (rule 4): ``tuple[EchosPollTarget, ...]``. For each
+        device, emits ``stationXmlReady(device, xml-or-None)``. Runs on the
+        worker thread, serialised against the poll tick by the single Qt
+        event loop; ``stop()`` cancels an in-flight fetch via the same
+        task-cancel path as a poll. Never raises across the boundary.
+        """
+        if self._stop_flag:
+            return
+        if not isinstance(targets, tuple) or not all(
+            isinstance(t, EchosPollTarget) for t in targets
+        ):
+            _log.warning(
+                "echos_stationxml_bad_payload", payload_type=type(targets).__name__
+            )
+            return
+        for target in targets:
+            if self._stop_flag:
+                return
+            xml = self._fetch_stationxml_one(target)
+            if not self._stop_flag:
+                self.stationXmlReady.emit(target.name, xml)
 
     @Slot()
     def _on_tick(self) -> None:
@@ -283,6 +314,37 @@ class EchosStatusWorker(QObject):
             time_sync_type=status.time_sync_type,
             pps_offset_us=status.pps.offset_us if status.pps else 0,
         )
+
+    # -- StationXML one-shot (M6.6-B) -----------------------------------
+    def _fetch_stationxml_one(self, target: EchosPollTarget) -> str | None:
+        started = time.monotonic()
+        try:
+            xml = asyncio.run(self._fetch_stationxml_async(target))
+        except asyncio.CancelledError:
+            _log.info("echos_stationxml_canceled", device=target.name)
+            return None
+        except Exception as exc:
+            _log.warning("echos_stationxml_unexpected_error", device=target.name, error=str(exc))
+            return None
+        elapsed = time.monotonic() - started
+        if elapsed > _SLOW_POLL_WARN_S:
+            _log.warning("echos_stationxml_slow", device=target.name, elapsed_s=round(elapsed, 3))
+        return xml
+
+    async def _fetch_stationxml_async(self, target: EchosPollTarget) -> str | None:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None  # always inside asyncio.run
+        with self._lock:
+            if self._stop_flag:
+                return None
+            self._in_flight = (loop, task)
+        try:
+            async with self._client_factory(target) as client:
+                return await _fetch_stationxml_helper(client)
+        finally:
+            with self._lock:
+                self._in_flight = None
 
 
 __all__ = ["EchosStatusWorker"]

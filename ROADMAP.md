@@ -1100,7 +1100,20 @@ designed together).
       Skill: `hvsr-array` (and re-read its component-ordering note).
       No worker/thread surface → no qt-concurrency-auditor needed.
 
-- [ ] **B. Auto-read + persist the device StationXML.** The firmware
+- [x] **B. Auto-read + persist the device StationXML.** DONE 2026-06-16:
+      `fetch_stationxml(client)` (never-raises helper) on the status-poller
+      worker via a new `fetch_stationxml` slot + `stationXmlReady` signal;
+      fetched off-thread when a device enters Monitoring/Recording (de-duped
+      per acquisition). Persisted per `(session, device)` in the new
+      `session_stationxml` table (schema v6, idempotent migration) via
+      `engine.persist_session_stationxml`; read back through
+      `archive_reader.read_session_stationxml`. `ResponseProvider` gains a
+      lock-guarded blob store + `inventory_from_stationxml_blob`, so
+      `remover_for`/`is_configured` resolve a remover from the blob with the
+      config-file override still winning (rule 16). Archive analysis preloads
+      the selected session's blob into the provider. Full unit + integration
+      tests; qt-concurrency-auditor PASS, code-reviewer APPROVE. Original
+      plan follows. ▸ The firmware
       serves `GET /api/stationxml` (public, no auth — `echos_api.py:450
       get_stationxml`, already used by the wizard for selectors and by
       `core/positions.py` for coordinates). Goal: fetch it

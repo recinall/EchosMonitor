@@ -24,6 +24,7 @@ from echosmonitor.core.response import (
     ResponseProvider,
     ResponseRemover,
     default_pre_filt,
+    inventory_from_stationxml_blob,
     load_inventory,
 )
 
@@ -380,3 +381,66 @@ def test_provider_bad_file_surfaces_or_unavailable() -> None:
             prov.remover_for("dev")
         # available_for swallows the load error into a graceful False.
         assert prov.available_for("dev", _NSLC, obspy.UTCDateTime()) is False
+
+
+# M6.6-B: StationXML blob parsing + the ResponseProvider blob fallback.
+
+
+def _anmo_blob() -> str:
+    from pathlib import Path
+
+    return Path(get_example_file("IU_ANMO_00_BHZ.xml")).read_text(encoding="utf-8")
+
+
+def test_inventory_from_stationxml_blob_parses_and_caches() -> None:
+    blob = _anmo_blob()
+    inv1 = inventory_from_stationxml_blob(blob)
+    inv2 = inventory_from_stationxml_blob(blob)
+    # Same bytes → cached identity (no re-parse).
+    assert inv1 is inv2
+    assert inv1.get_response(_NSLC, obspy.UTCDateTime("2015-01-01")) is not None
+
+
+def test_inventory_from_stationxml_blob_bad_raises() -> None:
+    with pytest.raises(ResponseError):
+        inventory_from_stationxml_blob("<not-stationxml/>")
+
+
+def test_provider_blob_fallback_resolves_response(
+    anmo_inventory: obspy.core.inventory.Inventory,
+) -> None:
+    """M6.6-B: with no config-file path, a registered StationXML blob makes
+    the device 'configured' and resolves a working remover (archive path)."""
+    from pathlib import Path
+
+    prov = ResponseProvider([_device("anmo")], Path("/tmp"))
+    assert prov.is_configured("anmo") is False
+    prov.set_stationxml_blob("anmo", _anmo_blob())
+    assert prov.is_configured("anmo") is True
+    remover = prov.remover_for("anmo")
+    assert isinstance(remover, ResponseRemover)
+    _fs, start = _anmo_channel_stats(anmo_inventory)
+    assert prov.available_for("anmo", _NSLC, start) is True
+    # Clearing the blob reverts to no-response.
+    prov.set_stationxml_blob("anmo", None)
+    assert prov.is_configured("anmo") is False
+    assert prov.remover_for("anmo") is None
+
+
+def test_provider_config_file_override_wins_over_blob(
+    anmo_inventory: obspy.core.inventory.Inventory,
+) -> None:
+    """Rule 16: an explicit config-file response_metadata override beats a
+    fetched StationXML blob. We prove the file path is taken even when a
+    (garbage) blob is also registered — the file resolves, the blob is
+    ignored."""
+    from pathlib import Path
+
+    xml = Path(get_example_file("IU_ANMO_00_BHZ.xml"))
+    prov = ResponseProvider([_device("anmo", path=xml)], None)
+    prov.set_stationxml_blob("anmo", "<garbage/>")
+    # remover_for must resolve from the FILE (not raise on the garbage blob).
+    remover = prov.remover_for("anmo")
+    assert isinstance(remover, ResponseRemover)
+    _fs, start = _anmo_channel_stats(anmo_inventory)
+    assert prov.available_for("anmo", _NSLC, start) is True

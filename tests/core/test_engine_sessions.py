@@ -177,6 +177,44 @@ def test_start_session_creates_session_rooted_layout(
         engine.stop()
 
 
+def test_persist_session_stationxml_round_trips(
+    qtbot,
+    tmp_path: Path,
+    make_fake_server,  # noqa: F811
+) -> None:
+    """M6.6-B: a fetched StationXML blob persists into the active session's
+    DB and reads back via the archive reader with no live device call."""
+    from echosmonitor.storage.archive_reader import read_session_stationxml
+
+    server = make_fake_server(_SERVER_CFG)
+    archive_root = tmp_path / "archive"
+    engine = StreamingEngine(_make_cfg(archive_root, server))
+    xml = "<FDSNStationXML>persist-me</FDSNStationXML>"
+    try:
+        info = engine.start_session("Survey 2026", ["dev"])
+        assert engine.persist_session_stationxml("dev", xml) is True
+        db_path = archive_root / "Survey_2026" / "archive.db"
+        assert read_session_stationxml(db_path, info.session_id, "dev") == xml
+        # A device that is not a session member is not persisted.
+        assert engine.persist_session_stationxml("ghost", xml) is False
+    finally:
+        engine.stop()
+
+
+def test_persist_session_stationxml_no_session_is_noop(
+    qtbot,
+    tmp_path: Path,
+    make_fake_server,  # noqa: F811
+) -> None:
+    """With no recording session, persistence is a no-op (rule 14)."""
+    server = make_fake_server(_SERVER_CFG)
+    engine = StreamingEngine(_make_cfg(tmp_path / "archive", server))
+    try:
+        assert engine.persist_session_stationxml("dev", "<x/>") is False
+    finally:
+        engine.stop()
+
+
 def test_second_session_while_active_raises(qtbot, tmp_path: Path, make_fake_server) -> None:  # noqa: F811
     server = make_fake_server(_SERVER_CFG)
     engine = StreamingEngine(_make_cfg(tmp_path / "archive", server))

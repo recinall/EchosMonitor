@@ -28,7 +28,7 @@ from pathlib import Path
 
 import structlog
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Connection-level PRAGMAs. ``WAL`` lets readers and writers proceed
 # without blocking each other. ``synchronous=NORMAL`` is the standard
@@ -178,7 +178,31 @@ CREATE INDEX IF NOT EXISTS idx_detections_stream ON detections(stream_id);
 CREATE INDEX IF NOT EXISTS idx_detections_t_on   ON detections(t_on);
 """
 
-_CREATE_SCHEMA_SQL = _CREATE_SCHEMA_SQL + _DETECTIONS_DDL
+# Per-session, per-device StationXML blob (schema v6, M6.6-B, rule 14).
+# The device's FDSN StationXML (GET /api/stationxml) fetched BEFORE an
+# acquisition and persisted scoped to the session that recorded with it,
+# so Archive browsing + archive HVSR/deconvolution resolve the real
+# instrument response + coordinates with NO live device call. The blob is
+# the raw XML text; ``fetched_at`` is ISO-8601 UTC. One row per
+# (session, device): a re-fetch UPSERTs in place.
+#
+# This DDL lives in BOTH the base schema (fresh installs) and the
+# v5→v6 migration (existing databases). Both forms are idempotent
+# (``IF NOT EXISTS``).
+_SESSION_STATIONXML_DDL = """
+CREATE TABLE IF NOT EXISTS session_stationxml (
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    device_name TEXT NOT NULL,
+    xml_blob    TEXT NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    UNIQUE(session_id, device_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_stationxml_session
+    ON session_stationxml(session_id);
+"""
+
+_CREATE_SCHEMA_SQL = _CREATE_SCHEMA_SQL + _DETECTIONS_DDL + _SESSION_STATIONXML_DDL
 
 # Schema v3 historically added the ``events`` table (the removed AI
 # persist-on-detection feature, CLAUDE.md rule 12). The version number is
@@ -299,6 +323,12 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
     v4 → v5 (M3-D): ``sessions`` gains ``reindexed`` — marks a session
     row synthesized by the re-indexer for an archive whose DB was
     missing (the real session metadata is unrecoverable from the tree).
+
+    v5 → v6 (M6.6-B, rule 14): the ``session_stationxml`` table appears —
+    the device StationXML fetched before acquisition, persisted per
+    (session, device) so archive analysis resolves the instrument
+    response without a live device call. Old DBs gain the table via a
+    no-op ``CREATE TABLE IF NOT EXISTS`` (M0-B precedent).
     """
     if from_version == SCHEMA_VERSION:
         return
@@ -320,6 +350,9 @@ def _upgrade(conn: sqlite3.Connection, from_version: int) -> None:
             conn, "sessions", "reindexed", "INTEGER NOT NULL DEFAULT 0"
         )
         version = 5
+    if version == 5:
+        conn.executescript(_SESSION_STATIONXML_DDL)
+        version = 6
     if version != SCHEMA_VERSION:
         # Unknown / future version we don't know how to migrate. Leave
         # the DB untouched and surface it loudly rather than silently
