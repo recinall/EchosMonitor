@@ -15,6 +15,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    # TEMPORARY (M7-C2 validation): build on pushes to the release branch so the
+    # Windows/macOS packaging can be exercised before the workflow reaches main
+    # (workflow_dispatch only works from the default branch). The `publish` job
+    # stays gated on a `v*` tag, so a branch push only runs `build`. REMOVE
+    # this branch trigger before merging.
+    branches: ["m7-c2-release"]
   workflow_dispatch:
 
 # Read-only by default; the publish job elevates to contents: write.
