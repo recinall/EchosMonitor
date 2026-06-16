@@ -54,7 +54,9 @@ def test_main_window_smoke(qtbot: QtBot) -> None:
     window = MainWindow(cfg, Path("/tmp/cfg.yaml"))
     qtbot.addWidget(window)
 
-    assert window.windowTitle() == "EchosMonitor"
+    # M7-A: the title now carries the version (e.g. "EchosMonitor v0.1.0");
+    # the exact-string contract moved to tests/test_versioning.py.
+    assert window.windowTitle().startswith("EchosMonitor v")
     docks = window.findChildren(QDockWidget)
     assert len(docks) == 4
     expected = {"Devices", "Stations", "Spectrogram", "Log"}

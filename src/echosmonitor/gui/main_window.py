@@ -272,7 +272,7 @@ class MainWindow(QMainWindow):
         # keeps the dock a placeholder so the layout/objectName is stable.
         self._log_sink = log_sink
 
-        self.setWindowTitle("EchosMonitor")
+        self.setWindowTitle(f"EchosMonitor v{__version__}")
         self.resize(_DEFAULT_WIDTH, _DEFAULT_HEIGHT)
         self.setObjectName("MainWindow")
 

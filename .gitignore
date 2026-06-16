@@ -95,6 +95,12 @@ firmware_*/sdkconfig
 firmware_*/sdkconfig.old
 
 # ======================
+# hatch-vcs generated version module (M7-A) — written at build time from the
+# git tag; never hand-edited or committed.
+# ======================
+src/echosmonitor/_version.py
+
+# ======================
 # graphify code-visualization output (regenerable)
 # ======================
 graphify-out/

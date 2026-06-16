@@ -1266,9 +1266,32 @@ time). Mutation-verify every regression test by reverse-edit, NEVER
 Goal: a tagged version produces installable artifacts for the three desktop
 platforms from CI, reproducibly.
 
-- [ ] **A. Versioning + changelog**: semver from git tag (the package already
+- [x] **A. Versioning + changelog**: semver from git tag (the package already
       reads `importlib.metadata`); CHANGELOG.md kept per milestone; window
       title + About dialog show the version.
+      *Done 2026-06-16* (gate green; code-reviewer APPROVE; no threads → no
+      concurrency audit):
+  - [x] version is git-tag-driven via **hatch-vcs** (`dynamic = ["version"]`,
+        `source = "vcs"`); a build writes the resolved version into a
+        gitignored `src/echosmonitor/_version.py`. `__init__._resolve_version()`
+        is a frozen-app-safe chain: `importlib.metadata` → generated
+        `_version.py` → `"0.0.0+dev"`. Untagged dev checkout → `0.1.devN+g<hash>`.
+  - [x] window title now shows `EchosMonitor v<ver>` (About + status bar
+        already did, M0); `storage/hvsr_report.py:APP_VERSION` no longer a
+        hardcoded `"0.1.0"` literal — it derives from `__version__` (the
+        report's existing test already asserted equality with the package
+        metadata, so this was latently required).
+  - [x] app/window icon: `EchosMonitor.png` moved to
+        `src/echosmonitor/resources/` (packaged + force-included in the wheel);
+        `gui/resources.app_icon()` loads it via `importlib.resources`
+        (bundle/zip-safe, never raises) and `__main__` sets it on the
+        QApplication.
+  - [x] `CHANGELOG.md` (Keep-a-Changelog), `[0.1.0]` backfilled at milestone
+        granularity; `tests/test_versioning.py` pins the fallback chain (3
+        branches), the title, and the changelog presence.
+  - [x] **tagging `v0.1.0` deferred to the release cut** (C/E): the tooling
+        already handles an untagged checkout; the first real artifact build
+        tags then.
 - [ ] **B. Packaging tool decision** (record in the decision log):
       PyInstaller (one-dir) vs Briefcase. Constraints to verify on all 3 OS:
       PySide6 plugin bundling, obspy data files (e.g. seedlink/StationXML
@@ -1301,6 +1324,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 
 | Date | Decision | Why |
 |------|----------|-----|
+| 2026-06-16 | M7-A: version is **git-tag-driven via hatch-vcs**, not a hand-maintained literal; `__version__` is a 3-step fallback chain (`importlib.metadata` → generated `_version.py` → `"0.0.0+dev"`) | One source of truth (the tag) removes the "bump pyproject AND tag" double-book; hatch-vcs writes `_version.py` at build so a PyInstaller bundle that does not collect dist-info still reports a real version (M7-B reads it in the freeze). The metadata-first order keeps editable `uv sync` and metadata-collecting bundles authoritative; the literal `0.0.0+dev` only ever shows for a raw never-built source checkout. `hvsr_report.APP_VERSION` was a second hardcoded `0.1.0` — folded into `__version__` (its own test already required them equal). First tag `v0.1.0` is deferred to the release cut (M7-C/E), so dev shows `0.1.devN+g<hash>`. |
 | 2026-06-16 | M6.6-A: map HVSR horizontals by **orientation code** (`N`/`1`→N, `E`/`2`→E), never by `sorted()` of the NSLC string | The bug (`models.py:350`) sorted full NSLCs so `…HHE` < `…HHN` put East into N — swapping the science inputs to hvsrpy on every GUI HVSR (live + archive), not just the label. The orientation char is already parsed (`parts[3][2]`); use it. f0 survives for symmetric horizontal combos (geom-mean/squared-avg) but directional readings were wrong. |
 | 2026-06-16 | M6.6-B: persist the fetched StationXML in a **new `session_stationxml(session_id, device_name, xml_blob, fetched_at)` table** (schema v6), not in config or a sidecar file | Rule 14 scopes it to the session that recorded with it; rule 8 puts the write on the storage thread after fsync; the Archive tab + archive HVSR/decon read it back via `archive_reader` with zero live device calls. Config stays the connect-only truth (rule 15); a user `response_metadata` file still wins as an explicit override. Old DBs migrate via a no-op `CREATE TABLE IF NOT EXISTS` (M0-B precedent). |
 | 2026-06-16 | M6.6-C: the "back off REST while SeedLink streams" **cadence (hard-skip vs slow heartbeat) is left to the implementing session** to decide with the `echos-rest-api` skill in hand and decision-log then | The trade is real (clock-health freshness vs device/LAN load) and best judged against the live device; the plan fixes only the policy shape (key off `ConnState.CONNECTED` + recent packets, resume full cadence on stall) and the schema-knob requirement. |

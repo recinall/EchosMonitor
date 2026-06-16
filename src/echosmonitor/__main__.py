@@ -74,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("config_loaded", path=str(cfg_path), devices=len(cfg.devices))
 
     app = QApplication.instance() or QApplication(sys.argv)
+    assert isinstance(app, QApplication)
+    # M7-A: window/taskbar branding. app_icon() never raises — a missing
+    # resource just yields an empty icon and the app launches unbranded.
+    from echosmonitor.gui.resources import app_icon
+
+    app.setWindowIcon(app_icon())
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
 

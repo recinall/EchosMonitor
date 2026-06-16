@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from echosmonitor import __version__
+
 # Monospace character budget per line on A4 portrait at 9 pt — long lines are
 # wrapped to this so nothing runs past the right page margin.
 _WRAP_WIDTH = 92
@@ -39,9 +41,10 @@ if TYPE_CHECKING:
     from echosmonitor.core.hvsr import HvsrResult
     from echosmonitor.core.hvsr_array import ArrayHvsrResult
 
-# App version surfaced in the report header. Kept here (not imported from
-# pyproject at runtime) to avoid a packaging-metadata read on the GUI path.
-APP_VERSION = "0.1.0"
+# App version surfaced in the report header. Derived from the single source of
+# truth (the git-tag version resolved once at package import, M7-A) rather than
+# a hand-maintained literal — no per-call packaging-metadata read.
+APP_VERSION = __version__
 
 
 @dataclass(frozen=True, slots=True)
