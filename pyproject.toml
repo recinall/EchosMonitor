@@ -63,6 +63,11 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "types-PyYAML",
+    # Packaging (M7-B): one-dir desktop bundles via packaging/echosmonitor.spec.
+    # Build-only — not a runtime dependency. hooks-contrib carries the obspy /
+    # scipy / PySide6 collection hooks PyInstaller's core does not ship.
+    "pyinstaller>=6.0",
+    "pyinstaller-hooks-contrib>=2024.0",
 ]
 
 [project.scripts]

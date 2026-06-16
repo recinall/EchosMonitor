@@ -53,6 +53,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Emit JSON log lines instead of the colored console renderer.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Headless self-check: load config and construct the main window, "
+            "then exit 0 WITHOUT entering the event loop. Used by the packaged "
+            "smoke test to fail a broken bundle in CI before a user sees it."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -99,6 +108,16 @@ def main(argv: list[str] | None = None) -> int:
     sigint_keepalive.timeout.connect(lambda: None)
 
     window = MainWindow(cfg, cfg_path, log_sink=log_sink)
+
+    # M7-B/E: packaged headless smoke. Reaching here means the full import
+    # graph (obspy native libs, PySide6, hvsrpy), the bundled default.yaml, the
+    # plot theme, the app icon and the whole main window all resolved inside the
+    # bundle. Close cleanly (stops workers via closeEvent) and exit before the
+    # event loop / first-run wizard so the check is non-interactive.
+    if args.check:
+        window.close()
+        log.info("check_ok", version=__version__)
+        return 0
 
     # M4 stage C — first-run wizard. Detection is "no user config file
     # on disk AND zero devices in the loaded config" (see

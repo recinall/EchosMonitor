@@ -1292,12 +1292,41 @@ platforms from CI, reproducibly.
   - [x] **tagging `v0.1.0` deferred to the release cut** (C/E): the tooling
         already handles an untagged checkout; the first real artifact build
         tags then.
-- [ ] **B. Packaging tool decision** (record in the decision log):
+- [x] **B. Packaging tool decision** (record in the decision log):
       PyInstaller (one-dir) vs Briefcase. Constraints to verify on all 3 OS:
       PySide6 plugin bundling, obspy data files (e.g. seedlink/StationXML
       schemas), scipy/numpy size, hvsrpy + its transitive matplotlib +
       the IPython workaround pin. Produce a working local build first
       (`scripts/build.{sh,ps1}`), with hidden-imports/spec files versioned.
+      *Done 2026-06-16* (decision: **PyInstaller one-dir**; gate green;
+      code-reviewer APPROVE; built + verified on Linux):
+  - [x] versioned `packaging/echosmonitor.spec` (one-dir, windowed) +
+        `packaging/entry.py` shim + `scripts/build.{sh,ps1}`; `pyinstaller`
+        and `pyinstaller-hooks-contrib` in the build-only `dev` group.
+  - [x] constraint findings (all resolved in the spec):
+        **obspy** needed three fixes — collect `RELEASE-VERSION` + a runtime
+        hook (`packaging/rthooks/pyi_rth_obspy_version.py`) so obspy's
+        relative frozen `__file__` doesn't point `OBSPY_ROOT` at the CWD and
+        crash at import; and `collect_dynamic_libs("obspy", search_patterns=
+        ["*.so",…])` because obspy's C libs are named `mseed.cpython-*.so`
+        (the default `lib*.so` pattern collects nothing). **hvsrpy** pulls
+        `IPython.display` at import (the pinned-`ipython` reason) → hidden
+        import. **keyring** backends are entry-point-loaded → `collect_
+        submodules("keyring.backends")`. **PySide6** plugins bundle via the
+        contrib hook; QtWebEngine/Qt3D/Multimedia/tkinter excluded (unused).
+        Bundle is ~697 MB uncompressed (scipy/numpy/PySide6/obspy/matplotlib)
+        — the M7-C installers compress it; trimming is a follow-up.
+  - [x] `--check` headless self-check added to `__main__` (construct config +
+        main window in the freeze, exit 0 before the event loop/wizard); the
+        packaged binary's `--check` runs the full start path
+        (`config_loaded` from the bundled `default.yaml`, `streaming_engine_
+        idle` per rule 13, `check_ok`). `tests/test_cli_smoke.py` pins
+        `--version`/`--check` in a fresh interpreter (XDG-sandboxed) plus a
+        skip-unless-present packaged-binary smoke (the M7-E seed).
+  - [ ] M7-C carry-forwards (reviewer follow-ups): per-platform icons
+        (`.ico`/`.icns` — PNG is Linux-ignored); Windows GUI-subsystem build
+        has no stdout, so the packaged smoke uses `--check` exit codes, not
+        `--version` stdout; trim bundle size.
 - [ ] **C. CI matrix** (GitHub Actions): on every PR run the gate on
       ubuntu/windows/macos; on tag `v*` build artifacts:
       Windows → installer (Inno Setup/NSIS) + portable zip;
@@ -1324,6 +1353,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 
 | Date | Decision | Why |
 |------|----------|-----|
+| 2026-06-16 | M7-B: packaging tool is **PyInstaller one-dir**, not Briefcase; build is a versioned `.spec` + `scripts/build.{sh,ps1}` | PyInstaller is the battle-tested path for a scientific PySide6 + obspy/scipy/hvsrpy stack — the contrib hooks cover PySide6 plugin bundling, and the obspy/keyring/IPython gaps are all expressible in the spec. One-dir (not one-file) gives faster startup, no per-launch temp extraction, and is the exact input the M7-C OS installers wrap (Inno/NSIS, AppImage, .dmg). Briefcase's native-installer story is cleaner but unproven against obspy's data files + ctypes-loaded C libs, which is where the real risk sits. The build surfaced four real bundling fixes, now encoded: obspy's relative frozen `__file__` (OBSPY_ROOT→CWD crash) needs a `inspect.getfile` runtime hook + collected `RELEASE-VERSION`; obspy's C libs (`mseed.cpython-*.so`) need `collect_dynamic_libs(..., search_patterns=["*.so",…])` since the default `lib*.so` matches none; hvsrpy's top-level `IPython.display` import and keyring's entry-point backends need hidden imports. A `--check` headless self-check is the packaged smoke (exit-code based — portable to the Windows GUI build that has no stdout). |
 | 2026-06-16 | M7-A: version is **git-tag-driven via hatch-vcs**, not a hand-maintained literal; `__version__` is a 3-step fallback chain (`importlib.metadata` → generated `_version.py` → `"0.0.0+dev"`) | One source of truth (the tag) removes the "bump pyproject AND tag" double-book; hatch-vcs writes `_version.py` at build so a PyInstaller bundle that does not collect dist-info still reports a real version (M7-B reads it in the freeze). The metadata-first order keeps editable `uv sync` and metadata-collecting bundles authoritative; the literal `0.0.0+dev` only ever shows for a raw never-built source checkout. `hvsr_report.APP_VERSION` was a second hardcoded `0.1.0` — folded into `__version__` (its own test already required them equal). First tag `v0.1.0` is deferred to the release cut (M7-C/E), so dev shows `0.1.devN+g<hash>`. |
 | 2026-06-16 | M6.6-A: map HVSR horizontals by **orientation code** (`N`/`1`→N, `E`/`2`→E), never by `sorted()` of the NSLC string | The bug (`models.py:350`) sorted full NSLCs so `…HHE` < `…HHN` put East into N — swapping the science inputs to hvsrpy on every GUI HVSR (live + archive), not just the label. The orientation char is already parsed (`parts[3][2]`); use it. f0 survives for symmetric horizontal combos (geom-mean/squared-avg) but directional readings were wrong. |
 | 2026-06-16 | M6.6-B: persist the fetched StationXML in a **new `session_stationxml(session_id, device_name, xml_blob, fetched_at)` table** (schema v6), not in config or a sidecar file | Rule 14 scopes it to the session that recorded with it; rule 8 puts the write on the storage thread after fsync; the Archive tab + archive HVSR/decon read it back via `archive_reader` with zero live device calls. Config stays the connect-only truth (rule 15); a user `response_metadata` file still wins as an explicit override. Old DBs migrate via a no-op `CREATE TABLE IF NOT EXISTS` (M0-B precedent). |
