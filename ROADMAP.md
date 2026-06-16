@@ -1066,8 +1066,12 @@ B (depends on nothing) → C (touches the poller + B's fetch path; do
 after B so the StationXML pre-acquisition fetch and the poll-backoff are
 designed together).
 
-- [ ] **A. HVSR assigns N/E by channel code, not alphabetically
-      (SCIENCE BUG).** The HVSR tab shows `Z=HHZ N=HHE E=HHN` — North
+- [x] **A. HVSR assigns N/E by channel code, not alphabetically
+      (SCIENCE BUG).** DONE 2026-06-16: `three_component_groups_from_pairs`
+      now maps by orientation char (`N`/`1`→N, `E`/`2`→E, `Z`/`3`→Z);
+      docstring rewritten; regression tests in `tests/core/test_models.py`
+      (alphabet-vs-code mutation-verified). Original report follows. ▸ The
+      HVSR tab shows `Z=HHZ N=HHE E=HHN` — North
       and East are SWAPPED, and the swap is in the science path, not
       just the label: every GUI-generated HVSR curve (live AND archive)
       has fed hvsrpy's `ns`/`ew` reversed. Root cause:

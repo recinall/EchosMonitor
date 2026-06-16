@@ -11,6 +11,7 @@ from echosmonitor.core.models import (
     EchosDeviceSnapshot,
     StreamID,
     StreamSelector,
+    three_component_groups_from_pairs,
 )
 
 
@@ -99,3 +100,52 @@ def test_clock_fields_default_pessimistic() -> None:
     assert snapshot.ntp_synchronized is False
     assert snapshot.time_sync_type == ""
     assert snapshot.pps_offset_us == 0
+
+
+def test_three_component_groups_map_by_orientation_code_not_alphabet() -> None:
+    """M6.6-A: N/E come from the SEED orientation char, never ``sorted()``.
+
+    The bug: ``sorted()`` ordered the full NSLC strings and ``…HHE`` <
+    ``…HHN``, so N got HHE and E got HHN — hvsrpy's ``ns``/``ew`` fed
+    reversed on every GUI HVSR (live + archive). Mutation-verify by
+    reintroducing ``sorted()`` of the horizontals: this asserts N=HHN.
+    """
+    pairs = [
+        ("echos", "IV.STA.00.HHZ"),
+        ("echos", "IV.STA.00.HHN"),
+        ("echos", "IV.STA.00.HHE"),
+    ]
+    groups = three_component_groups_from_pairs(pairs)
+    group = groups["echos"]["IV.STA.00.HH"]
+    assert group["Z"] == "IV.STA.00.HHZ"
+    assert group["N"] == "IV.STA.00.HHN"
+    assert group["E"] == "IV.STA.00.HHE"
+
+
+def test_three_component_groups_numeric_orientation_convention() -> None:
+    """M6.6-A: the SEED ``1``/``2``/``3`` numeric orientation maps 1→N, 2→E, 3→Z."""
+    pairs = [
+        ("echos", "IV.STA.00.EH3"),
+        ("echos", "IV.STA.00.EH1"),
+        ("echos", "IV.STA.00.EH2"),
+    ]
+    groups = three_component_groups_from_pairs(pairs)
+    group = groups["echos"]["IV.STA.00.EH"]
+    assert group["Z"] == "IV.STA.00.EH3"
+    assert group["N"] == "IV.STA.00.EH1"
+    assert group["E"] == "IV.STA.00.EH2"
+
+
+def test_three_component_groups_requires_full_triple() -> None:
+    """A station missing a horizontal orientation is not 3C-capable."""
+    pairs = [
+        ("echos", "IV.STA.00.HHZ"),
+        ("echos", "IV.STA.00.HHN"),
+    ]
+    assert three_component_groups_from_pairs(pairs) == {}
+    # Symmetric: a vertical + East only (missing North) is also not 3C.
+    pairs = [
+        ("echos", "IV.STA.00.HHZ"),
+        ("echos", "IV.STA.00.HHE"),
+    ]
+    assert three_component_groups_from_pairs(pairs) == {}

@@ -330,11 +330,17 @@ def three_component_groups_from_pairs(
 ) -> dict[str, dict[str, dict[str, str]]]:
     """Map ``device -> station_key -> {Z,N,E: nslc}`` for 3C-capable stations.
 
-    A station is 3C-capable when it has a vertical (``Z``) plus two
-    horizontals (``N``/``E`` or ``1``/``2``). The two horizontals map to
-    ``N`` (first) and ``E`` (second) so they feed hvsrpy's ``ns``/``ew``.
-    Pure: consumed by the live HVSR/Archive widgets (over engine buffer
-    keys) and by the archive-browser worker (over DB stream rows).
+    A station is 3C-capable when it has a vertical (``Z``/``3``) plus two
+    horizontals (``N``/``E`` or ``1``/``2``). Horizontals map to hvsrpy's
+    ``ns``/``ew`` BY ORIENTATION CODE, never alphabetically: ``N`` or ``1``
+    → N, ``E`` or ``2`` → E (SEED convention — ``1``/``2`` are the
+    numeric-orientation equivalents of ``N``/``E``); ``Z``/``3`` is the
+    vertical. The orientation char is the last character of the SEED
+    channel code (``parts[3][2]``). Mapping by ``sorted()`` of the full
+    NSLC string is WRONG: ``…HHE`` < ``…HHN`` would put East into N and
+    swap the science inputs to hvsrpy (M6.6-A). Pure: consumed by the live
+    HVSR/Archive widgets (over engine buffer keys) and by the
+    archive-browser worker (over DB stream rows).
     """
     by_device: dict[str, dict[str, dict[str, str]]] = {}
     raw: dict[tuple[str, str], dict[str, str]] = {}
@@ -346,11 +352,12 @@ def three_component_groups_from_pairs(
         station_key = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3][:2]}"
         raw.setdefault((device, station_key), {})[orient] = nslc
     for (device, station), orients in raw.items():
-        vertical = orients.get("Z")
-        horizontals = sorted(n for o, n in orients.items() if o != "Z")
-        if vertical is None or len(horizontals) < 2:
+        vertical = orients.get("Z") or orients.get("3")
+        north = orients.get("N") or orients.get("1")
+        east = orients.get("E") or orients.get("2")
+        if vertical is None or north is None or east is None:
             continue
-        group = {"Z": vertical, "N": horizontals[0], "E": horizontals[1]}
+        group = {"Z": vertical, "N": north, "E": east}
         by_device.setdefault(device, {})[station] = group
     return by_device
 
