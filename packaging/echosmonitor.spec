@@ -27,6 +27,7 @@ The load-bearing collection rules (each is a real failure mode without it):
 """
 
 import os
+import sys
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
@@ -39,6 +40,17 @@ from PyInstaller.utils.hooks import (
 # every spec-relative path on it so the build works from any working directory.
 _HERE = SPECPATH
 _REPO = os.path.abspath(os.path.join(_HERE, os.pardir))
+
+# Per-platform icon (M7-C2). PyInstaller ignores PNG icons on Windows/macOS, so
+# use the derived .ico/.icns (regenerate from the master PNG via
+# packaging/make_icons.py). Linux keeps the PNG — the runtime QApplication icon
+# is set from that same PNG via gui/resources.app_icon() regardless of platform.
+if sys.platform == "win32":
+    _ICON = os.path.join(_HERE, "icons", "EchosMonitor.ico")
+elif sys.platform == "darwin":
+    _ICON = os.path.join(_HERE, "icons", "EchosMonitor.icns")
+else:
+    _ICON = os.path.join(_REPO, "src", "echosmonitor", "resources", "EchosMonitor.png")
 
 # --- metadata (importlib.metadata in the freeze) ----------------------------
 datas = []
@@ -121,10 +133,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # PyInstaller ignores PNG icons on Linux (the runtime QApplication icon is
-    # set from this same PNG via gui/resources.app_icon()); Windows wants .ico
-    # and macOS .icns. M7-C must add per-platform icon variants here.
-    icon=os.path.join(_REPO, "src", "echosmonitor", "resources", "EchosMonitor.png"),
+    icon=_ICON,
 )
 
 coll = COLLECT(
@@ -136,3 +145,21 @@ coll = COLLECT(
     upx_exclude=[],
     name="echosmonitor",
 )
+
+# macOS: wrap the one-dir collection in a proper .app bundle so the M7-C2 .dmg
+# ships a double-clickable application (Finder app, Dock icon, Gatekeeper
+# quarantine target) rather than a bare folder. No-op on Linux/Windows.
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="EchosMonitor.app",
+        icon=_ICON,
+        bundle_identifier="org.echos.echosmonitor",
+        info_plist={
+            # The app is not a document editor and has no Retina-art reason to
+            # advertise high-res capability beyond what Qt already handles.
+            "NSHighResolutionCapable": True,
+            "NSPrincipalClass": "NSApplication",
+        },
+    )
+
