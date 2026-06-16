@@ -93,6 +93,9 @@ class EchosPollTarget:
     host: str
     http_port: int = 80
     poll_interval_s: float = 5.0
+    # M6.6-C: slow heartbeat cadence used while this device's SeedLink
+    # stream is CONNECTED (back off REST while the data proves liveness).
+    poll_interval_streaming_s: float = 30.0
 
 
 class ClockHealth(StrEnum):

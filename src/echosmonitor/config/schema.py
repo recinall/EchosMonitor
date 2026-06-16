@@ -319,6 +319,14 @@ class EchosDeviceConfig(_Base):
     # Lower bound 1 s keeps the poller polite to the ESP32's HTTP server;
     # upper bound 1 h rules out "never" misconfigurations.
     poll_interval_s: Annotated[float, Field(ge=1.0, le=3600.0)] = 5.0
+    # M6.6-C: slow "heartbeat" cadence used WHILE the device's SeedLink
+    # stream is CONNECTED. The live data already proves the device is
+    # alive, so most status polling is redundant; we still poll at this
+    # slower rate to keep clock-health (PPS/GNSS/NTP) and ring % fresh.
+    # Full ``poll_interval_s`` cadence resumes the moment the stream drops
+    # (exactly when REST is useful — reboot vs network hiccup). Default
+    # 30 s; should be >= ``poll_interval_s`` to actually back off.
+    poll_interval_streaming_s: Annotated[float, Field(ge=1.0, le=3600.0)] = 30.0
 
 
 class DeviceConfig(_Base):

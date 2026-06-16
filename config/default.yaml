@@ -26,6 +26,7 @@ devices: []
 #     echos:
 #       http_port: 80
 #       poll_interval_s: 5.0
+#       poll_interval_streaming_s: 30.0   # M6.6-C: slow heartbeat while SeedLink is CONNECTED
 #       # position_override: { lat: 45.4, lon: 11.9, elev_m: 20.0 }  # wins over StationXML (rule 16)
 #
 # Example: TWO public servers in parallel (best-effort, throttled — for

@@ -37,6 +37,7 @@ class _Trigger(QObject):
 
     configureRequested = Signal(object)  # noqa: N815
     fetchRequested = Signal(object)  # noqa: N815 — StationXML one-shot (M6.6-B)
+    streamingChanged = Signal(object)  # noqa: N815 — poll backoff (M6.6-C)
 
 
 class _HangingTransport(httpx.AsyncBaseTransport):
@@ -86,6 +87,9 @@ def _spawn(qtbot: Any, factory: Any) -> tuple[EchosStatusWorker, QThread, _Trigg
     )
     trigger.fetchRequested.connect(
         worker.fetch_stationxml, type=Qt.ConnectionType.QueuedConnection
+    )
+    trigger.streamingChanged.connect(
+        worker.set_streaming, type=Qt.ConnectionType.QueuedConnection
     )
     thread.start()
     qtbot.waitUntil(thread.isRunning, timeout=1000)
@@ -301,5 +305,79 @@ def test_stationxml_bad_payload_is_ignored(qtbot: Any) -> None:
         trigger.fetchRequested.emit("not-a-tuple")
         qtbot.wait(300)
         assert emitted == []
+    finally:
+        _shutdown(worker, thread)
+
+
+def _fast_target(streaming_s: float = 10.0) -> EchosPollTarget:
+    """A target that polls every tick normally but backs off hard when
+    streaming — so a window count cleanly distinguishes the two cadences."""
+    return EchosPollTarget(
+        name="echos-field-01",
+        host="echos-test.local",
+        http_port=80,
+        poll_interval_s=0.2,
+        poll_interval_streaming_s=streaming_s,
+    )
+
+
+def test_streaming_device_backs_off_to_heartbeat(qtbot: Any) -> None:
+    """M6.6-C: a CONNECTED device polls once then waits the slow heartbeat,
+    while a non-streaming device re-polls every tick."""
+    # Baseline: not streaming → many polls in the window.
+    fw_a = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw_a))
+    try:
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            trigger.configureRequested.emit((_fast_target(),))
+        qtbot.wait(1600)
+        baseline = len([r for r in fw_a.requests if r == ("GET", "/api/status")])
+    finally:
+        _shutdown(worker, thread)
+    assert baseline >= 3  # ~every 500 ms tick
+
+    # Streaming: mark CONNECTED before configuring → one poll, then 10 s away.
+    fw_b = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw_b))
+    try:
+        trigger.streamingChanged.emit(frozenset({"echos-field-01"}))
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            trigger.configureRequested.emit((_fast_target(),))
+        qtbot.wait(1600)
+        streaming_polls = len([r for r in fw_b.requests if r == ("GET", "/api/status")])
+    finally:
+        _shutdown(worker, thread)
+    assert streaming_polls == 1  # only the initial poll; heartbeat is 10 s
+
+
+def test_stream_drop_resumes_full_cadence(qtbot: Any) -> None:
+    """When a streaming device stops streaming it is made due immediately,
+    so full-cadence polling resumes at once (reboot-vs-hiccup detection)."""
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        trigger.streamingChanged.emit(frozenset({"echos-field-01"}))
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            trigger.configureRequested.emit((_fast_target(),))
+        qtbot.wait(800)
+        before = len([r for r in fw.requests if r == ("GET", "/api/status")])
+        assert before == 1  # backed off
+        # Stream drops → resume full cadence.
+        trigger.streamingChanged.emit(frozenset())
+        qtbot.wait(1200)
+        after = len([r for r in fw.requests if r == ("GET", "/api/status")])
+        assert after >= before + 2  # polling resumed at full cadence
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_set_streaming_bad_payload_is_ignored(qtbot: Any) -> None:
+    fw = FakeEchosFirmware()
+    worker, thread, trigger = _spawn(qtbot, _factory_for(fw))
+    try:
+        trigger.streamingChanged.emit("not-a-collection")
+        trigger.streamingChanged.emit([1, 2, 3])  # non-str members
+        with qtbot.waitSignal(worker.snapshotReady, timeout=_SNAPSHOT_DEADLINE_MS):
+            trigger.configureRequested.emit((_target(),))
     finally:
         _shutdown(worker, thread)

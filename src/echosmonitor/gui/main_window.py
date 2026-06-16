@@ -74,7 +74,7 @@ from echosmonitor.core.echos_status import EchosStatusWorker
 from echosmonitor.core.hvsr_array import ArrayHvsrResult, HvsrArrayEngine
 from echosmonitor.core.hvsr_engine import HvsrEngine
 from echosmonitor.core.info_worker import InfoWorker
-from echosmonitor.core.models import AcquisitionState, EchosPollTarget
+from echosmonitor.core.models import AcquisitionState, ConnState, EchosPollTarget
 from echosmonitor.core.positions import PositionQuery, PositionResolver
 from echosmonitor.core.response import ResponseProvider
 from echosmonitor.core.session import resolve_base_archive_root
@@ -252,6 +252,11 @@ class MainWindow(QMainWindow):
     # ``EchosStatusWorker.fetch_stationxml`` across the thread boundary
     # (QueuedConnection). Carries tuple[EchosPollTarget, ...].
     _stationXmlFetchRequested = Signal(object)  # noqa: N815
+    # M6.6-C: the set of devices whose SeedLink stream is CONNECTED,
+    # delivered to ``EchosStatusWorker.set_streaming`` (QueuedConnection)
+    # so the poller backs off to the slow heartbeat cadence. Carries a
+    # frozenset[str] of device names.
+    _streamingDevicesChanged = Signal(object)  # noqa: N815
 
     def __init__(
         self,
@@ -394,10 +399,17 @@ class MainWindow(QMainWindow):
         self._echos_worker.stationXmlReady.connect(
             self._on_stationxml_ready, type=Qt.ConnectionType.QueuedConnection
         )
+        # M6.6-C: feed the streaming-device set to the poller so it backs
+        # off to the slow heartbeat cadence while a stream is CONNECTED.
+        self._streamingDevicesChanged.connect(
+            self._echos_worker.set_streaming, type=Qt.ConnectionType.QueuedConnection
+        )
         # Per-acquisition fetch de-dup + the latest blob per device (so a
         # monitoring fetch is reused when the device starts recording).
         self._stationxml_requested: set[str] = set()
         self._stationxml_blobs: dict[str, str] = {}
+        # M6.6-C: devices currently CONNECTED at the SeedLink level.
+        self._streaming_devices: set[str] = set()
         self._echos_thread.start()
         QMetaObject.invokeMethod(
             self._echos_worker, "start", Qt.ConnectionType.QueuedConnection
@@ -1411,6 +1423,8 @@ class MainWindow(QMainWindow):
         # Same-thread connections (Auto resolves to Direct); cross-thread is
         # already Queued inside the engine. No explicit Queued needed here.
         self._engine.deviceStateChanged.connect(self._device_panel.on_device_state)
+        # M6.6-C: track SeedLink CONNECTED state to drive the poll backoff.
+        self._engine.deviceStateChanged.connect(self._on_device_state_streaming)
         # M2-C acquisition badges (rule 13): queued so the panel's
         # handler never runs re-entrantly inside an engine emit.
         self._engine.acquisitionStateChanged.connect(
@@ -1582,6 +1596,7 @@ class MainWindow(QMainWindow):
                 host=d.host,
                 http_port=d.echos.http_port,
                 poll_interval_s=d.echos.poll_interval_s,
+                poll_interval_streaming_s=d.echos.poll_interval_streaming_s,
             )
             for d in self._store.root.devices
             if d.echos is not None
@@ -1601,8 +1616,28 @@ class MainWindow(QMainWindow):
                     host=d.host,
                     http_port=d.echos.http_port,
                     poll_interval_s=d.echos.poll_interval_s,
+                    poll_interval_streaming_s=d.echos.poll_interval_streaming_s,
                 )
         return None
+
+    def _on_device_state_streaming(self, device_name: str, conn_int: int) -> None:
+        """Track SeedLink CONNECTED devices for the poll backoff (M6.6-C).
+
+        Keyed off ``ConnState.CONNECTED``: while the socket is up the data
+        stream proves the device is alive, so the status poller backs off to
+        the slow heartbeat cadence. Any other state (drop/reconnect) removes
+        the device, resuming full-cadence polling — exactly when REST is
+        useful. Pushes to the worker only on an actual set change.
+        """
+        streaming = conn_int == int(ConnState.CONNECTED)
+        was_streaming = device_name in self._streaming_devices
+        if streaming == was_streaming:
+            return
+        if streaming:
+            self._streaming_devices.add(device_name)
+        else:
+            self._streaming_devices.discard(device_name)
+        self._streamingDevicesChanged.emit(frozenset(self._streaming_devices))
 
     def _on_acquisition_stationxml(self, device_name: str, state_int: int) -> None:
         """Fetch + persist the device StationXML across acquisition changes.

@@ -42,6 +42,7 @@ def test_echos_section_defaults() -> None:
     assert device.echos is not None
     assert device.echos.http_port == 80
     assert device.echos.poll_interval_s == 5.0
+    assert device.echos.poll_interval_streaming_s == 30.0  # M6.6-C
     assert device.echos.position_override is None
 
 
@@ -59,6 +60,8 @@ def test_position_override_roundtrip() -> None:
         ("http_port", 65536),
         ("poll_interval_s", 0.5),
         ("poll_interval_s", 3601.0),
+        ("poll_interval_streaming_s", 0.5),
+        ("poll_interval_streaming_s", 3601.0),
     ],
 )
 def test_echos_bounds_rejected(field: str, value: float) -> None:

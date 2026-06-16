@@ -1157,7 +1157,17 @@ designed together).
       `qt-worker-threading` (off-thread fetch). qt-concurrency-auditor
       REQUIRED (new off-thread fetch + storage write).
 
-- [ ] **C. Minimize REST polling while SeedLink streams.** The status
+- [x] **C. Minimize REST polling while SeedLink streams.** DONE 2026-06-16:
+      slow-heartbeat policy (see decision log) — `EchosStatusWorker` gains a
+      `set_streaming` slot + a worker-thread streaming set; the tick uses
+      `poll_interval_streaming_s` (default 30 s) while a device is in the
+      set, and a device leaving the set is made due immediately to resume
+      full cadence. MainWindow keys the set off `engine.deviceStateChanged ==
+      ConnState.CONNECTED` and pushes only on change. Schema knob
+      `echos.poll_interval_streaming_s` (mirrored in both default.yaml).
+      Worker timing tests (back-off + resume-on-drop, mutation-verified) +
+      MainWindow wiring + schema bounds; qt-concurrency-auditor PASS.
+      Original plan follows. ▸ The status
       poller (`core/echos_status.py`, `EchosStatusWorker`, started
       unconditionally in `main_window.py:371-378`, one shared QThread)
       hits THREE public GETs every `echos.poll_interval_s` (default 5 s,
@@ -1294,6 +1304,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 | 2026-06-16 | M6.6-A: map HVSR horizontals by **orientation code** (`N`/`1`→N, `E`/`2`→E), never by `sorted()` of the NSLC string | The bug (`models.py:350`) sorted full NSLCs so `…HHE` < `…HHN` put East into N — swapping the science inputs to hvsrpy on every GUI HVSR (live + archive), not just the label. The orientation char is already parsed (`parts[3][2]`); use it. f0 survives for symmetric horizontal combos (geom-mean/squared-avg) but directional readings were wrong. |
 | 2026-06-16 | M6.6-B: persist the fetched StationXML in a **new `session_stationxml(session_id, device_name, xml_blob, fetched_at)` table** (schema v6), not in config or a sidecar file | Rule 14 scopes it to the session that recorded with it; rule 8 puts the write on the storage thread after fsync; the Archive tab + archive HVSR/decon read it back via `archive_reader` with zero live device calls. Config stays the connect-only truth (rule 15); a user `response_metadata` file still wins as an explicit override. Old DBs migrate via a no-op `CREATE TABLE IF NOT EXISTS` (M0-B precedent). |
 | 2026-06-16 | M6.6-C: the "back off REST while SeedLink streams" **cadence (hard-skip vs slow heartbeat) is left to the implementing session** to decide with the `echos-rest-api` skill in hand and decision-log then | The trade is real (clock-health freshness vs device/LAN load) and best judged against the live device; the plan fixes only the policy shape (key off `ConnState.CONNECTED` + recent packets, resume full cadence on stall) and the schema-knob requirement. |
+| 2026-06-16 | M6.6-C **resolved: SLOW HEARTBEAT (default 30 s), not hard-skip; full 3-GET snapshot retained at the slower cadence** (schema knob `echos.poll_interval_streaming_s`) | Clock discipline (PPS/GNSS/NTP) is timestamp-trust and stays worth refreshing during a recording, so a heartbeat beats a full skip. Keeping the whole snapshot (status + seedlink + calibrate) at the slow rate — rather than dropping individual GETs — keeps `EchosDeviceSnapshot` coherent (no partial-update model) and is the lower-risk change; the device/LAN win comes from the 6× cadence drop (5 s→30 s). **Streaming is keyed off `ConnState.CONNECTED`** (the SeedLink socket-liveness proxy): on any drop/reconnect the device leaves the set and is made due immediately, so full-cadence polling resumes at once — exactly when REST matters (reboot vs hiccup). A CONNECTED-but-silent socket keeps the slow cadence; acceptable because a real stall transitions ConnState off CONNECTED. |
 | 2026-06-10 | M0 order: **B (AI removal) before A (rename)** | Removal shrinks the rename surface (deletes one of three platformdirs sites, `ai_engine.py:593`, plus extras/overrides); deletion is verifiable by the acceptance grep + gate even with no tests. docs/AUDIT.md §4. |
 | 2026-06-10 | M0-A QSettings: **reset, log once** — no migration | QSettings stores only window geometry/dock layout/column state (`main_window.py:2084`, `station_browser.py:602,948`); migration code would outweigh the value. |
 | 2026-06-10 | M0-A storage paths: **no migration** of old `SeedTiLa` data dirs | Product refactor with no deployed base assumed; M2 re-roots archives per project anyway. Old default was `user_data_dir("seedlink_dashboard","SeedTiLa")/archive` (`streaming_engine.py:1689,1900`). Revisit before M0 ships if field archives exist. |

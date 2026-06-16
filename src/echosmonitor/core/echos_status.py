@@ -113,6 +113,10 @@ class EchosStatusWorker(QObject):
         self._targets: tuple[EchosPollTarget, ...] = ()
         # Per-device monotonic deadline of the next poll. 0.0 = due now.
         self._next_due: dict[str, float] = {}
+        # M6.6-C: devices whose SeedLink stream is CONNECTED — polled at
+        # the slow heartbeat cadence. Worker-thread-only state (mutated in
+        # the queued set_streaming slot, read on the tick), so no lock.
+        self._streaming: set[str] = set()
         self._timer: QTimer | None = None
         self._stop_flag = False
         # Guards the read-modify-write of ``_in_flight`` so ``stop()``
@@ -160,7 +164,35 @@ class EchosStatusWorker(QObject):
         # Keep due times for devices that survive the change; new ones
         # poll on the next tick. Removed devices drop their entry.
         self._next_due = {t.name: self._next_due.get(t.name, 0.0) for t in targets}
+        # Prune streaming flags for devices that are no longer targets
+        # (worker-thread-only state; harmless if stale but keep it tidy).
+        self._streaming &= {t.name for t in targets}
         _log.info("echos_status_configured", device_count=len(targets))
+
+    @Slot(object)
+    def set_streaming(self, devices: object) -> None:
+        """Replace the set of CONNECTED-streaming devices (M6.6-C).
+
+        Payload contract (rule 4): an iterable of device-name strings (the
+        GUI sends a ``frozenset``/``tuple``). Devices in the set poll at the
+        slow heartbeat cadence; the rest poll at the full cadence. A device
+        that just STOPPED streaming is made due immediately so full-cadence
+        polling resumes at once (that is exactly when REST is useful — to
+        tell a reboot from a transient drop). Worker-thread-only state.
+        """
+        if self._stop_flag:
+            return
+        if not isinstance(devices, (set, frozenset, tuple, list)) or not all(
+            isinstance(d, str) for d in devices
+        ):
+            _log.warning("echos_streaming_bad_payload", payload_type=type(devices).__name__)
+            return
+        new_streaming = set(devices)
+        # Devices that left the streaming set become due now (resume full
+        # cadence immediately rather than after the slow heartbeat).
+        for name in self._streaming - new_streaming:
+            self._next_due[name] = 0.0
+        self._streaming = new_streaming
 
     @Slot(object)
     def fetch_stationxml(self, targets: object) -> None:
@@ -208,7 +240,14 @@ class EchosStatusWorker(QObject):
             self._poll_one(target)
             # Schedule from completion, not from the due time: a slow
             # device must not accumulate a poll backlog against itself.
-            self._next_due[target.name] = time.monotonic() + target.poll_interval_s
+            # While the SeedLink stream is CONNECTED, back off to the slow
+            # heartbeat cadence (M6.6-C) — the data itself proves liveness.
+            interval = (
+                target.poll_interval_streaming_s
+                if target.name in self._streaming
+                else target.poll_interval_s
+            )
+            self._next_due[target.name] = time.monotonic() + interval
 
     @Slot()
     def release(self) -> None:
