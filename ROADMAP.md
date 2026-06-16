@@ -1411,6 +1411,17 @@ Acceptance: pushing tag `v0.1.0` yields three downloadable artifacts that
 launch on a clean machine of each OS and complete the M2 happy path
 (connect → Monitor → Record → Stop) against a fake/real device.
 
+**Shipped 2026-06-16 — v0.1.0 released.** `git tag v0.1.0` triggered
+`release.yml`, which built + published the GitHub Release (non-draft) with
+four artifacts: `EchosMonitor-0.1.0-x86_64.AppImage`,
+`EchosMonitor-0.1.0-windows-setup.exe`, `EchosMonitor-0.1.0-windows-portable.zip`,
+`EchosMonitor-0.1.0.dmg`. hatch-vcs resolved the clean tag to `0.1.0`; each
+build passed the packaged `--check` smoke. **The artifact-production half of
+acceptance is met; the "launch on a clean machine + M2 happy path" half is
+still PENDING field validation** on real Windows/macOS/Linux hardware (M6.6 +
+M7 have never run on a clean machine or against a real device). macOS is
+unsigned and its test gate is non-blocking (M7-C1c).
+
 ---
 
 ## Decision log
