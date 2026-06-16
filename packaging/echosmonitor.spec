@@ -156,8 +156,11 @@ if sys.platform == "darwin":
         icon=_ICON,
         bundle_identifier="org.echos.echosmonitor",
         info_plist={
-            # The app is not a document editor and has no Retina-art reason to
-            # advertise high-res capability beyond what Qt already handles.
+            # Qt renders at native Retina resolution, so advertise HiDPI
+            # support (without this the app is drawn upscaled/blurry on Retina
+            # displays). CFBundleShortVersionString is left at PyInstaller's
+            # default for now — threading the resolved version into Info.plist
+            # lands with M7-D (signing/notarization touches the plist anyway).
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",
         },

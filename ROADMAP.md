@@ -1393,10 +1393,16 @@ platforms from CI, reproducibly.
 - [ ] **D. Signing** (open question 6): Windows code signing and macOS
       notarization need certificates/Apple account — ship unsigned first
       with documented Gatekeeper/SmartScreen instructions; wire signing as
-      optional CI secrets.
-- [ ] **E. Packaged smoke test**: CI launches the built binary headless
-      (`QT_QPA_PLATFORM=offscreen`) with `--version` and a minimal
-      start/quit, so a broken bundle fails the release, not the user.
+      optional CI secrets. *Carry-forward (M7-C2 reviewer): thread the
+      resolved version into the macOS `.app` `Info.plist`
+      (`CFBundleShortVersionString`, currently PyInstaller's `0.0.0` default)
+      while here — notarization touches the plist anyway.*
+- [x] **E. Packaged smoke test** *(done via M7-C2)*: every release `build`
+      job runs the bundle's `--check` (headless config + main-window
+      construct + exit-by-code) plus `--version`, embedded in
+      `scripts/build.{sh,ps1}`, so a broken bundle fails the release job, not
+      the user. Exit-code based so it works on the Windows GUI-subsystem
+      build that has no stdout.
 - [ ] **F. Runtime sanity in bundle**: platformdirs paths, keyring backend
       availability per OS (fallback path tested), QSettings org/app, log
       file location documented.
