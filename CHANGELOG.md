@@ -8,12 +8,6 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
-### Added
-- **M7-A** — Release versioning: the package version is now derived from the git
-  tag via hatch-vcs (with an `importlib.metadata` → generated `_version.py` →
-  `0.0.0+dev` fallback). The main-window title now shows the version, and the
-  application/window icon is wired from a packaged resource.
-
 ## [0.1.0] — 2026-06-16
 
 First end-to-end release of EchosMonitor as an Echos-specific monitor for
@@ -45,6 +39,13 @@ Highlights, by milestone:
 - **M6.6 — Pre-release refinements:** HVSR horizontals mapped by SEED orientation
   code (not alphabetically), an in-app Log tab, per-session StationXML auto-fetch
   and persistence, and a slow-heartbeat REST poll cadence while SeedLink streams.
+- **M7 — Release engineering:** git-tag-driven versioning (hatch-vcs) with the
+  version in the window title/About dialog; PyInstaller one-dir desktop bundles;
+  a 3-OS GitHub Actions gate (ruff/mypy/pytest on Linux/Windows/macOS) and the
+  cross-platform port it exposed (Windows MiniSEED int dtype + binary I/O, fsync,
+  QSettings, worker-thread teardown); and a tag-driven release pipeline producing
+  a Linux AppImage, a Windows Inno Setup installer + portable zip, and a macOS
+  `.dmg`. macOS ships unsigned and its test suite is not yet green (tracked).
 
 ### Removed
 - **M0:** the entire AI subsystem (agents/seisbench/torch/phasenet) and the
