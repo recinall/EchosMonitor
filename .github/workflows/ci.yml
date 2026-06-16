@@ -60,7 +60,10 @@ jobs:
             libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        # Pinned to a full version: setup-uv publishes only `vX.Y.Z` tags for
+        # the v8 line (no moving `v8` major tag), and an exact pin is the
+        # supply-chain-safe form anyway.
+        uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: true
           # Sets UV_PYTHON for the rest of the job; uv provisions the
