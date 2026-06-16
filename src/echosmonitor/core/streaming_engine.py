@@ -359,6 +359,14 @@ class StreamingEngine(QObject):
         self._chain_max_q = max(1, self._refresh_hz * _CHAIN_QUEUE_FACTOR)
         self._threads: dict[str, QThread] = {}
         self._workers: dict[str, SeedLinkWorker] = {}
+        # (QThread, SeedLinkWorker) pairs whose bounded join timed out during
+        # teardown — held for the engine's lifetime so the still-running
+        # QThread is never garbage-collected (a hard "QThread: Destroyed while
+        # thread is still running" abort). This mirrors the HVSR engines'
+        # abandoned-thread retention (M6-0 decision log). Seen on macOS, where
+        # obspy's blocking recv can outlive the stop() deadline; the thread
+        # finishes on its own once the socket finally unwinds.
+        self._abandoned_threads: list[tuple[QThread, SeedLinkWorker]] = []
         self._bridges: dict[str, _DeviceBridge] = {}
         # Per-stream state is keyed by ``device_stream_key(device, nslc)``
         # so two devices with overlapping NSLC remain independent. The
@@ -1165,6 +1173,11 @@ class StreamingEngine(QObject):
         for name, thread in self._threads.items():
             if not thread.wait(_THREAD_JOIN_MS):
                 _log.warning("streaming_engine_thread_join_timeout", device=name)
+                # Retain the still-running pair so the `_threads.clear()` below
+                # cannot drop its last reference and trigger a Qt abort.
+                stuck_worker = self._workers.get(name)
+                if stuck_worker is not None:
+                    self._abandoned_threads.append((thread, stuck_worker))
 
         # Stop the DSP thread. Both ``_clearChainsRequested`` and
         # ``_clearSpectrogramsRequested`` are wired with
@@ -1984,6 +1997,10 @@ class StreamingEngine(QObject):
             thread.quit()
             if not thread.wait(_THREAD_JOIN_MS):
                 _log.warning("streaming_engine_thread_join_timeout", device=name)
+                # Retain the still-running pair so the pops below cannot drop
+                # its last reference and trigger a Qt abort (see stop()).
+                if worker is not None:
+                    self._abandoned_threads.append((thread, worker))
         if bridge is not None:
             for signal in (
                 bridge.packetReceivedNamed,

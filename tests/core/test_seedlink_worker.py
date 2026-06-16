@@ -41,7 +41,12 @@ class _LoopThread:
 
     def start(self) -> None:
         def _run() -> None:
-            self.loop = asyncio.new_event_loop()
+            # Force a SelectorEventLoop. On Windows the default is the
+            # ProactorEventLoop, where transport.get_extra_info("socket")
+            # does not expose the raw socket the way inject_disconnect()
+            # needs to set SO_LINGER and force a TCP RST — so the worker
+            # never sees the server-side disconnect (the reconnect test).
+            self.loop = asyncio.SelectorEventLoop()
             asyncio.set_event_loop(self.loop)
             self._ready.set()
             self.loop.run_forever()

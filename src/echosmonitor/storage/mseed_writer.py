@@ -101,6 +101,11 @@ _PAUSE_DURATION_S: float = 30.0
 # class before handing data to obspy (see :meth:`MseedWriter._encode`).
 _OBSPY_INT32_TYPE = np.dtype(np.int32).type
 
+# Open flag forcing binary (untranslated) I/O. On Windows os.open defaults to
+# TEXT mode, which mangles 0x0A bytes in the binary MiniSEED stream; this flag
+# is Windows-only (0 elsewhere), so the OR is a no-op on POSIX.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 _log = structlog.get_logger(__name__)
 
 
@@ -535,7 +540,11 @@ class MseedWriter(QObject):
             self._validate_or_truncate(path)
             self._validated_paths.add(path)
 
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        # ``_O_BINARY`` is mandatory on Windows: without it os.open uses TEXT
+        # mode and translates every 0x0A byte in the binary MiniSEED to
+        # 0x0D 0x0A on write, corrupting record alignment (obspy then reads
+        # "Not a SEED record"). It is 0 on POSIX, so this is a no-op there.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY, 0o644)
         self._open_files[path] = fd
         return fd
 
