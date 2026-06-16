@@ -1366,18 +1366,43 @@ platforms from CI, reproducibly.
         reproduce/diagnose (a recv-timeout on the obspy socket, or
         `pytest-forked` isolation, are the leads). Until then macOS runs +
         reports but does not block the gate.
-  - [ ] **C2. Tag release** (`.github/workflows/release.yml`, next PR): on tag
-        `v*` build artifacts — Windows → installer (Inno Setup) + portable zip;
-        Linux → AppImage; macOS → .dmg — and upload to the GitHub Release.
-        Folds in M7-C carry-forwards (per-platform `.ico`/`.icns` icons) and
-        the M7-E packaged headless smoke (`--check`).
+  - [x] **C2. Tag release** (`.github/workflows/release.yml`): on tag `v*` (and
+        `workflow_dispatch` for dry-run testing) build per-OS artifacts and
+        publish to the GitHub Release. *Workflow + packaging authored
+        2026-06-16; Linux artifact validated locally end-to-end; Windows/macOS
+        validated via `workflow_dispatch` CI:*
+    - [x] per-platform icons (`.ico`/`.icns`) generated from the master PNG by
+          `packaging/make_icons.py` (committed under `packaging/icons/`); the
+          spec selects per `sys.platform`. **macOS BUNDLE** added to the spec so
+          the build emits a real `EchosMonitor.app` (the `.dmg` payload).
+    - [x] **Linux → AppImage** (`packaging/linux/build_appimage.sh`):
+          AppDir + `appimagetool --appimage-extract-and-run` (no FUSE).
+          Validated locally: the `.AppImage` runs `--version` + `--check` green.
+    - [x] **Windows → Inno Setup installer + portable `.zip`**
+          (`packaging/windows/echosmonitor.iss`; `choco install innosetup`).
+    - [x] **macOS → `.dmg`** (`packaging/macos/build_dmg.sh`, `hdiutil`,
+          .app + `/Applications` symlink). Unsigned (signing is M7-D).
+    - [x] M7-E packaged smoke folded in: `scripts/build.{sh,ps1}` run the
+          `--check` headless start/quit after every build, so a broken bundle
+          fails the release job, not the user.
+    - [x] `publish` job (softprops/action-gh-release) runs only on a real `v*`
+          tag; `workflow_dispatch` stops after `build` (artifacts downloadable
+          from the run) so the pipeline is validated before the first tag.
+          Least-privilege: `contents: read` default, `contents: write` only on
+          the publish job.
 - [ ] **D. Signing** (open question 6): Windows code signing and macOS
       notarization need certificates/Apple account — ship unsigned first
       with documented Gatekeeper/SmartScreen instructions; wire signing as
-      optional CI secrets.
-- [ ] **E. Packaged smoke test**: CI launches the built binary headless
-      (`QT_QPA_PLATFORM=offscreen`) with `--version` and a minimal
-      start/quit, so a broken bundle fails the release, not the user.
+      optional CI secrets. *Carry-forward (M7-C2 reviewer): thread the
+      resolved version into the macOS `.app` `Info.plist`
+      (`CFBundleShortVersionString`, currently PyInstaller's `0.0.0` default)
+      while here — notarization touches the plist anyway.*
+- [x] **E. Packaged smoke test** *(done via M7-C2)*: every release `build`
+      job runs the bundle's `--check` (headless config + main-window
+      construct + exit-by-code) plus `--version`, embedded in
+      `scripts/build.{sh,ps1}`, so a broken bundle fails the release job, not
+      the user. Exit-code based so it works on the Windows GUI-subsystem
+      build that has no stdout.
 - [ ] **F. Runtime sanity in bundle**: platformdirs paths, keyring backend
       availability per OS (fallback path tested), QSettings org/app, log
       file location documented.
@@ -1392,6 +1417,7 @@ launch on a clean machine of each OS and complete the M2 happy path
 
 | Date | Decision | Why |
 |------|----------|-----|
+| 2026-06-16 | M7-C2: `release.yml` triggers on **tag `v*` AND `workflow_dispatch`**; the `publish` (GitHub Release) job is gated on the tag, so a manual dispatch builds + uploads artifacts WITHOUT cutting a release. Per-OS artifacts: Linux AppImage (`appimagetool --appimage-extract-and-run`, no FUSE), Windows Inno Setup installer + portable zip (`choco install innosetup`), macOS `.dmg` (`hdiutil`, via a new spec `BUNDLE` → `EchosMonitor.app`). Icons (`.ico`/`.icns`) are committed, generated from the master PNG by `packaging/make_icons.py`. | The dispatch/tag split lets the whole pipeline be validated on all three runners before the irreversible first tag — the same de-risking the M7-C1 gate-first split bought (and exactly what avoided guessing here: the Linux AppImage was proven locally end-to-end, `--version` + `--check` green, but the Windows/Inno + macOS/dmg paths can only be exercised on their runners). AppImage over a raw tarball gives a single double-clickable file with no FUSE requirement on the build side; Inno over NSIS for a conventional Windows installer UX; `hdiutil` over `create-dmg` to avoid a brew dependency. Committing the derived icons (vs generating in CI) keeps the spec runnable directly (local + CI) with the PNG as the one source of truth and `make_icons.py` as the regenerator. Artifacts are unsigned — signing is M7-D, wired later as optional secrets so an unsigned release ships now. | 
 | 2026-06-16 | M7-C1: **macOS is non-blocking (`continue-on-error`)**; Ubuntu + Windows are the required, green matrix. Also pinned `astral-sh/setup-uv@v8.2.0` (no moving `v8` tag is published) and the uv version to `0.11.21` (must match the lockfile generator, else `uv sync --locked` rejects it). | macOS-arm64 hits a `Fatal Python error: Aborted` during GC across the ~15 real-socket SeedLink integration tests: obspy's blocking `receive_data` (C, GIL-released) does not unwind at test teardown, and a later test's garbage-collect aborts the interpreter. It is not a EchosMonitor logic bug (Windows + Linux exercise the same paths green) but an obspy-on-macOS + threads + GC interaction, and it is not reproducible or safely fixable without real macOS hardware — chasing it blind would burn many ~6-min CI cycles with no local repro. Landing Linux + Windows green now ships the real value (the cross-platform port found genuine storage/durability/portability bugs); macOS keeps running + reporting under `continue-on-error` and is tracked as M7-C1c. The defensive QThread/worker retention added to the engine + harness stays (it is correct and pattern-consistent even though it does not resolve the GC abort). | 
 | 2026-06-16 | M7-C1: the first real 3-OS CI run surfaced that **the app had never run on Windows/macOS**; fixed every exposed portability bug in-PR rather than deferring (user call). Real `src` bugs: (1) the MiniSEED writer's direct `_write_mseed` binding KeyError'd on Windows because an int32-WIDTH array there carries the `np.intc` scalar class, which is `==` by dtype but absent from obspy's `SAMPLETYPE` map — canonicalise to `np.dtype(np.int32).type` with a zero-copy `.view` only when it differs (Linux hot path untouched); (2) `os.fsync` on a **read-only** fd raises EBADF on Windows — the export + HVSR-report atomic writes reopened the just-written file `"rb"` then fsync'd; reopen `"rb+"`; (3) `QSettings(org, app)` uses the **Windows registry** (NativeFormat), which `setPath` can't redirect (test-isolation hole) and isn't portable — route all settings through `gui/qsettings_util.open_settings` (IniFormat file on every OS) + `setDefaultFormat(IniFormat)` at bootstrap. Test-only platform assumptions (the handoff's anticipated class): SDS path asserts compared `/`-literal strings (Windows renders `\`) → assert on `Path.parts`/`.parents`; dock-minimum asserts were `==` exact px (font-metric-dependent) → `>=` the design floor + a relative central-width check; the SO_LINGER RST in the fake server packed `"ii"` (POSIX `struct linger`) which fails on Windows' `u_short` layout → `"HH"` on win32; the seedlink worker-test harness now retains worker/thread pairs whose bounded join times out (obspy recv slow to unwind on macOS) so a later test's GC can't trigger a "QThread destroyed while running" abort (same precaution as the HVSR engines). | The product targets Windows/macOS desktops (M7); shipping a release whose science-critical storage path crashes on two of three platforms is not acceptable, and the bugs were real (encoding, durability-fsync, settings portability), not cosmetic. Fixing in-PR keeps the gate honestly green on all three OSes rather than merging a known-red tier-2. Storage changes preserve the Linux hot path (M6.5-C zero-copy) and were verified by the existing round-trip tests now running on Windows CI plus two new ones (obspy-key pin + uint round-trip). |
 | 2026-06-16 | M7-C: split into **two PRs — PR gate (`ci.yml`) first, tag release (`release.yml`) next**; gate is a 3-OS matrix running the documented `ruff`/`mypy`/`pytest` gate | The cross-OS test surface (paths, keyring backends, offscreen Qt) is the real unknown and is independent of the installer work; landing the gate first turns those failures green before the heavier Inno/AppImage/.dmg build, and keeps each change PR-sized. Two workflow files (not one with tag-conditionals) keep the PR-push and tag-`v*` triggers independent and obvious. The gate is already green locally on Linux (ruff 0, mypy 0, 1206 passed), so `ci.yml` reproduces a known-good command set; the per-OS unknowns (paths, keyring, offscreen Qt) only surface on CI itself. `fetch-depth: 0` is mandatory: hatch-vcs reads full history (no tags yet) and a shallow clone breaks `uv sync`'s editable build. |
