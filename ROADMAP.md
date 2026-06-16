@@ -1049,6 +1049,180 @@ device) remains the only unexercised write. The legacy-config
 migration question is SUPERSEDED — the user re-added the device via
 the wizard; pihw.local can be added manually the same way if wanted.
 
+## M6.6 — Pre-release refinements (planned 2026-06-16; do M6.6 before M7)
+
+Four user-requested refinements from the 2026-06-15 GUI session. This
+section is a HANDOFF: each item below carries its root-cause, the exact
+files/lines, the acceptance criteria, the rule constraints, and the
+decision already taken, so a fresh post-`/clear` session can execute it
+stage by stage. Investigated read-only; nothing was implemented in the
+planning session. Per CLAUDE.md workflow: run the named skill FIRST for
+each stage, write the regression test (mutation-verify it), full gate in
+the BACKGROUND (one pytest instance, `timeout 600`), `code-reviewer` on
+every diff + `qt-concurrency-auditor` on anything touching workers/
+threads/timers, update the boxes + decision log, commit per stage.
+Suggested order: A (small, science-critical) → D (self-contained) →
+B (depends on nothing) → C (touches the poller + B's fetch path; do
+after B so the StationXML pre-acquisition fetch and the poll-backoff are
+designed together).
+
+- [ ] **A. HVSR assigns N/E by channel code, not alphabetically
+      (SCIENCE BUG).** The HVSR tab shows `Z=HHZ N=HHE E=HHN` — North
+      and East are SWAPPED, and the swap is in the science path, not
+      just the label: every GUI-generated HVSR curve (live AND archive)
+      has fed hvsrpy's `ns`/`ew` reversed. Root cause:
+      `core/models.py:348-354` `three_component_groups_from_pairs` does
+      `horizontals = sorted(n for o, n in orients.items() if o != "Z")`
+      then `{"N": horizontals[0], "E": horizontals[1]}` — `sorted()`
+      orders the full NSLC strings, and `…HHE` < `…HHN` alphabetically,
+      so N gets HHE and E gets HHN. The orientation code is ALREADY
+      parsed one block up (`orient = parts[3][2]`, line 345) but then
+      thrown away. Fix: map by orientation suffix — `N` or `1` → N,
+      `E` or `2` → E (keep `Z`/`3` handling), and when only `1`/`2`
+      exist map 1→N, 2→E (SEED convention); the docstring at
+      `models.py:333-335` currently codifies the wrong "first/second"
+      rule — rewrite it. The fix is ONE function; the consumers
+      (`gui/widgets/hvsr_widget.py:507-509` label,
+      `core/hvsr_engine.py:216-220` live capture,
+      `core/hvsr.py:412-415` hvsrpy feed + `:866-911` archive slice)
+      all read the corrected dict automatically. Acceptance: a unit
+      test on `three_component_groups_from_pairs` proving HHZ/HHN/HHE
+      AND the 1/2/3 convention map by code not alphabet (mutation-
+      verify by reintroducing `sorted()`); the HVSR label shows
+      `N=HHN E=HHE`. Decision-log that pre-fix GUI HVSR results had
+      N/E swapped (horizontal-combination dependent: geometric-mean /
+      squared-average are symmetric in N,E so f0 is unaffected, but
+      azimuth-dependent combos and any directional reading were wrong).
+      Skill: `hvsr-array` (and re-read its component-ordering note).
+      No worker/thread surface → no qt-concurrency-auditor needed.
+
+- [ ] **B. Auto-read + persist the device StationXML.** The firmware
+      serves `GET /api/stationxml` (public, no auth — `echos_api.py:450
+      get_stationxml`, already used by the wizard for selectors and by
+      `core/positions.py` for coordinates). Goal: fetch it
+      automatically BEFORE each acquisition and PERSIST it per session
+      so Archive browsing and archive HVSR/deconvolution use the real
+      instrument response + coordinates without re-querying the device.
+      Today instrument response comes ONLY from a user-supplied local
+      file (`device.response_metadata.path` → `core/response.py
+      ResponseProvider`); if absent, HVSR/decon silently degrade to
+      counts. Plan:
+      (1) Pure async helper `fetch_stationxml(client) -> str | None`
+          (never raises; logs + None on failure). Lives in `core/`
+          (rule 2 networking is sanctioned in `echos_api`/adjacent).
+      (2) Fetch OFF the GUI thread (rule 1) when a device goes
+          Idle→Monitoring/Recording (rule 13 — user-triggered, never on
+          launch). Reuse the status-poller thread or a one-shot task;
+          design the trigger TOGETHER with item C's poll-backoff so the
+          two REST touch-points share one policy.
+      (3) Persist per session+device (rule 14): new
+          `session_stationxml(session_id, device_name, xml_blob,
+          fetched_at, UNIQUE(session_id,device_name))` table in
+          `storage/db.py` (schema bump v5→v6, `CREATE TABLE IF NOT
+          EXISTS`, migration is a no-op stub for old DBs per the M0-B
+          precedent), DAO write on the storage thread after fsync
+          (rule 8), read-back via `storage/archive_reader.py
+          read_session_stationxml(...)`.
+      (4) `core/response.py`: a `ResponseProvider.from_stationxml_blob`
+          path so a `ResponseRemover` can be built from the persisted
+          XML (live decon keeps the config-file override as the winner,
+          rule 16-style: explicit override > fetched StationXML).
+      Acceptance: against the fake firmware, starting a recording
+      persists the StationXML blob; the Archive tab / archive HVSR for
+      that session resolve a response from the blob with NO live device
+      call; fetch failure degrades gracefully (counts, one warn).
+      Files: `core/echos_api.py` (helper or reuse), `core/
+      streaming_engine.py` (fetch+persist orchestration),
+      `storage/db.py` + `storage/dao.py` + `storage/archive_reader.py`,
+      `core/response.py`, fake at `tests/core/echos_fake.py` already
+      serves a 3-channel StationXML. Skills: `echos-rest-api` (endpoint/
+      auth) + `miniseed-sds` (DB-after-fsync, schema) +
+      `qt-worker-threading` (off-thread fetch). qt-concurrency-auditor
+      REQUIRED (new off-thread fetch + storage write).
+
+- [ ] **C. Minimize REST polling while SeedLink streams.** The status
+      poller (`core/echos_status.py`, `EchosStatusWorker`, started
+      unconditionally in `main_window.py:371-378`, one shared QThread)
+      hits THREE public GETs every `echos.poll_interval_s` (default 5 s,
+      `schema.py:318`): `/api/status` (clock/GNSS/PPS — the clock-health
+      column), `/api/seedlink/status` (clients + ring %),
+      `/api/calibrate/status` (calibration state). It polls
+      UNCONDITIONALLY — it never checks whether SeedLink is happily
+      streaming. Once the SeedLink TCP stream is CONNECTED and packets
+      flow, most of this is redundant (the data itself proves the device
+      is alive; client-count and idle calibration state are noise).
+      Keep what is ORTHOGONAL to data flow: clock discipline
+      (PPS/GNSS/NTP — timestamp trust) and ring % (only meaningful near
+      exhaustion). Plan a "back off while streaming" policy: the poller
+      slows or skips while a device's `ConnState.CONNECTED` AND packets
+      arrived recently, and resumes full cadence when the stream stalls/
+      drops (which is exactly when REST is useful — to detect a reboot
+      vs a network hiccup). Wiring: MainWindow already has
+      `engine.deviceStateChanged` and the worker `diagnosticsUpdated`/
+      `statsUpdated`; feed a per-device streaming flag (or a
+      `last_packet_monotonic`) into `EchosStatusWorker.configure(...)`;
+      the worker checks it on its tick (worker-thread-only state, no new
+      locks). Consider a slow "heartbeat" cadence while streaming (e.g.
+      clock-health every 30-60 s) vs a hard skip — DECIDE and decision-
+      log it; expose via a schema knob (e.g.
+      `echos.poll_interval_streaming_s` or `skip_poll_while_streaming`).
+      Note: public GETs never trip the 429 auth lockout, so this is
+      purely about device/LAN load, not safety. Acceptance: with a
+      device CONNECTED and streaming (fake SeedLink), the poller issues
+      ≤ the heartbeat cadence (assert call count over a window); when the
+      stream drops, full-cadence polling resumes; clock-health column
+      still updates within the heartbeat. Files: `core/echos_status.py`,
+      `gui/main_window.py`, `config/schema.py`, maybe `core/models.py`
+      (`last_packet` on diagnostics). Skills: `echos-rest-api` +
+      `qt-worker-threading`. qt-concurrency-auditor REQUIRED.
+
+- [ ] **D. Implement the Log tab (currently a placeholder).** The
+      bottom dock's Log tab is `_make_placeholder_dock(_DOCK_LOG)` — a
+      centered QLabel (`main_window.py:737,785-792`). Logging is
+      structlog→stdlib with a SINGLE `StreamHandler(sys.stderr)`
+      (`utils/logging.py:81-92`); nothing reaches the GUI and there is
+      no file sink or ring buffer. Plan an in-app log viewer:
+      (1) A `logging.Handler` subclass wrapping a QObject with a
+          `Signal(object)` carrying a frozen record (level, ts, logger,
+          event, rendered line). `emit()` is called from ANY thread
+          (worker or GUI) — keep a bounded `deque(maxlen=N)` under a
+          `threading.Lock` (rule 5: cap + drop-oldest, no unbounded
+          growth) and emit the Qt signal QueuedConnection → GUI slot
+          (rule 1/4: only the GUI thread touches the widget).
+      (2) New `gui/widgets/log_widget.py`: read-only view (QPlainTextEdit
+          or a capped model/list), level filter, autoscroll + pause,
+          clear, copy/export. Prefill from the ring buffer's snapshot on
+          construction (logs emitted before the tab existed).
+      (3) Install the handler in `configure_logging` (or right after,
+          handing the sink to MainWindow) so worker-thread logs flow in;
+          wire `recordReady → log_widget.on_record` QueuedConnection.
+      (4) Optional schema: `app.log_max_lines` (default ~1000). The dock
+          identity/objectName/QSettings layout are unchanged (just swap
+          the placeholder body) so saved layouts keep working.
+      Acceptance: a log emitted from a worker thread appears in the Log
+      tab on the GUI thread; the buffer caps at `log_max_lines` (drop-
+      oldest); level filter works; the smoke test
+      (`tests/gui/test_main_window.py:52-71`, asserts the 4 docks incl.
+      "Log") still passes and a new test drives a record end-to-end.
+      Files: `utils/logging.py`, `gui/widgets/log_widget.py` (new),
+      `gui/main_window.py`, `config/schema.py`, `__main__.py` (hand the
+      sink to the window), `tests/gui/`. Skill: `qt-worker-threading`
+      (the cross-thread sink). qt-concurrency-auditor REQUIRED (a
+      Handler emitting a Qt signal from arbitrary threads is exactly its
+      territory — the GIL-safe deque + QueuedConnection marshal must be
+      audited).
+
+Constraints for the whole milestone: do NOT start M7. Everything that
+works must keep working (wizard, discovery, settings, clock-health
+column, live tabs, session toolbar, archive browser/exports, HVSR
+single+array, map + f0 overlay + satellite). Real device echos.local is
+authorized for monitoring/streaming (and the public StationXML GET);
+device-config WRITES still need explicit per-request go-ahead; respect
+the 429 lockout; the dev box runs a live SeedTiLa prod instance (timing
+flakes — rerun standalone before chasing; one pytest instance at a
+time). Mutation-verify every regression test by reverse-edit, NEVER
+`git checkout` (it wiped uncommitted work twice).
+
 ## M7 — Release: Windows / Linux / macOS
 
 Goal: a tagged version produces installable artifacts for the three desktop
@@ -1089,6 +1263,9 @@ launch on a clean machine of each OS and complete the M2 happy path
 
 | Date | Decision | Why |
 |------|----------|-----|
+| 2026-06-16 | M6.6-A: map HVSR horizontals by **orientation code** (`N`/`1`→N, `E`/`2`→E), never by `sorted()` of the NSLC string | The bug (`models.py:350`) sorted full NSLCs so `…HHE` < `…HHN` put East into N — swapping the science inputs to hvsrpy on every GUI HVSR (live + archive), not just the label. The orientation char is already parsed (`parts[3][2]`); use it. f0 survives for symmetric horizontal combos (geom-mean/squared-avg) but directional readings were wrong. |
+| 2026-06-16 | M6.6-B: persist the fetched StationXML in a **new `session_stationxml(session_id, device_name, xml_blob, fetched_at)` table** (schema v6), not in config or a sidecar file | Rule 14 scopes it to the session that recorded with it; rule 8 puts the write on the storage thread after fsync; the Archive tab + archive HVSR/decon read it back via `archive_reader` with zero live device calls. Config stays the connect-only truth (rule 15); a user `response_metadata` file still wins as an explicit override. Old DBs migrate via a no-op `CREATE TABLE IF NOT EXISTS` (M0-B precedent). |
+| 2026-06-16 | M6.6-C: the "back off REST while SeedLink streams" **cadence (hard-skip vs slow heartbeat) is left to the implementing session** to decide with the `echos-rest-api` skill in hand and decision-log then | The trade is real (clock-health freshness vs device/LAN load) and best judged against the live device; the plan fixes only the policy shape (key off `ConnState.CONNECTED` + recent packets, resume full cadence on stall) and the schema-knob requirement. |
 | 2026-06-10 | M0 order: **B (AI removal) before A (rename)** | Removal shrinks the rename surface (deletes one of three platformdirs sites, `ai_engine.py:593`, plus extras/overrides); deletion is verifiable by the acceptance grep + gate even with no tests. docs/AUDIT.md §4. |
 | 2026-06-10 | M0-A QSettings: **reset, log once** — no migration | QSettings stores only window geometry/dock layout/column state (`main_window.py:2084`, `station_browser.py:602,948`); migration code would outweigh the value. |
 | 2026-06-10 | M0-A storage paths: **no migration** of old `SeedTiLa` data dirs | Product refactor with no deployed base assumed; M2 re-roots archives per project anyway. Old default was `user_data_dir("seedlink_dashboard","SeedTiLa")/archive` (`streaming_engine.py:1689,1900`). Revisit before M0 ships if field archives exist. |
