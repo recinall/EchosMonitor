@@ -1,0 +1,86 @@
+# EchosMonitor CI gate (M7-C). Runs the project quality gate
+# (ruff + mypy + pytest, the same three commands CLAUDE.md documents) on
+# ubuntu / windows / macos for every PR and every push to main.
+#
+# This is the PR-gate half of M7. The tag-`v*` artifact build + GitHub Release
+# upload lives in a separate release.yml (M7-C, second PR) so the two triggers
+# stay independent and easy to reason about.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: the gate only reads the checkout. Fork PRs already run with
+# no secret access under the safe `pull_request` trigger; this also pins the
+# token to read-only regardless of the repo/org default.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run (saves runner
+# minutes); never cancel a run on the default branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Discover per-OS failures (path / keyring / offscreen-Qt assumptions)
+      # independently — one OS failing must not hide the state of the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Single Python for now (the project floor is 3.11; 3.12 is the
+        # dev baseline). Add versions here to widen the matrix later.
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout (full history for hatch-vcs)
+        uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives __version__ from git tags/history; a shallow
+          # clone leaves the package unversioned and can break `uv sync`'s
+          # build of the editable install.
+          fetch-depth: 0
+
+      # PySide6's offscreen platform plugin needs a handful of system libs
+      # that the GitHub ubuntu image does not ship. macOS/Windows runners
+      # carry the equivalents in the OS. (conftest.py forces
+      # QT_QPA_PLATFORM=offscreen, so no display is required.)
+      - name: Install Qt offscreen system libs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          # Sets UV_PYTHON for the rest of the job; uv provisions the
+          # interpreter on `uv sync` (no separate setup-python step).
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies (uv sync --locked)
+        # --locked asserts uv.lock is in sync with pyproject.toml and installs
+        # exactly the pinned set: reproducible across OSes and across time, and
+        # a loud failure if someone edits deps without re-running `uv lock`.
+        run: uv sync --locked
+
+      - name: Lint (ruff)
+        run: uv run ruff check src tests
+
+      - name: Type-check (mypy --strict)
+        run: uv run mypy src
+
+      # The default gate excludes `-m perf` (load-sensitive wall-time bounds)
+      # via pyproject addopts — CI boxes are exactly the noisy environment
+      # those tests flake under.
+      - name: Test (pytest)
+        run: uv run pytest

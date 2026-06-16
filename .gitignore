@@ -61,6 +61,9 @@ desktop.ini
 *.lock
 *.pid
 !firmware_*/dependencies.lock
+# uv's resolution lockfile is committed (M7-C): it pins the exact dependency
+# set so the CI gate and release builds are reproducible (`uv sync --locked`).
+!uv.lock
 
 # ======================
 # Jupyter (se usato)
