@@ -65,6 +65,34 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _obspy_io_self_check() -> None:
+    """Exercise obspy's entry-point-resolved IO plugins (smoke-only).
+
+    obspy resolves every reader/writer (MiniSEED, StationXML, …) through its
+    distribution ENTRY POINTS. A freeze that omits obspy's metadata has an
+    EMPTY plugin registry — archive reads, StationXML parsing and SeedLink
+    packet decoding all fail at runtime with ``Format "X" is not supported``.
+    Round-tripping both formats here makes `--check` (the packaged smoke) fail
+    in CI instead of letting that ship to the field (v0.1.1 regression).
+    """
+    import io
+
+    import numpy as np
+    from obspy import Stream, Trace, read, read_inventory
+
+    buf = io.BytesIO()
+    Stream([Trace(data=np.arange(64, dtype=np.int32))]).write(buf, format="MSEED")
+    buf.seek(0)
+    if len(read(buf, format="MSEED")) != 1:
+        raise RuntimeError("obspy MiniSEED round-trip failed (plugin registry empty?)")
+
+    inv = read_inventory()  # obspy's bundled example inventory
+    sx = io.BytesIO()
+    inv.write(sx, format="STATIONXML")
+    sx.seek(0)
+    read_inventory(sx, format="STATIONXML")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the application. Returns the Qt event loop exit code."""
     args = _parse_args(sys.argv[1:] if argv is None else argv)
@@ -120,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     # bundle. Close cleanly (stops workers via closeEvent) and exit before the
     # event loop / first-run wizard so the check is non-interactive.
     if args.check:
+        _obspy_io_self_check()
         window.close()
         log.info("check_ok", version=__version__)
         return 0

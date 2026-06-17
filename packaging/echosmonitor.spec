@@ -55,6 +55,16 @@ else:
 # --- metadata (importlib.metadata in the freeze) ----------------------------
 datas = []
 datas += copy_metadata("echosmonitor")
+# obspy discovers EVERY reader/writer (MiniSEED, StationXML, …) through its own
+# distribution ENTRY POINTS (importlib.metadata). Without obspy's dist-info in
+# the freeze the plugin registry is EMPTY — `obspy.read(... format="MSEED")`
+# and `read_inventory(... format="STATIONXML")` fail with
+# `Format "X" is not supported. Supported types:` (empty), which silently
+# breaks archive reads, StationXML parsing AND SeedLink packet decoding
+# (incoming MiniSEED records → 0 packets). collect_data_files/collect_submodules
+# do NOT bring the entry points; copy_metadata does. (Field regression in
+# v0.1.0/v0.1.1; the `--check` smoke missed it because it never touches obspy IO.)
+datas += copy_metadata("obspy")
 
 # obspy ships compiled C libraries (libmseed, evresp, ...) under obspy/lib/ and
 # loads them at runtime via ctypes.CDLL (not import), so PyInstaller's static

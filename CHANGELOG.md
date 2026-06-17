@@ -8,6 +8,20 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-06-17
+
+### Fixed
+- **Packaged obspy had an empty plugin registry (critical).** The PyInstaller
+  bundle omitted obspy's distribution metadata, so obspy discovered **none** of
+  its entry-point-resolved IO plugins. In the released v0.1.0/v0.1.1 binaries
+  this silently broke everything that touches seismic IO: archive MiniSEED
+  reads (`Format "MSEED" is not supported`), StationXML parsing (TypeError),
+  **and SeedLink packet decoding** — so live recording received 0 packets and
+  the stall watchdog tripped on `expected_interval_s=0.0`. Fixed by collecting
+  `copy_metadata("obspy")` in the spec. The packaged `--check` smoke now
+  round-trips MiniSEED + StationXML through the plugin registry, so this class
+  of bundling regression fails CI instead of the field.
+
 ## [0.1.1] — 2026-06-17
 
 Field-test fixes from the v0.1.0 Linux AppImage. From this release, build

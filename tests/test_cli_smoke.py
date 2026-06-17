@@ -61,6 +61,22 @@ def test_check_flag_starts_and_exits_clean(tmp_path: Path) -> None:
     assert proc.returncode == 0, f"--check failed:\n{proc.stderr}"
 
 
+def test_obspy_io_self_check_round_trips() -> None:
+    """The ``--check`` obspy-IO probe round-trips MiniSEED + StationXML through
+    obspy's entry-point plugin registry.
+
+    Regression for the v0.1.1 field bug: a freeze missing obspy's distribution
+    metadata has an EMPTY plugin registry, so archive MSEED reads, StationXML
+    parsing and SeedLink packet decoding all fail with ``Format "X" is not
+    supported``. In the dev env obspy's metadata is present so this only asserts
+    the probe never raises; its real teeth are the packaged-binary ``--check``
+    in CI, which fails if obspy's metadata was not bundled.
+    """
+    from echosmonitor.__main__ import _obspy_io_self_check
+
+    _obspy_io_self_check()  # must not raise
+
+
 def _packaged_binary() -> Path:
     root = Path(__file__).resolve().parents[1] / "dist" / "echosmonitor"
     # one-dir layout differs by OS: bare name on POSIX, .exe on Windows.
