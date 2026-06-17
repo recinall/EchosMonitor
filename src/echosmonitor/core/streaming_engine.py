@@ -119,6 +119,20 @@ _CHAIN_QUEUE_MAX_SAMPLES = 20000
 # float32 = 4 bytes per sample; used for the ring-buffer memory-cost log.
 _BYTES_PER_SAMPLE = 4
 
+# Stall watchdog (Bug 2). The expected packet cadence is derived from the
+# stream itself — a device emits one ~``npts``-sample packet every ``npts/fs``
+# seconds of data — so the stall threshold ADAPTS to the sampling rate instead
+# of a fixed timeout. A stream is flagged stalled when no packet arrives for
+# ``_STALL_FACTOR`` times that expected interval, clamped to [min, max]. The
+# clamp keeps a very fast stream from false-flagging on one late packet and a
+# very slow stream from going unmonitored for minutes; the max stays below
+# obspy's 120 s ``netto`` so the app notices a stall before the socket does.
+_STALL_FACTOR = 12.0
+_STALL_MIN_S = 5.0
+_STALL_MAX_S = 60.0
+# The watchdog runs on the flush tick; throttle the scan to ~1 Hz.
+_STALL_CHECK_INTERVAL_S = 1.0
+
 
 class _DeviceBridge(QObject):
     """Forwards one worker's signals into the engine, attaching device name.
@@ -245,6 +259,12 @@ class StreamingEngine(QObject):
     newStreamSeen = Signal(str, str)  # device, nslc  # noqa: N815
     streamMeta = Signal(str, str, float, str)  # device, nslc, fs, starttime ISO  # noqa: N815
     deviceStateChanged = Signal(str, int)  # device_name, ConnState int  # noqa: N815
+    # Stall watchdog (Bug 2): a CONNECTED device whose stream went silent for
+    # longer than its sampling-rate-derived expected cadence (True), or that
+    # has since resumed (False). The GUI uses this to resume full-cadence REST
+    # polling while a stream is stalled (the slow heartbeat assumes "data
+    # proves liveness", which is false on a silent-but-open socket).
+    streamStalled = Signal(str, bool)  # device_name, is_stalled  # noqa: N815
     # ----- M2 acquisition lifecycle (rule 13) ---------------------------
     # ``acquisitionStateChanged(device, AcquisitionState int)`` — fired on
     # every user-driven state transition (Idle/Monitoring/Recording) and
@@ -374,6 +394,14 @@ class StreamingEngine(QObject):
         self._buffers: dict[str, RingBuffer] = {}
         self._coalescers: dict[str, _StreamCoalescer] = {}
         self._status: dict[str, DeviceStatus] = {}
+        # Stall watchdog (Bug 2) — engine-thread only (updated in _on_packet /
+        # _on_state, scanned in _flush_all), so no lock. Per device: the
+        # monotonic time of the last packet, the sampling-rate-derived expected
+        # inter-packet interval, and whether it is currently flagged stalled.
+        self._last_packet_monotonic: dict[str, float] = {}
+        self._expected_packet_interval_s: dict[str, float] = {}
+        self._stalled: set[str] = set()
+        self._last_stall_scan_s: float = 0.0
         # Reverse lookup: composite key → (device_name, nslc). Used by the
         # bounded-queue snapshot pass to dispatch to the router on the
         # right (device, nslc) pair without parsing the key string.
@@ -1260,6 +1288,9 @@ class StreamingEngine(QObject):
         self._key_to_pair.clear()
         self._stream_fs.clear()
         self._latest_raw_endtime.clear()
+        self._last_packet_monotonic.clear()
+        self._expected_packet_interval_s.clear()
+        self._stalled.clear()
         self._detrend_linear_warned.clear()
         self._stream_drops_pending.clear()
         self._stream_drops_last_log.clear()
@@ -1558,6 +1589,17 @@ class StreamingEngine(QObject):
         endtime = trace.stats.endtime
         samples = np.ascontiguousarray(trace.data, dtype=np.float32)
 
+        # Stall watchdog (Bug 2): record arrival + the sampling-rate-derived
+        # expected cadence (one ~npts-sample packet every npts/fs s of data).
+        # A device flagged stalled that produces a packet has recovered.
+        self._last_packet_monotonic[device_name] = time.monotonic()
+        if fs > 0.0:
+            self._expected_packet_interval_s[device_name] = float(trace.stats.npts) / fs
+        if device_name in self._stalled:
+            self._stalled.discard(device_name)
+            _log.info("seedlink_stream_resumed", device=device_name)
+            self.streamStalled.emit(device_name, False)
+
         if key not in self._buffers:
             capacity = max(1, int(self._window_seconds * fs * 2))
             # Surface the per-stream ring-buffer allocation cost so a
@@ -1810,7 +1852,42 @@ class StreamingEngine(QObject):
                 self._chain_drops_pending[key] = self._chain_drops_pending.get(key, 0) + 1
             queue.append((samples, t_start))
 
-    @Slot()
+    def _scan_stalls(self) -> None:
+        """Flag CONNECTED streams gone silent past their expected cadence (Bug 2).
+
+        Engine-thread only (called from the flush tick). The threshold adapts
+        to the sampling rate: a device emitting one ``npts``-sample packet every
+        ``npts/fs`` seconds is stalled when nothing arrives for ``_STALL_FACTOR``
+        times that, clamped to ``[_STALL_MIN_S, _STALL_MAX_S]``. The flag does
+        NOT force a reconnect — a transient gap shorter than obspy's ``netto``
+        recovers on the SAME socket with no loss; the flag only resumes
+        full-cadence REST polling and surfaces the stall (rule 7 observability).
+        Recovery is detected in :meth:`_on_packet`.
+        """
+        now = time.monotonic()
+        if now - self._last_stall_scan_s < _STALL_CHECK_INTERVAL_S:
+            return
+        self._last_stall_scan_s = now
+        for name, status in self._status.items():
+            if status.state is not ConnState.CONNECTED or name in self._stalled:
+                continue
+            last = self._last_packet_monotonic.get(name)
+            if last is None:
+                continue
+            expected = self._expected_packet_interval_s.get(name, 0.0)
+            threshold = min(max(_STALL_FACTOR * expected, _STALL_MIN_S), _STALL_MAX_S)
+            silent = now - last
+            if silent > threshold:
+                self._stalled.add(name)
+                _log.warning(
+                    "seedlink_stream_stalled",
+                    device=name,
+                    silent_s=round(silent, 1),
+                    expected_interval_s=round(expected, 3),
+                    threshold_s=round(threshold, 1),
+                )
+                self.streamStalled.emit(name, True)
+
     def _flush_all(self) -> None:
         """Tick handler: dispatch DSP work, then flush render.
 
@@ -1834,6 +1911,7 @@ class StreamingEngine(QObject):
         decoupling robust even if a future caller re-introduces a
         same-thread render slot: the drains have already fired by then.
         """
+        self._scan_stalls()
         snapshots: dict[str, list[tuple[np.ndarray, UTCDateTime]]] = {}
         drops: list[tuple[str, int]] = []
         # Snapshot wall time once outside the lock so every per-stream
@@ -1937,6 +2015,20 @@ class StreamingEngine(QObject):
         status = self._status.get(device_name)
         if status is not None:
             status.state = ConnState(state)
+        # Stall watchdog (Bug 2): seed the baseline on CONNECT so the first
+        # packet has a grace window; on any non-CONNECTED transition clear the
+        # baseline + flag so a reconnect starts clean (and a stalled device
+        # that drops is un-flagged rather than left stuck stalled).
+        if ConnState(state) is ConnState.CONNECTED:
+            self._last_packet_monotonic[device_name] = time.monotonic()
+        else:
+            # On any drop, clear the baseline + flag silently: the GUI's own
+            # state handler already removes a non-CONNECTED device from the
+            # streaming set, so no streamStalled(False) is needed here (and it
+            # would race the state change). Only a genuine packet-resume while
+            # still CONNECTED emits the recovery (see _on_packet).
+            self._last_packet_monotonic.pop(device_name, None)
+            self._stalled.discard(device_name)
         self.deviceStateChanged.emit(device_name, state)
 
     @Slot(str, str)
@@ -2103,6 +2195,15 @@ class StreamingEngine(QObject):
         self._workers.pop(name, None)
         self._threads.pop(name, None)
         self._bridges.pop(name, None)
+        # Stall-watchdog state (Bug 2): clear it here so EVERY path that stops a
+        # device (user stop, config-diff remove, restart) starts clean. Without
+        # this, ``_status[name]`` is preserved as a stale CONNECTED and the
+        # frozen last-packet time ages past the threshold, so the flush-tick
+        # watchdog would flag a stopped device "stalled" forever and resume
+        # full-cadence REST polling against a device the user told it to stop.
+        self._last_packet_monotonic.pop(name, None)
+        self._expected_packet_interval_s.pop(name, None)
+        self._stalled.discard(name)
         # Tear down the archive writer for this device. Per-device
         # writers are independent — stopping one's writer does not
         # affect the others. The writer's flush/close happens before
@@ -2874,6 +2975,7 @@ class StreamingEngine(QObject):
                     self._chain_drops_last_log.pop(key, None)
             self._device_dsp_cfg.pop(name, None)
             self._status.pop(name, None)
+            # (watchdog state already cleared by _stop_device above)
             # A removed device is implicitly idle; announce it so any
             # state badge tracking the device clears before the
             # ``devicesChanged`` refresh below drops the row entirely.

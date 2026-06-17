@@ -1426,6 +1426,8 @@ class MainWindow(QMainWindow):
         self._engine.deviceStateChanged.connect(self._device_panel.on_device_state)
         # M6.6-C: track SeedLink CONNECTED state to drive the poll backoff.
         self._engine.deviceStateChanged.connect(self._on_device_state_streaming)
+        # Bug 2: a CONNECTED-but-silent stream resumes full-cadence REST polling.
+        self._engine.streamStalled.connect(self._on_stream_stalled)
         # M2-C acquisition badges (rule 13): queued so the panel's
         # handler never runs re-entrantly inside an engine emit.
         self._engine.acquisitionStateChanged.connect(
@@ -1639,6 +1641,23 @@ class MainWindow(QMainWindow):
         else:
             self._streaming_devices.discard(device_name)
         self._streamingDevicesChanged.emit(frozenset(self._streaming_devices))
+
+    def _on_stream_stalled(self, device_name: str, is_stalled: bool) -> None:
+        """A CONNECTED stream went silent (True) or resumed (False) — Bug 2.
+
+        The slow REST heartbeat assumes a CONNECTED socket means live data; a
+        stalled stream breaks that, so treat a stalled device as NOT streaming
+        and resume full-cadence polling (where REST is actually useful — clock
+        health, device status). Resume re-adds it. Pushes only on a real
+        change to the streaming set.
+        """
+        was_streaming = device_name in self._streaming_devices
+        if is_stalled:
+            self._streaming_devices.discard(device_name)
+        else:
+            self._streaming_devices.add(device_name)
+        if (device_name in self._streaming_devices) != was_streaming:
+            self._streamingDevicesChanged.emit(frozenset(self._streaming_devices))
 
     def _on_acquisition_stationxml(self, device_name: str, state_int: int) -> None:
         """Fetch + persist the device StationXML across acquisition changes.
