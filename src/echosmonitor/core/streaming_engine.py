@@ -1852,7 +1852,6 @@ class StreamingEngine(QObject):
                 self._chain_drops_pending[key] = self._chain_drops_pending.get(key, 0) + 1
             queue.append((samples, t_start))
 
-    @Slot()
     def _scan_stalls(self) -> None:
         """Flag CONNECTED streams gone silent past their expected cadence (Bug 2).
 
@@ -2196,6 +2195,15 @@ class StreamingEngine(QObject):
         self._workers.pop(name, None)
         self._threads.pop(name, None)
         self._bridges.pop(name, None)
+        # Stall-watchdog state (Bug 2): clear it here so EVERY path that stops a
+        # device (user stop, config-diff remove, restart) starts clean. Without
+        # this, ``_status[name]`` is preserved as a stale CONNECTED and the
+        # frozen last-packet time ages past the threshold, so the flush-tick
+        # watchdog would flag a stopped device "stalled" forever and resume
+        # full-cadence REST polling against a device the user told it to stop.
+        self._last_packet_monotonic.pop(name, None)
+        self._expected_packet_interval_s.pop(name, None)
+        self._stalled.discard(name)
         # Tear down the archive writer for this device. Per-device
         # writers are independent — stopping one's writer does not
         # affect the others. The writer's flush/close happens before
@@ -2967,9 +2975,7 @@ class StreamingEngine(QObject):
                     self._chain_drops_last_log.pop(key, None)
             self._device_dsp_cfg.pop(name, None)
             self._status.pop(name, None)
-            self._last_packet_monotonic.pop(name, None)
-            self._expected_packet_interval_s.pop(name, None)
-            self._stalled.discard(name)
+            # (watchdog state already cleared by _stop_device above)
             # A removed device is implicitly idle; announce it so any
             # state badge tracking the device clears before the
             # ``devicesChanged`` refresh below drops the row entirely.

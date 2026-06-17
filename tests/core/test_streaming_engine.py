@@ -149,6 +149,24 @@ def test_stall_watchdog_ignores_non_connected(qtbot) -> None:
     assert "dev" not in engine._stalled
 
 
+def test_stall_state_cleared_on_stop_device(qtbot) -> None:
+    """Every stop path clears the watchdog state, so a user-stopped device is
+    never left flagged stalled / aging (a stale CONNECTED + frozen last-packet
+    would otherwise flag it forever and resume REST polling against it)."""
+    engine = StreamingEngine(_make_root_cfg([]))
+    _seed_connected_silent(engine, "dev", expected_interval_s=1.0, silent_s=30.0)
+    engine._scan_stalls()
+    assert "dev" in engine._stalled
+
+    engine._stop_device("dev")
+    assert "dev" not in engine._stalled
+    assert "dev" not in engine._last_packet_monotonic
+    assert "dev" not in engine._expected_packet_interval_s
+    engine._last_stall_scan_s = 0.0
+    with qtbot.assertNotEmitted(engine.streamStalled):
+        engine._scan_stalls()
+
+
 @pytest.fixture
 def engine_with_one_fake_device(
     qtbot,
