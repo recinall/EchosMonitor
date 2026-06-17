@@ -135,6 +135,43 @@ def test_to_config_round_trips_initial(qtbot) -> None:
     ]
 
 
+def test_set_device_channels_auto_derives_over_default_placeholder(qtbot) -> None:
+    """A fresh add-form holds only the ``*.*.*`` placeholder; loading the
+    device's StationXML channels REPLACES it with the exact NSLCs so the saved
+    device is never left without concrete, streaming selectors (Bug 1+3)."""
+    form = DeviceForm(existing_names=())
+    qtbot.addWidget(form)
+    form.set_device_channels(("XX.ECHOS.00.HHZ", "XX.ECHOS.00.HHN", "XX.ECHOS.00.HHE"))
+    derived = [(s.network, s.station, s.location, s.channel) for s in form._read_selectors()]
+    assert derived == [
+        ("XX", "ECHOS", "00", "HHZ"),
+        ("XX", "ECHOS", "00", "HHN"),
+        ("XX", "ECHOS", "00", "HHE"),
+    ]
+    assert "auto-filled" in form._stationxml_status.text().lower()
+
+
+def test_set_device_channels_keeps_user_customised_selectors(qtbot) -> None:
+    """Auto-derivation must never clobber selectors the user actually set."""
+    form = DeviceForm(
+        initial=DeviceConfig(
+            name="d", host="h", selectors=[StreamSelectorConfig(network="IU", station="ANMO")]
+        )
+    )
+    qtbot.addWidget(form)
+    form.set_device_channels(("XX.ECHOS.00.HHZ",))
+    assert [(s.network, s.station) for s in form._read_selectors()] == [("IU", "ANMO")]
+    assert "available" in form._stationxml_status.text().lower()
+
+
+def test_set_device_channels_unavailable_status(qtbot) -> None:
+    """No channels (StationXML unavailable) → an honest status, no auto-fill."""
+    form = DeviceForm(existing_names=())
+    qtbot.addWidget(form)
+    form.set_device_channels(())
+    assert "unavailable" in form._stationxml_status.text().lower()
+
+
 def test_response_metadata_round_trips(qtbot) -> None:
     """An initial device's response_metadata prefills and reads back."""
     xml = get_example_file("IU_ANMO_00_BHZ.xml")

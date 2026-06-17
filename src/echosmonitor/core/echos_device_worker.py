@@ -122,6 +122,10 @@ class EchosDeviceWorker(QObject):
     # rule 4: object payloads are frozen dataclasses / frozen pydantic
     # models, isinstance-guarded at the receiver.
     loaded = Signal(object)  # EchosDeviceState
+    # Channels parsed from the device's StationXML, fetched WITHOUT auth so the
+    # dialog can derive selectors before any admin password is stored. Carries
+    # a ``tuple[str, ...]`` of NSLCs (empty if the StationXML was unavailable).
+    stationxmlLoaded = Signal(object)  # noqa: N815
     applied = Signal(str)  # op name: "acquisition" | "network" | "calibrate_start" | "reboot"
     restartProgress = Signal(object)  # noqa: N815  # RestartStatus (one per observed step)
     seedlinkApplied = Signal(object)  # noqa: N815  # terminal RestartStatus (done OR failed)
@@ -155,6 +159,21 @@ class EchosDeviceWorker(QObject):
         state = self._run("load", self._load(target))
         if state is not None:
             self.loaded.emit(state)
+
+    @Slot(object)
+    def requestStationxml(self, target: object) -> None:  # noqa: N802 — Qt slot naming
+        """Fetch ONLY the device StationXML (public, no auth) → channels.
+
+        Decoupled from :meth:`requestLoad` (which needs admin credentials for
+        the config GETs) so selectors can be derived on dialog open for a
+        brand-new, not-yet-authenticated device. Always emits — an empty tuple
+        when the document is unavailable — so the dialog can show a status.
+        """
+        if not isinstance(target, EchosPollTarget):
+            return
+        channels = self._run("stationxml", self._fetch_stationxml(target))
+        if channels is not None:
+            self.stationxmlLoaded.emit(channels)
 
     @Slot(object, object)
     def applyAcquisition(self, target: object, config: object) -> None:  # noqa: N802
@@ -309,6 +328,21 @@ class EchosDeviceWorker(QObject):
             channels=channels,
             has_credentials=password is not None,
         )
+
+    async def _fetch_stationxml(self, target: EchosPollTarget) -> tuple[str, ...]:
+        """Return the device's StationXML channels, or ``()`` if unavailable.
+
+        StationXML is a PUBLIC endpoint — fetched with ``password=None`` so it
+        works before any admin credential is stored. Failure degrades to ``()``
+        (and a status in the dialog), never to the generic ``failed`` dialog —
+        a missing StationXML is honest domain state, not a transport error.
+        """
+        try:
+            async with self._factory(target, None) as client:
+                return parse_stationxml_channels(await client.get_stationxml())
+        except EchosApiError as exc:
+            _log.info("echos_dialog_stationxml_unavailable", device=target.name, kind=exc.kind)
+            return ()
 
     async def _apply_acquisition(
         self, target: EchosPollTarget, config: EchosAcquisitionConfig

@@ -101,6 +101,10 @@ _TIMEOUT_DEFAULT_S = 10.0
 _TIMEOUT_DECIMALS = 1
 _TIMEOUT_STEP_S = 0.5
 
+# Debounce for the StationXML auto-fetch after host edits (Bug 1+3): long
+# enough that typing a hostname does not fire a request per keystroke.
+_STATIONXML_DEBOUNCE_MS = 600
+
 # Device-name allowed characters. Mirrors the ``[A-Za-z0-9_.-]+`` set
 # the rest of the codebase uses for path-safe device identifiers (the
 # YAML serialiser, the QSettings keys under ``StationBrowser/lastDeviceId``,
@@ -346,6 +350,14 @@ class DeviceForm(QWidget):
         sel_buttons.addWidget(self._use_channels_button)
         sel_buttons.addStretch(1)
         selector_layout.addLayout(sel_buttons)
+        # Status of the device's StationXML auto-fetch (M7.1 / Bug 1+3): tells
+        # the user the device metadata WAS downloaded (so "Response metadata"
+        # reading "(none)" is not mistaken for "nothing was fetched"), and how
+        # many selectors were auto-derived from it.
+        self._stationxml_status = QLabel("", selector_box)
+        self._stationxml_status.setStyleSheet("QLabel { color: #888; }")
+        self._stationxml_status.setWordWrap(True)
+        selector_layout.addWidget(self._stationxml_status)
         form.addRow("Selectors:", selector_box)
 
         # DSP chain summary + disabled Edit chain button -------------
@@ -582,11 +594,46 @@ class DeviceForm(QWidget):
         )
 
     def set_device_channels(self, channels: tuple[str, ...]) -> None:
-        """Enable selector derivation from the device's StationXML NSLCs."""
+        """Record the device's StationXML NSLCs and surface them.
+
+        Enables "Use device channels", updates the StationXML status label,
+        and — crucially for Bug 1 — AUTO-DERIVES the selectors when the form
+        currently has none. A device saved with empty selectors connects but
+        subscribes to nothing ("No streams specified") and retry-loops forever,
+        so a freshly-configured device must never be left selector-less when
+        the device itself advertises its channels.
+        """
         self._device_channels = channels
         self._use_channels_button.setEnabled(bool(channels))
-        if channels:
-            self._use_channels_button.setText(f"Use device channels ({len(channels)})")
+        if not channels:
+            self._stationxml_status.setText("Device StationXML: unavailable")
+            return
+        self._use_channels_button.setText(f"Use device channels ({len(channels)})")
+        if self._selectors_are_default_or_empty():
+            self._on_use_device_channels()
+            self._stationxml_status.setText(
+                f"Device StationXML: {len(channels)} channels — selectors auto-filled."
+            )
+        else:
+            self._stationxml_status.setText(
+                f"Device StationXML: {len(channels)} channels available."
+            )
+
+    def _selectors_are_default_or_empty(self) -> bool:
+        """True when the selector grid still holds only the wildcard placeholder.
+
+        Auto-derivation replaces the default ``*.*.*`` row (or an empty grid)
+        with the device's exact channels, but never clobbers selectors the user
+        has actually customised.
+        """
+        sels = self._read_selectors()
+        if not sels:
+            return True
+        if len(sels) == 1:
+            net, sta, loc, chan = _DEFAULT_SELECTOR_CELLS
+            s = sels[0]
+            return (s.network, s.station, s.location, s.channel) == (net, sta, loc, chan)
+        return False
 
     def set_credential_status(self, text: str) -> None:
         self._credential_status_label.setText(text)
@@ -1027,6 +1074,7 @@ class DeviceDialog(QDialog):
     # Worker request signals — emitted on the GUI thread, delivered to
     # the per-dialog EchosDeviceWorker via QueuedConnection.
     _loadRequested = Signal(object)  # noqa: N815
+    _stationxmlRequested = Signal(object)  # noqa: N815
     _acqApplyRequested = Signal(object, object)  # noqa: N815
     _slApplyRequested = Signal(object, object)  # noqa: N815
     _calStartRequested = Signal(object)  # noqa: N815
@@ -1110,6 +1158,20 @@ class DeviceDialog(QDialog):
         form.echosEnabledChanged.connect(self._update_server_tabs_enabled)
         form.credentialStoreRequested.connect(self._on_store_credential)
         form.connectionTargetChanged.connect(self._invalidate_device_state)
+        # StationXML auto-fetch (Bug 1+3): pull the device's PUBLIC StationXML
+        # — debounced after host edits — so selectors are auto-derived without
+        # the user hunting through server tabs (an empty-selectors device
+        # connects but subscribes to nothing and retry-loops forever). Needs no
+        # credentials, so it works on a brand-new device before a password is
+        # stored.
+        self._stationxml_timer = QTimer(self)
+        self._stationxml_timer.setSingleShot(True)
+        self._stationxml_timer.setInterval(_STATIONXML_DEBOUNCE_MS)
+        self._stationxml_timer.timeout.connect(self._request_stationxml)
+        form.connectionTargetChanged.connect(self._stationxml_timer.start)
+        # Initial fetch on open for an already-addressed device (edit flow, or a
+        # discovery-prefilled add) without waiting for a host edit.
+        QTimer.singleShot(0, self._request_stationxml)
         # This dialog wires the credential sink, so the password row is live.
         form.enable_credential_store()
         self._tabs.currentChanged.connect(self._on_tab_changed)
@@ -1263,6 +1325,7 @@ class DeviceDialog(QDialog):
         self._worker.moveToThread(self._worker_thread)
         queued = Qt.ConnectionType.QueuedConnection
         self._loadRequested.connect(self._worker.requestLoad, type=queued)
+        self._stationxmlRequested.connect(self._worker.requestStationxml, type=queued)
         self._acqApplyRequested.connect(self._worker.applyAcquisition, type=queued)
         self._slApplyRequested.connect(self._worker.applySeedlink, type=queued)
         self._calStartRequested.connect(self._worker.startCalibration, type=queued)
@@ -1271,6 +1334,7 @@ class DeviceDialog(QDialog):
         self._credStoreRequested.connect(self._worker.storeCredential, type=queued)
         self._rebootRequested.connect(self._worker.requestReboot, type=queued)
         self._worker.loaded.connect(self._on_loaded, type=queued)
+        self._worker.stationxmlLoaded.connect(self._on_stationxml_loaded, type=queued)
         self._worker.applied.connect(self._on_applied, type=queued)
         self._worker.restartProgress.connect(self._sl_tab.on_restart_progress, type=queued)
         self._worker.seedlinkApplied.connect(self._sl_tab.on_seedlink_applied, type=queued)
@@ -1296,6 +1360,21 @@ class DeviceDialog(QDialog):
         if target is None or self._ensure_worker() is None:
             return
         self._loadRequested.emit(target)
+
+    def _request_stationxml(self) -> None:
+        """Ask the worker for the device's PUBLIC StationXML (no credentials)."""
+        target = self._form.echos_target()
+        if target is None or self._ensure_worker() is None:
+            return
+        self._stationxmlRequested.emit(target)
+
+    @Slot(object)
+    def _on_stationxml_loaded(self, channels: object) -> None:
+        if not isinstance(channels, tuple):
+            return
+        # The form derives selectors from these when it currently has none and
+        # surfaces a status (Bug 1+3).
+        self._form.set_device_channels(channels)
 
     @Slot()
     def _invalidate_device_state(self) -> None:
