@@ -8,6 +8,32 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-06-17
+
+Field-test fixes from the v0.1.0 Linux AppImage. From this release, build
+artifacts are versioned ``<tag>+g<short-sha>`` (e.g. ``0.1.1+g29d5250``) so
+each binary is traceable to its exact commit.
+
+### Fixed
+- **Device selectors (Bug 1 + Bug 3):** a device configured with no stream
+  selectors connected but subscribed to nothing (obspy "No streams specified")
+  and retry-looped forever with zero data. The device dialog now auto-fetches
+  the device's **public** StationXML on open and auto-derives the selectors
+  (replacing the `*.*.*` placeholder, never user-set ones), with a status line
+  so the metadata is visibly retrieved; the worker now stops with a clear error
+  instead of an endless silent reconnect when selectors are empty.
+- **Streaming stall watchdog (Bug 2):** the REST poll backed off to the slow
+  heartbeat purely on `ConnState.CONNECTED`, so a CONNECTED-but-silent stream
+  was invisible until obspy's 120 s timeout. An engine watchdog now flags a
+  silent stream using a **sampling-rate-derived** threshold (`npts/fs × factor`,
+  clamped 5–60 s), resumes full-cadence REST polling, and logs
+  `seedlink_stream_stalled`/`_resumed` for diagnosis — without forcing a
+  reconnect (a transient gap recovers on the same socket with no loss).
+
+### Documentation
+- README documents the **macOS 13+** minimum (PySide6 6.11 ships only
+  `macosx_13_0` wheels) and the unsigned-artifact bypass per OS.
+
 ## [0.1.0] — 2026-06-16
 
 First end-to-end release of EchosMonitor as an Echos-specific monitor for
