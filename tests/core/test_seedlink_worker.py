@@ -241,6 +241,34 @@ def test_worker_reconnects_after_server_disconnect(
         harness.shutdown(deadline_s=3.0)
 
 
+def test_empty_selectors_stops_without_retry_loop(qtbot) -> None:
+    """A device configured with NO selectors must report a clear config error
+    and STOP — not connect, fail with obspy's 'No streams specified', and
+    retry-loop forever (the confirmed Bug 1 field failure; no data, the device
+    looks 'never connects'). The host is never reached: the guard fires first.
+    """
+    worker = SeedLinkWorker(
+        name="noselectors", host="127.0.0.1", port=18000, selectors=[],
+        reconnect=ReconnectConfig(),
+    )
+    harness = _WorkerHarness(worker)
+    harness.start()
+    try:
+        assert harness.wait_until(
+            lambda: any(s == int(ConnState.STOPPED) for s, _ in harness.states),
+            timeout_s=3.0,
+            qtbot=qtbot,
+        )
+        codes = [s for s, _ in harness.states]
+        # No connection attempt and no reconnect backoff were ever entered.
+        assert int(ConnState.CONNECTING) not in codes
+        assert int(ConnState.WAITING_RETRY) not in codes
+        # A clear, actionable error was surfaced exactly once.
+        assert any("selector" in e.lower() for e in harness.errors)
+    finally:
+        harness.shutdown(deadline_s=3.0)
+
+
 def test_worker_stop_returns_within_one_second(
     qtbot,
     fake_server: FakeSeedLinkServer,

@@ -35,6 +35,7 @@ _DEVICE = "echos-field-01"
 
 class _Trigger(QObject):
     loadRequested = Signal(object)  # noqa: N815
+    stationxmlRequested = Signal(object)  # noqa: N815
     acqRequested = Signal(object, object)  # noqa: N815
     slRequested = Signal(object, object)  # noqa: N815
     pwRequested = Signal(object, str)  # noqa: N815
@@ -87,6 +88,7 @@ def _spawn(
     trigger = _Trigger()
     queued = Qt.ConnectionType.QueuedConnection
     trigger.loadRequested.connect(worker.requestLoad, type=queued)
+    trigger.stationxmlRequested.connect(worker.requestStationxml, type=queued)
     trigger.acqRequested.connect(worker.applyAcquisition, type=queued)
     trigger.slRequested.connect(worker.applySeedlink, type=queued)
     trigger.pwRequested.connect(worker.changePassword, type=queued)
@@ -120,6 +122,25 @@ def test_load_aggregates_device_state(
         assert state.has_credentials is True
         # Selector derivation source: NSLCs parsed from StationXML.
         assert state.channels == ("XX.ECH01..HHZ", "XX.ECH01..HHN", "XX.ECH01..HHE")
+    finally:
+        _shutdown(worker, thread)
+
+
+def test_request_stationxml_emits_channels_without_credentials(
+    qtbot: Any, fw: FakeEchosFirmware, tmp_path: Path
+) -> None:
+    """StationXML is PUBLIC: requestStationxml derives channels with NO admin
+    password stored, so the dialog can auto-fill selectors for a brand-new
+    device (Bug 1+3). It must NOT emit ``failed``."""
+    empty_store = CredentialsStore(fallback_dir=tmp_path, keyring_module=FakeKeyring())
+    worker, thread, trigger = _spawn(qtbot, empty_store, _factory_for(fw))
+    try:
+        with qtbot.assertNotEmitted(worker.failed), qtbot.waitSignal(
+            worker.stationxmlLoaded, timeout=_DEADLINE_MS
+        ) as blocker:
+            trigger.stationxmlRequested.emit(_target())
+        (channels,) = blocker.args
+        assert channels == ("XX.ECH01..HHZ", "XX.ECH01..HHN", "XX.ECH01..HHE")
     finally:
         _shutdown(worker, thread)
 

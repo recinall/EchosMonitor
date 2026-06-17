@@ -293,6 +293,23 @@ class SeedLinkWorker(QObject):
         # cannot observe `_run_done == True` and skip the wait.
         self._run_done.clear()
         try:
+            if not self._selectors:
+                # A device with no stream selectors connects but obspy raises
+                # "No streams specified" — previously classified as a transient
+                # connect failure and retried forever (silent, zero data). It
+                # is a permanent CONFIG error, not a transport hiccup: surface
+                # it once and STOP rather than burn a reconnect loop. The fix
+                # at the source is the dialog's StationXML auto-derivation; this
+                # is the safety net for an already-saved selector-less config.
+                self._log.error(
+                    "seedlink_worker_no_selectors", host=self._host, port=self._port
+                )
+                self.errorOccurred.emit(
+                    "No stream selectors configured for this device — open the "
+                    "device dialog and use the device's channels."
+                )
+                self._emit_state(ConnState.STOPPED, "no streams selected")
+                return
             initial = max(_BACKOFF_INITIAL_S, float(self._reconnect.initial_delay_s))
             cap = max(initial, float(self._reconnect.max_delay_s))
             backoff = initial
