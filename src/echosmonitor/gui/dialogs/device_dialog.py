@@ -1495,6 +1495,11 @@ class DeviceDialog(QDialog):
         self._torn_down = True
         self._maint_tab.stop_polling()
         self._lockout_timer.stop()
+        # Quiesce the StationXML debounce in the same teardown step as its
+        # sibling: a host edit can leave it armed, and a late fire would only
+        # be a no-op via the _torn_down guard — but a complete stop beats
+        # relying on the downstream guard alone.
+        self._stationxml_timer.stop()
         worker, thread = self._worker, self._worker_thread
         if worker is None or thread is None:
             return
