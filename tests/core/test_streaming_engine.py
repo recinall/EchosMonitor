@@ -94,6 +94,61 @@ def test_idempotent_start_and_stop(qtbot) -> None:
     qtbot.wait(20)
 
 
+def _seed_connected_silent(
+    engine: StreamingEngine, name: str, *, expected_interval_s: float, silent_s: float
+) -> None:
+    """Put a device into CONNECTED + silent-for-``silent_s`` watchdog state."""
+    from echosmonitor.core.models import DeviceStatus
+
+    engine._status[name] = DeviceStatus(name=name, state=ConnState.CONNECTED)
+    engine._expected_packet_interval_s[name] = expected_interval_s
+    engine._last_packet_monotonic[name] = time.monotonic() - silent_s
+    engine._last_stall_scan_s = 0.0  # bypass the ~1 Hz scan throttle
+
+
+def test_stall_watchdog_flags_silent_connected_stream(qtbot) -> None:
+    """A CONNECTED stream silent past its expected cadence is flagged (Bug 2).
+
+    expected interval 1 s → threshold = clamp(12x1, 5, 60) = 12 s; silent 30 s.
+    """
+    engine = StreamingEngine(_make_root_cfg([]))
+    _seed_connected_silent(engine, "dev", expected_interval_s=1.0, silent_s=30.0)
+    with qtbot.waitSignal(engine.streamStalled, timeout=1000) as blocker:
+        engine._scan_stalls()
+    assert blocker.args == ["dev", True]
+    assert "dev" in engine._stalled
+    # Idempotent: a second scan does not re-emit for an already-flagged device.
+    engine._last_stall_scan_s = 0.0
+    with qtbot.assertNotEmitted(engine.streamStalled):
+        engine._scan_stalls()
+
+
+def test_stall_threshold_scales_with_sampling_rate(qtbot) -> None:
+    """The threshold adapts to the stream's cadence ('watchdog intelligente'):
+    the SAME silence flags a fast stream but not a slow one (Bug 2)."""
+    # Slow stream: interval 5 s → threshold clamp(60, 5, 60) = 60 s; silent 40 s → OK.
+    slow = StreamingEngine(_make_root_cfg([]))
+    _seed_connected_silent(slow, "slow", expected_interval_s=5.0, silent_s=40.0)
+    slow._scan_stalls()
+    assert "slow" not in slow._stalled
+
+    # Fast stream: interval 0.5 s → threshold clamp(6, 5, 60) = 6 s; silent 40 s → stalled.
+    fast = StreamingEngine(_make_root_cfg([]))
+    _seed_connected_silent(fast, "fast", expected_interval_s=0.5, silent_s=40.0)
+    fast._scan_stalls()
+    assert "fast" in fast._stalled
+
+
+def test_stall_watchdog_ignores_non_connected(qtbot) -> None:
+    """A device that is not CONNECTED is never flagged (no stream to stall)."""
+    engine = StreamingEngine(_make_root_cfg([]))
+    _seed_connected_silent(engine, "dev", expected_interval_s=1.0, silent_s=999.0)
+    engine._status["dev"].state = ConnState.WAITING_RETRY
+    with qtbot.assertNotEmitted(engine.streamStalled):
+        engine._scan_stalls()
+    assert "dev" not in engine._stalled
+
+
 @pytest.fixture
 def engine_with_one_fake_device(
     qtbot,
