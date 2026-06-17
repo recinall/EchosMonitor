@@ -50,6 +50,37 @@ heading slug from comments that reference an invariant defended here.
 
 ## Entries
 
+### 2026-06-17 — Packaged obspy had an empty plugin registry: no copy_metadata("obspy")
+
+- **Symptom** — in the released v0.1.0/v0.1.1 desktop binaries (but never in a
+  dev `uv run` checkout): `archive_reader_read_failed error='Format "MSEED" is
+  not supported. Supported types: '` (the supported-types list **empty**),
+  `echos_stationxml_unparseable`/`position_stationxml_unparseable
+  error_type=TypeError`, and live recording stuck at **0 packets** with the
+  stall watchdog firing on `expected_interval_s=0.0` despite "1 station(s)
+  accepted". Archive windows loaded empty.
+- **Root cause** — obspy discovers EVERY reader/writer (MiniSEED, StationXML, …)
+  through its distribution **entry points** (`importlib.metadata`). The
+  PyInstaller spec collected obspy's data files and submodules but NOT its
+  dist-info, so the frozen app's plugin registry was empty. With no MiniSEED
+  plugin, `obspy.read(format="MSEED")` (archive), `read_inventory(
+  format="STATIONXML")` (positions + device dialog) AND the SeedLink client's
+  decoding of incoming MiniSEED records all failed — the last silently, so the
+  worker connected, subscribed, and received zero parseable packets.
+- **Fix** — `datas += copy_metadata("obspy")` in `packaging/echosmonitor.spec`
+  (commit 1c7cc50). `collect_data_files`/`collect_submodules` do not bring entry
+  points; only `copy_metadata` does. Belt-and-braces: the `--check` smoke in
+  `__main__._obspy_io_self_check` now round-trips MiniSEED + StationXML through
+  the plugin registry, so a freeze with empty obspy metadata fails CI's release
+  build (per-OS) instead of the field. Shipped as v0.1.2.
+- **Lesson learned** — any dependency whose features resolve through
+  `importlib.metadata` entry points (obspy, keyring backends, pluggy-style
+  systems) needs `copy_metadata(<dist>)` in the freeze, not just its modules
+  and data. And a packaged smoke must EXERCISE the bundle's real IO paths
+  (read/write a file in each format the app uses), not merely import-and-
+  construct — `--check` building the main window proved nothing about obspy's
+  registry, which is why this shipped twice.
+
 ### 2026-06-06 — Deconvolution amplified sub-corner noise: broadband pre_filt on a geophone
 
 - **Symptom** — The physical-units VELOCITY trace for a 4.5 Hz velocimeter
