@@ -1,0 +1,283 @@
+"""Off-process HVSR compute boundary (rule 1 / rule 10 GIL fix).
+
+``hvsrpy``'s Konno-Ohmachi smoothing is numba-JIT and holds the CPython GIL
+for several seconds per re-compute. Run on a ``QThread`` it STILL freezes the
+GUI/engine thread and the SeedLink worker — the 2026-06-18 stall-watchdog
+postmortem (a GIL-holding compute reads as a "silent" device) named the only
+real fix: move the compute into a separate OS PROCESS so it cannot hold the
+in-process GIL.
+
+This module owns that boundary. It imports no Qt: the ``QThread`` worker
+calls :meth:`HvsrComputeClient.compute` and blocks on the subprocess pipe —
+a ``poll``/``recv`` syscall that RELEASES the GIL — so while ``hvsrpy`` runs
+in the child the GUI render and the SeedLink data path keep scheduling.
+
+Two implementations behind one Protocol:
+
+* :class:`SubprocessHvsrComputeClient` — production. A persistent child
+  process (``multiprocessing`` *spawn* context — never *fork*: forking a
+  multi-``QThread`` Qt process inherits locks held by other threads and
+  deadlocks, and inherits the SeedLink socket fds). The child is spawned
+  lazily on the first compute, kept warm across recomputes and measurements
+  (so numba JITs once), respawned if it dies, and torn down (bounded) on
+  :meth:`close`. A compute is now genuinely INTERRUPTIBLE: ``should_stop``
+  is polled every :data:`_POLL_INTERVAL_S` and a cancel ``terminate()``s the
+  child (today's in-process numba compute could only be abandoned, never
+  stopped — so a stop waited out the whole JIT).
+* :class:`InProcessHvsrComputeClient` — calls ``accumulator.compute()``
+  directly on the calling (worker) thread. Reproduces the pre-subprocess
+  behaviour verbatim; it is the test suite's default (``tests/conftest.py``)
+  so the Qt-threading tests stay fast and deterministic.
+
+``HvsrAccumulator`` snapshots, ``HvsrSettings`` and ``HvsrResult`` are all
+picklable (plain dataclasses / pydantic v2 / numpy / ``UTCDateTime``); the
+spawn child inherits no file descriptors or sockets and imports ``hvsrpy``
+only inside the compute, so the parent process never loads numba at all.
+
+A spawn child re-imports the launcher's module graph to rebuild ``__main__``
+(in a ``uv run`` checkout that is the console-script wrapper → this module's
+target; in a PyInstaller bundle it re-runs ``packaging/entry.py``, which does
+pull in PySide6 before :func:`multiprocessing.freeze_support` short-circuits
+the child). The child therefore is NOT guaranteed Qt-free — but it never
+constructs a ``QApplication`` or runs the GUI/event loop, only the compute
+loop; importing PySide6 without instantiating it is harmless.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import multiprocessing
+import threading
+import time
+from typing import TYPE_CHECKING, Protocol
+
+import structlog
+
+from echosmonitor.core.exceptions import HvsrError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from multiprocessing.connection import Connection
+    from multiprocessing.process import BaseProcess
+
+    from echosmonitor.core.hvsr import HvsrAccumulator, HvsrResult
+
+_log = structlog.get_logger(__name__)
+
+# ``should_stop`` poll cadence while waiting on the child (rule 7: ≤ 100 ms).
+_POLL_INTERVAL_S = 0.1
+# Bounded join when terminating the child (rule 7).
+_TERMINATE_JOIN_S = 2.0
+# Bounded join for a graceful close before falling back to terminate.
+_CLOSE_JOIN_S = 5.0
+
+# Pipe message tags (parent → child / child → parent).
+_REQ_COMPUTE = "compute"
+_REQ_SHUTDOWN = "shutdown"
+_RESP_OK = "ok"
+_RESP_ERR = "err"
+
+# structlog level (== logging.CRITICAL) below which the child drops its own
+# compute log lines: the parent owns observability, and the child's default
+# (unconfigured) logger would otherwise interleave on the shared stderr.
+_CHILD_LOG_FLOOR = 50
+
+
+class HvsrComputeClient(Protocol):
+    """Run one ``accumulator.compute()`` off the calling thread (or in it)."""
+
+    def compute(
+        self, accumulator: HvsrAccumulator, *, should_stop: Callable[[], bool]
+    ) -> HvsrResult | None:
+        """Return the result, ``None`` if cancelled, or raise ``HvsrError``."""
+        ...
+
+    def close(self, *, timeout_s: float = _CLOSE_JOIN_S) -> None:
+        """Release any resources (bounded, rule 7). Idempotent."""
+        ...
+
+
+class InProcessHvsrComputeClient:
+    """Synchronous, same-thread compute — the pre-subprocess behaviour.
+
+    ``should_stop`` is intentionally unobserved: an in-process numba compute
+    cannot be interrupted mid-flight (the very problem the subprocess client
+    solves). The worker's ``_superseded`` checks AROUND this call provide the
+    same latest-wins guarantee the engine relied on before this module
+    existed.
+    """
+
+    def compute(
+        self, accumulator: HvsrAccumulator, *, should_stop: Callable[[], bool]
+    ) -> HvsrResult | None:
+        return accumulator.compute()
+
+    def close(self, *, timeout_s: float = _CLOSE_JOIN_S) -> None:
+        return None
+
+
+def _compute_server_main(conn: Connection) -> None:
+    """Child entry: serve compute requests over ``conn`` until shutdown.
+
+    Top-level so ``multiprocessing`` spawn can pickle it by reference. Imports
+    ``hvsrpy`` only transitively via ``accumulator.compute()``. Never raises
+    across the pipe — a failed compute is an ``("err", message)`` response, a
+    closed pipe ends the loop.
+    """
+    # The child's structlog is unconfigured; silence the compute's own
+    # INFO/WARNING lines so they do not interleave on the shared stderr.
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(_CHILD_LOG_FLOOR))
+    try:
+        while True:
+            try:
+                tag, payload = conn.recv()
+            except EOFError:
+                return  # parent closed the pipe
+            if tag == _REQ_SHUTDOWN:
+                return
+            if tag != _REQ_COMPUTE:
+                continue
+            try:
+                result = payload.compute()
+            except Exception as exc:
+                conn.send((_RESP_ERR, str(exc)))
+                continue
+            conn.send((_RESP_OK, result))
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            conn.close()
+
+
+class SubprocessHvsrComputeClient:
+    """Persistent spawn child running the compute off-process (GIL-free).
+
+    Owned by ONE worker thread (the caller of :meth:`compute`); :meth:`close`
+    is called by the owner only after that thread has joined. The internal
+    lock is belt-and-suspenders against a stray concurrent call.
+    """
+
+    def __init__(self) -> None:
+        self._ctx = multiprocessing.get_context("spawn")
+        self._lock = threading.Lock()
+        self._proc: BaseProcess | None = None
+        self._conn: Connection | None = None
+        self._closed = False
+
+    def _ensure_child(self) -> Connection:
+        proc = self._proc
+        if proc is not None and proc.is_alive() and self._conn is not None:
+            return self._conn
+        self._drop_child()
+        parent_conn, child_conn = self._ctx.Pipe()
+        proc = self._ctx.Process(
+            target=_compute_server_main,
+            args=(child_conn,),
+            name="hvsr-compute",
+            daemon=True,
+        )
+        proc.start()
+        child_conn.close()  # the parent keeps only its own end
+        self._proc = proc
+        self._conn = parent_conn
+        _log.info("hvsr_compute_subprocess_spawned", pid=proc.pid)
+        return parent_conn
+
+    def compute(
+        self, accumulator: HvsrAccumulator, *, should_stop: Callable[[], bool]
+    ) -> HvsrResult | None:
+        with self._lock:
+            if self._closed:
+                raise HvsrError("hvsr compute client is closed")
+            conn = self._ensure_child()
+            n_windows = accumulator.n_windows
+            t0 = time.monotonic()
+            _log.info("hvsr_subprocess_compute_start", n_windows=n_windows)
+            try:
+                conn.send((_REQ_COMPUTE, accumulator))
+            except (OSError, ValueError) as exc:
+                self._drop_child()
+                raise HvsrError(f"hvsr compute subprocess send failed: {exc}") from exc
+            while True:
+                if should_stop():
+                    # Forced interrupt: numba cannot be unwound, so kill the
+                    # child (next compute respawns). Prompt — within one poll.
+                    self._drop_child()
+                    _log.info("hvsr_subprocess_compute_cancelled", n_windows=n_windows)
+                    return None
+                try:
+                    ready = conn.poll(_POLL_INTERVAL_S)
+                except (OSError, ValueError) as exc:
+                    self._drop_child()
+                    raise HvsrError(f"hvsr compute subprocess poll failed: {exc}") from exc
+                if ready:
+                    break
+                proc = self._proc
+                if proc is None or not proc.is_alive():
+                    self._drop_child()
+                    raise HvsrError("hvsr compute subprocess died mid-compute")
+            try:
+                tag, payload = conn.recv()
+            except (EOFError, OSError) as exc:
+                self._drop_child()
+                raise HvsrError(f"hvsr compute subprocess recv failed: {exc}") from exc
+            elapsed_ms = (time.monotonic() - t0) * 1000.0
+            if tag == _RESP_ERR:
+                _log.warning(
+                    "hvsr_subprocess_compute_error",
+                    error=str(payload),
+                    elapsed_ms=round(elapsed_ms, 1),
+                )
+                raise HvsrError(str(payload))
+            _log.info(
+                "hvsr_subprocess_compute_done",
+                n_windows=n_windows,
+                elapsed_ms=round(elapsed_ms, 1),
+            )
+            return payload  # type: ignore[no-any-return]
+
+    def close(self, *, timeout_s: float = _CLOSE_JOIN_S) -> None:
+        with self._lock:
+            self._closed = True
+            proc = self._proc
+            conn = self._conn
+            if proc is None:
+                return
+            if conn is not None and proc.is_alive():
+                with contextlib.suppress(OSError, ValueError):
+                    conn.send((_REQ_SHUTDOWN, None))
+                proc.join(timeout_s)
+            self._terminate(proc)
+            self._proc = None
+            self._conn = None
+
+    def _drop_child(self) -> None:
+        """Terminate and forget the current child (the next compute respawns)."""
+        proc, conn = self._proc, self._conn
+        self._proc = None
+        self._conn = None
+        if conn is not None:
+            with contextlib.suppress(OSError, ValueError):
+                conn.close()
+        if proc is not None:
+            self._terminate(proc)
+
+    @staticmethod
+    def _terminate(proc: BaseProcess) -> None:
+        if not proc.is_alive():
+            return
+        proc.terminate()
+        proc.join(_TERMINATE_JOIN_S)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(_TERMINATE_JOIN_S)
+
+
+def make_default_compute_client() -> HvsrComputeClient:
+    """Factory for the production (subprocess) client.
+
+    The engines call THIS (module-attribute lookup at worker-build time) when
+    no explicit factory is injected, so ``tests/conftest.py`` can point it at
+    the in-process client for the whole suite while the new boundary tests
+    construct :class:`SubprocessHvsrComputeClient` directly.
+    """
+    return SubprocessHvsrComputeClient()

@@ -85,9 +85,17 @@ heading slug from comments that reference an invariant defended here.
   cannot tell "the world stopped" from "I stopped looking". Any
   same-thread liveness check must cross-check its own scheduling delay before
   trusting an elapsed-time measurement. The deeper cost — the live plot and
-  data path genuinely stutter while hvsrpy holds the GIL — is unaddressed here;
-  the real fix is to run the GIL-bound hvsrpy compute in a subprocess, tracked
-  separately.
+  data path genuinely stutter while hvsrpy holds the GIL — was unaddressed by
+  the watchdog fix; the real fix is to run the GIL-bound hvsrpy compute in a
+  subprocess. **Done 2026-06-18** (`core/hvsr_compute.py`): both HVSR engines
+  now run `accumulator.compute()` in a persistent spawn child via a
+  `SubprocessHvsrComputeClient`, so the worker thread only blocks on a pipe
+  `poll` (GIL released) while numba runs out-of-process — the GUI render and
+  the SeedLink worker keep scheduling. A bonus property: the compute is now
+  genuinely interruptible (a cancel `terminate()`s the child), where the
+  in-process numba could only be abandoned mid-JIT. The frozen-bundle spawn
+  path is gated by `--check` (a real subprocess compute round-trip, the same
+  CI-catches-it discipline as the obspy-metadata smoke).
 
 ### 2026-06-17 — Packaged obspy had an empty plugin registry: no copy_metadata("obspy")
 

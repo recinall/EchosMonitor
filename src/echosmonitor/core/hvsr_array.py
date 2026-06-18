@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -54,6 +54,7 @@ import structlog
 from obspy.core.utcdatetime import UTCDateTime
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 
+from echosmonitor.core import hvsr_compute
 from echosmonitor.core.hvsr import (
     HvsrAccumulator,
     HvsrResult,
@@ -65,6 +66,7 @@ from echosmonitor.core.hvsr_engine import HvsrState, capture_disjoint_window
 from echosmonitor.core.positions import StationGeometry
 
 if TYPE_CHECKING:
+    from echosmonitor.core.hvsr_compute import HvsrComputeClient
     from echosmonitor.core.response import ResponseProvider
     from echosmonitor.core.streaming_engine import StreamingEngine
     from echosmonitor.storage.archive_reader import ArchiveReader
@@ -223,8 +225,12 @@ class _ArrayWorker(QObject):
     # An archive cycle found NO gap-free 3C window on any device (M6).
     sliceEmpty = Signal(str)  # measurement_id  # noqa: N815
 
-    def __init__(self) -> None:
+    def __init__(self, client: HvsrComputeClient) -> None:
         super().__init__()
+        # The per-device hvsrpy computes run through this client — in
+        # production a subprocess (GIL-free), so a slow N-device cycle never
+        # freezes the GUI/engine or the SeedLink worker (rule 1 / rule 10).
+        self._client = client
         self._stop = False
         # Latest-wins token (skill §2): the engine writes the live
         # measurement id GIL-atomically; a stale queued compute (its posted
@@ -246,7 +252,10 @@ class _ArrayWorker(QObject):
             if self._superseded(measurement_id):
                 return None  # do not announce
             try:
-                results[device] = accumulator.compute()
+                result = self._client.compute(
+                    accumulator,
+                    should_stop=lambda: self._superseded(measurement_id),
+                )
             except Exception as exc:  # never crash the worker thread
                 _log.error(
                     "hvsr_array_compute_failed",
@@ -255,6 +264,10 @@ class _ArrayWorker(QObject):
                     error=str(exc),
                 )
                 errors[device] = str(exc)
+                continue
+            if result is None:
+                return None  # cancelled mid-device (subprocess killed) — do not announce
+            results[device] = result
         if self._superseded(measurement_id):
             return None  # stopped/superseded after the last device — do not announce
         return results, errors
@@ -436,10 +449,16 @@ class HvsrArrayEngine(QObject):
         engine: StreamingEngine,
         provider: ResponseProvider | None,
         parent: QObject | None = None,
+        *,
+        compute_client_factory: Callable[[], HvsrComputeClient] | None = None,
     ) -> None:
         super().__init__(parent)
         self._engine = engine
         self._provider = provider
+        # One fresh compute client per worker build (the subprocess is owned
+        # by that worker thread). Default = the production subprocess client;
+        # the test suite points the factory at the in-process client.
+        self._client_factory = compute_client_factory or hvsr_compute.make_default_compute_client
         self._measurement: _ArrayMeasurement | None = None
         self._seq = 0
         # Set when a stop's bounded join timed out: the thread is still
@@ -459,7 +478,7 @@ class HvsrArrayEngine(QObject):
         self._timer.timeout.connect(self._tick)
 
     def _make_worker(self) -> tuple[_ArrayWorker, QThread]:
-        worker = _ArrayWorker()
+        worker = _ArrayWorker(self._client_factory())
         thread = QThread()
         thread.setObjectName("hvsr-array-worker")
         worker.moveToThread(thread)
@@ -734,9 +753,19 @@ class HvsrArrayEngine(QObject):
     def shutdown(self) -> None:
         """Tear down for app exit — stop the measurement and every thread."""
         self.stop_measurement()
+        joined = True
         if self._array_thread.isRunning():
             self._array_thread.quit()
-            self._array_thread.wait(_THREAD_JOIN_MS)
+            joined = self._array_thread.wait(_THREAD_JOIN_MS)
+        # Close the compute client (kill the warm subprocess, bounded) ONLY
+        # once the worker thread has joined — close() takes the client lock a
+        # wedged in-flight compute still holds, so closing a non-joined worker
+        # would block. A still-stuck thread's child is daemonic (OS-reaped at
+        # exit); skipping its close trades a rare orphan for a non-blocking
+        # teardown.
+        if joined:
+            with contextlib.suppress(Exception):
+                self._worker._client.close()
         # Drain any threads abandoned by a poisoned-thread rebuild: their
         # severed workers can no longer announce, but a still-running
         # QThread must be joined (bounded) before the process exits. A pair
@@ -749,6 +778,10 @@ class HvsrArrayEngine(QObject):
                 if not thread.wait(_THREAD_JOIN_MS):
                     _log.warning("hvsr_array_abandoned_thread_join_timeout")
                     still_running.append((worker, thread))
+                    continue
+            # Thread confirmed stopped — its subprocess can be closed safely.
+            with contextlib.suppress(Exception):
+                worker._client.close()
         self._abandoned = still_running
 
     # ------------------------------------------------------------------

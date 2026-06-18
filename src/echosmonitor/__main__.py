@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import multiprocessing
 import signal
 import sys
 from pathlib import Path
@@ -93,8 +94,60 @@ def _obspy_io_self_check() -> None:
     read_inventory(sx, format="STATIONXML")
 
 
+def _hvsr_subprocess_self_check() -> None:
+    """Round-trip one real HVSR compute through the spawn subprocess (smoke).
+
+    The GIL-bound hvsrpy compute now runs in a child process
+    (``core/hvsr_compute.py``) so it cannot freeze the GUI/SeedLink threads.
+    A frozen bundle that cannot spawn that child — a missing
+    ``multiprocessing.freeze_support`` hook, a module the PyInstaller graph
+    dropped — would break ALL HVSR analysis at runtime, the same failure
+    class as the empty obspy plugin registry. Computing a tiny synthetic
+    measurement here makes `--check` fail in CI instead of in the field.
+    """
+    import numpy as np
+    from obspy import UTCDateTime
+
+    from echosmonitor.core.hvsr import HvsrAccumulator, HvsrSettings
+    from echosmonitor.core.hvsr_compute import SubprocessHvsrComputeClient
+
+    fs = 100.0
+    settings = HvsrSettings(window_length_s=2.0, freqmin_hz=1.0, freqmax_hz=20.0, resample_n=64)
+    rng = np.random.default_rng(0)
+    acc = HvsrAccumulator(
+        settings,
+        same_response=True,
+        same_response_detail="self-check",
+        device="selfcheck",
+        station_key="XX.CHK",
+        provenance="archive",
+    )
+    n = int(settings.window_length_s * fs)
+    t0 = UTCDateTime(0)
+    for i in range(3):
+        acc.add_window(
+            rng.standard_normal(n),
+            rng.standard_normal(n),
+            rng.standard_normal(n),
+            t0 + i * settings.window_length_s,
+            fs,
+        )
+    client = SubprocessHvsrComputeClient()
+    try:
+        result = client.compute(acc, should_stop=lambda: False)
+    finally:
+        client.close()
+    if result is None or not bool(np.isfinite(result.frequency).any()):
+        raise RuntimeError("HVSR subprocess compute self-check produced no result")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the application. Returns the Qt event loop exit code."""
+    # Frozen-bundle multiprocessing: a spawn/forked child re-enters this exe;
+    # freeze_support() makes such a child run the multiprocessing bootstrap
+    # (e.g. the hvsr-compute worker) and exit, instead of launching a second
+    # GUI. A no-op in a normal `uv run` checkout. MUST be first.
+    multiprocessing.freeze_support()
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     cfg, cfg_path = load_config(args.config)
@@ -149,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     # event loop / first-run wizard so the check is non-interactive.
     if args.check:
         _obspy_io_self_check()
+        _hvsr_subprocess_self_check()
         window.close()
         log.info("check_ok", version=__version__)
         return 0

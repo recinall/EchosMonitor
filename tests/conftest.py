@@ -66,6 +66,30 @@ def _redirect_qsettings(tmp_path: Path) -> None:
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
 
 
+@pytest.fixture(autouse=True)
+def _in_process_hvsr_compute(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run HVSR computes IN-PROCESS for the whole suite.
+
+    Production runs the GIL-bound hvsrpy compute in a spawn subprocess
+    (``core/hvsr_compute.py``). Spawning a child per HVSR engine test would
+    be slow and would defeat the Qt-threading tests that monkeypatch
+    ``HvsrAccumulator.compute`` for deterministic timing (a patch in this
+    process never reaches a child). Both ``HvsrEngine`` and
+    ``HvsrArrayEngine`` resolve their default client via
+    ``hvsr_compute.make_default_compute_client`` at worker-build time, so
+    pointing it at the in-process client here keeps every existing test
+    unchanged. The new ``tests/core/test_hvsr_compute.py`` boundary tests
+    construct ``SubprocessHvsrComputeClient`` directly and so are unaffected.
+    """
+    from echosmonitor.core import hvsr_compute
+
+    monkeypatch.setattr(
+        hvsr_compute,
+        "make_default_compute_client",
+        hvsr_compute.InProcessHvsrComputeClient,
+    )
+
+
 @pytest.fixture
 def capture_structlog() -> Iterator[list[dict[str, Any]]]:
     """Yield a list that gets appended to with every structlog event.

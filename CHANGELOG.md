@@ -8,6 +8,31 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-06-18
+
+### Fixed
+- **HVSR analysis no longer stutters the live stream (GIL fix).** hvsrpy's
+  Konno-Ohmachi smoothing is numba-JIT and held the CPython GIL for several
+  seconds per re-compute; run on a worker `QThread` it still froze the
+  GUI/engine thread **and** the SeedLink worker, so during HVSR analysis the
+  live plot and the SeedLink data path stalled (and the stall watchdog cried
+  wolf). The compute now runs in a persistent **spawn subprocess**
+  (`core/hvsr_compute.py`) for both the single-device and multi-device (array)
+  engines, so the worker thread only blocks on a pipe `poll` (GIL released)
+  while numba runs out-of-process — the GUI render and SeedLink keep
+  scheduling. As a bonus the compute is now genuinely **interruptible**: a stop
+  `terminate()`s the child, where in-process numba could only be abandoned
+  mid-JIT. The packaged `--check` smoke round-trips one real subprocess compute
+  so a broken frozen bundle fails CI (same discipline as the obspy-metadata
+  smoke).
+- **Stall watchdog forgives in-process GIL starvation (false stalls).** A
+  multi-second GIL-holding compute on the engine thread froze packet processing
+  and the stall scan together, so the next scan measured a false >5 s gap and
+  logged `seedlink_stream_stalled` for a stream that never went silent.
+  `_scan_stalls` now cross-checks its own scheduling delay and rebases every
+  stream's liveness clock (logging `stall_scan_starved`) when the engine thread
+  was frozen, while a genuine network silence is still flagged.
+
 ## [0.1.2] — 2026-06-17
 
 ### Fixed
@@ -91,5 +116,6 @@ Highlights, by milestone:
 - **M0:** the entire AI subsystem (agents/seisbench/torch/phasenet) and the
   generic-dashboard branding; the package was renamed to `echosmonitor`.
 
-[Unreleased]: https://github.com/recinall/EchosMonitor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/recinall/EchosMonitor/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/recinall/EchosMonitor/compare/v0.1.2...v0.1.3
 [0.1.0]: https://github.com/recinall/EchosMonitor/releases/tag/v0.1.0
