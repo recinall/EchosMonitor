@@ -50,6 +50,45 @@ heading slug from comments that reference an invariant defended here.
 
 ## Entries
 
+### 2026-06-18 — Stall watchdog cried wolf: an in-process GIL freeze read as a "silent" device
+
+- **Symptom** — v0.1.2 logged `seedlink_stream_stalled` (`silent_s` ~5.2–5.8,
+  `threshold_s` 5.0) "regularly", reported first as happening mainly during
+  HVSR analysis, then also without it. No data was actually lost; the live
+  stream recovered on its own each time (`seedlink_stream_resumed`).
+- **Root cause** — the watchdog stamped each stream's last-arrival time in
+  `_on_packet` and scanned for silence in `_scan_stalls`, BOTH on the
+  GUI/engine thread. A multi-second GIL-holding compute — the hvsrpy/numba
+  HVSR re-compute is the textbook case, but any heavy in-process work
+  (deconvolution, a GC pause) does it — freezes the engine thread, so packet
+  processing AND the scan stall together. The device kept sending and the OS
+  socket buffer held the data (obspy drained it with no loss once scheduled),
+  but the last-packet timestamps went stale, so the next scan computed a >5 s
+  gap and flagged a stall that never happened. Exactly the CLAUDE.md rule 10
+  landmine ("GIL-holding work starves the data path"), seen for the first time
+  only now because the v0.1.0/v0.1.1 binaries shipped an empty obspy plugin
+  registry (see 2026-06-17) and delivered zero packets — v0.1.2 is the first
+  build where SeedLink data and the watchdog ran together. The ~237 s period
+  between warnings was a red herring: it was just the HVSR re-compute cadence.
+- **Fix** — `core/streaming_engine.py::_scan_stalls` now reads its OWN
+  scheduling delay (`now - prev_scan`). If a scan ran more than
+  `_STALL_SCAN_STARVED_S` (2.5 s) past its ~1 Hz cadence, the engine thread was
+  frozen, not the network — so it rebases every stream's liveness clock to now,
+  logs `stall_scan_starved`, and forgives the round instead of blaming the
+  device. A genuine network silence leaves the loop ticking on time and is
+  still flagged. The `prev_scan == 0.0` never-scanned sentinel skips both the
+  throttle and the guard (first scan / tests). Regression tests:
+  `test_stall_watchdog_forgives_process_wide_starvation` (frozen scan → no
+  flag, liveness rebased) and `test_stall_watchdog_flags_silence_when_scan_loop_is_healthy`
+  (on-cadence scan + real silence → still flagged).
+- **Lesson learned** — a watchdog that lives on the same thread it monitors
+  cannot tell "the world stopped" from "I stopped looking". Any
+  same-thread liveness check must cross-check its own scheduling delay before
+  trusting an elapsed-time measurement. The deeper cost — the live plot and
+  data path genuinely stutter while hvsrpy holds the GIL — is unaddressed here;
+  the real fix is to run the GIL-bound hvsrpy compute in a subprocess, tracked
+  separately.
+
 ### 2026-06-17 — Packaged obspy had an empty plugin registry: no copy_metadata("obspy")
 
 - **Symptom** — in the released v0.1.0/v0.1.1 desktop binaries (but never in a

@@ -132,6 +132,24 @@ _STALL_MIN_S = 5.0
 _STALL_MAX_S = 60.0
 # The watchdog runs on the flush tick; throttle the scan to ~1 Hz.
 _STALL_CHECK_INTERVAL_S = 1.0
+# Process-wide starvation guard. The watchdog (and ``_on_packet``, which
+# stamps each stream's last-arrival time) both run on the GUI/engine thread,
+# so a multi-second GIL-holding compute — an hvsrpy/numba HVSR re-compute, a
+# deconvolution, a long GC pause — freezes BOTH at once. The last-packet
+# timestamps then look stale only because the whole process was frozen: the
+# device kept sending and the OS socket buffer holds the data, so obspy drains
+# it with no loss once scheduled (CLAUDE.md rule 10 — GIL-holding work starves
+# the data path). We detect this from the scan's OWN scheduling delay: if a
+# scan ran this much later than its ~1 Hz cadence the engine thread was
+# starved, so we forgive the round (rebase liveness, emit no stall) rather than
+# blame the network. A genuine network silence that does NOT coincide with a
+# freeze leaves the loop ticking on time and is still flagged on the next
+# healthy scan; a real stall unlucky enough to overlap a freeze is forgiven
+# that round only and re-accrues afterwards (the residual false-negative window
+# of any same-thread watchdog — the real cure is moving the GIL-bound hvsrpy
+# compute off-thread, tracked separately). Kept below ``_STALL_MIN_S`` so the
+# freeze is caught before a false stall would fire, yet above ordinary jitter.
+_STALL_SCAN_STARVED_S = 2.5
 
 
 class _DeviceBridge(QObject):
@@ -1291,6 +1309,11 @@ class StreamingEngine(QObject):
         self._last_packet_monotonic.clear()
         self._expected_packet_interval_s.clear()
         self._stalled.clear()
+        # Reset the watchdog's own scan clock to the never-scanned sentinel so a
+        # stop→start cycle's first scan is treated as a fresh start (skipping the
+        # throttle and the starvation guard) instead of measuring against a
+        # pre-stop monotonic timestamp.
+        self._last_stall_scan_s = 0.0
         self._detrend_linear_warned.clear()
         self._stream_drops_pending.clear()
         self._stream_drops_last_log.clear()
@@ -1865,9 +1888,28 @@ class StreamingEngine(QObject):
         Recovery is detected in :meth:`_on_packet`.
         """
         now = time.monotonic()
-        if now - self._last_stall_scan_s < _STALL_CHECK_INTERVAL_S:
+        prev_scan = self._last_stall_scan_s
+        # ``prev_scan == 0.0`` is the never-scanned sentinel (engine just
+        # started, or a test that bypasses the throttle): take it as the first
+        # scan, skipping both the throttle and the starvation guard below.
+        if prev_scan != 0.0 and now - prev_scan < _STALL_CHECK_INTERVAL_S:
             return
         self._last_stall_scan_s = now
+        # Process-wide starvation guard (see ``_STALL_SCAN_STARVED_S``): if our
+        # own scan was delayed far past its cadence the engine thread was
+        # frozen, not the network — forgive this round and rebase every
+        # stream's liveness clock so an in-process GIL stall (an HVSR
+        # re-compute, deconvolution, GC pause) cannot masquerade as a stalled
+        # device. The freeze hits all streams equally, so all are rebased.
+        if prev_scan != 0.0 and now - prev_scan > _STALL_SCAN_STARVED_S:
+            for name in self._last_packet_monotonic:
+                self._last_packet_monotonic[name] = now
+            _log.info(
+                "stall_scan_starved",
+                elapsed_s=round(now - prev_scan, 1),
+                streams_rebased=len(self._last_packet_monotonic),
+            )
+            return
         for name, status in self._status.items():
             if status.state is not ConnState.CONNECTED or name in self._stalled:
                 continue

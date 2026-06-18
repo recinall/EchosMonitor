@@ -123,6 +123,48 @@ def test_stall_watchdog_flags_silent_connected_stream(qtbot) -> None:
         engine._scan_stalls()
 
 
+def test_stall_watchdog_forgives_process_wide_starvation(qtbot) -> None:
+    """A GIL-holding in-process freeze (e.g. an hvsrpy/numba HVSR re-compute)
+    blocks the engine thread, so BOTH ``_on_packet`` and the watchdog scan stall
+    together — the device kept sending, the OS buffer holds the data, nothing was
+    lost. The watchdog must NOT blame the device: when its OWN scan was delayed
+    past ``_STALL_SCAN_STARVED_S`` it forgives the round and rebases liveness so a
+    self-inflicted freeze cannot masquerade as a stalled stream (rule 10)."""
+    from echosmonitor.core.streaming_engine import _STALL_SCAN_STARVED_S
+
+    engine = StreamingEngine(_make_root_cfg([]))
+    # Same numbers as the field report: ~0.224 s cadence, silent ~5.5 s.
+    _seed_connected_silent(engine, "dev", expected_interval_s=0.224, silent_s=5.5)
+    # The scan loop itself was frozen (whole process blocked), not just this one
+    # stream — the previous scan ran ~6 s ago instead of ~1 s ago.
+    frozen_for = _STALL_SCAN_STARVED_S + 3.0
+    engine._last_stall_scan_s = time.monotonic() - frozen_for
+    with qtbot.assertNotEmitted(engine.streamStalled):
+        engine._scan_stalls()
+    assert "dev" not in engine._stalled
+    # Liveness rebased to ~now, so the next (healthy) scan measures afresh.
+    assert engine._last_packet_monotonic["dev"] == pytest.approx(
+        time.monotonic(), abs=1.0
+    )
+
+
+def test_stall_watchdog_flags_silence_when_scan_loop_is_healthy(qtbot) -> None:
+    """The starvation guard forgives only a frozen loop, not a real network gap:
+    when the engine thread is responsive (scan on its normal ~1 Hz cadence) a
+    genuinely silent CONNECTED stream is still flagged."""
+    from echosmonitor.core.streaming_engine import _STALL_CHECK_INTERVAL_S
+
+    engine = StreamingEngine(_make_root_cfg([]))
+    _seed_connected_silent(engine, "dev", expected_interval_s=0.224, silent_s=5.5)
+    # Prior scan ran just over one throttle interval ago — a healthy cadence,
+    # well under _STALL_SCAN_STARVED_S, so the guard does not engage.
+    engine._last_stall_scan_s = time.monotonic() - (_STALL_CHECK_INTERVAL_S + 0.05)
+    with qtbot.waitSignal(engine.streamStalled, timeout=1000) as blocker:
+        engine._scan_stalls()
+    assert blocker.args == ["dev", True]
+    assert "dev" in engine._stalled
+
+
 def test_stall_threshold_scales_with_sampling_rate(qtbot) -> None:
     """The threshold adapts to the stream's cadence ('watchdog intelligente'):
     the SAME silence flags a fast stream but not a slow one (Bug 2)."""
