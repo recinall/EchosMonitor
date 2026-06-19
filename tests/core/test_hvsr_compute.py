@@ -10,10 +10,15 @@ on purpose (2 s windows, 64 centre frequencies).
 
 from __future__ import annotations
 
+import multiprocessing
+import sys
+
 import numpy as np
 import pytest
+import structlog
 from obspy import UTCDateTime
 
+from echosmonitor.core import hvsr_compute as hc
 from echosmonitor.core.exceptions import HvsrError
 from echosmonitor.core.hvsr import HvsrAccumulator, HvsrSettings
 from echosmonitor.core.hvsr_compute import (
@@ -182,14 +187,13 @@ def test_in_process_client_ignores_should_stop() -> None:
     client.close()  # no-op, no raise
 
 
-# --- degraded in-process fallback (v0.1.3 Windows frozen-spawn-child bug) ----
+# --- degraded in-process fallback (belt-and-suspenders) ----------------------
 #
-# When the spawn child's ENVIRONMENT is unusable (numba/llvmlite breaking in a
-# frozen spawn child on Windows) the child fails every compute the PARENT can
-# still complete in-process. The client must keep HVSR working by falling back,
-# and latch so it stops re-spawning the doomed child. These tests force that
-# branch with a fake child conn (no real broken numba needed) so they stay fast
-# and deterministic on every platform.
+# If the spawn child's ENVIRONMENT is unusable the child fails every compute the
+# PARENT can still complete in-process. The client must keep HVSR working by
+# falling back, and latch so it stops re-spawning the doomed child. These tests
+# force that branch with a fake child conn (no real broken child needed) so they
+# stay fast and deterministic on every platform.
 
 
 class _FakeConn:
@@ -243,8 +247,6 @@ def _wire_broken_child(client: SubprocessHvsrComputeClient, response: object) ->
 
 def test_falls_back_in_process_when_child_environment_broken() -> None:
     """Child fails a compute the parent completes in-process → degrade + latch."""
-    from echosmonitor.core import hvsr_compute as hc
-
     client = SubprocessHvsrComputeClient()
     try:
         _wire_broken_child(
@@ -267,8 +269,6 @@ def test_falls_back_in_process_when_child_environment_broken() -> None:
 
 def test_child_error_on_bad_input_propagates_and_does_not_latch() -> None:
     """A real INPUT error (in-process raises the SAME way) must NOT latch."""
-    from echosmonitor.core import hvsr_compute as hc
-
     empty = HvsrAccumulator(
         _SETTINGS,
         same_response=True,
@@ -287,3 +287,32 @@ def test_child_error_on_bad_input_propagates_and_does_not_latch() -> None:
         assert client.subprocess_broken is False
     finally:
         client.close()
+
+
+def test_child_main_survives_none_std_streams() -> None:
+    """The child entry must not crash when sys.stdout/sys.stderr are None.
+
+    THE v0.1.3 Windows root cause: a windowed (console=False) PyInstaller child
+    has ``sys.stdout is None``; structlog's default ``PrintLogger`` then dies on
+    ``weakref(None)`` at the FIRST compute log line — surfacing as
+    ``HvsrError: cannot create weak reference to 'NoneType' object`` and breaking
+    ALL HVSR on Windows. Drive ``_compute_server_main`` directly with the streams
+    forced to None: with the fix it must return an OK result, not crash.
+    """
+    saved_out, saved_err = sys.stdout, sys.stderr
+    saved_cfg = structlog.get_config()  # the child calls structlog.configure()
+    parent, child = multiprocessing.Pipe()
+    try:
+        sys.stdout = None  # type: ignore[assignment]
+        sys.stderr = None  # type: ignore[assignment]
+        parent.send((hc._REQ_COMPUTE, _accumulator()))
+        parent.send((hc._REQ_SHUTDOWN, None))
+        # Runs in this thread; returns on the shutdown message above.
+        hc._compute_server_main(child)
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+        structlog.configure(**saved_cfg)  # restore the suite's config
+    tag, payload = parent.recv()
+    assert tag == hc._RESP_OK
+    assert payload is not None
+    parent.close()

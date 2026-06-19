@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import contextlib
 import multiprocessing
+import os
+import sys
 import threading
 import time
 import traceback
@@ -125,9 +127,24 @@ def _compute_server_main(conn: Connection) -> None:
     across the pipe — a failed compute is an ``("err", message)`` response, a
     closed pipe ends the loop.
     """
-    # The child's structlog is unconfigured; silence the compute's own
-    # INFO/WARNING lines so they do not interleave on the shared stderr.
-    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(_CHILD_LOG_FLOOR))
+    # A windowed (console=False) PyInstaller child has sys.stdout/sys.stderr ==
+    # None. structlog's DEFAULT PrintLogger writes to sys.stdout, so the first
+    # log line inside accumulator.compute() (and any matplotlib/hvsrpy print)
+    # blows up with "cannot create weak reference to 'NoneType' object" — the
+    # whole v0.1.3 Windows HVSR field bug, invisible on CI runners (which DO
+    # have a console). Two defences: give the streams a real sink, AND pin the
+    # child's structlog to that sink so it never reaches for sys.stdout at all.
+    sink = open(os.devnull, "w")  # noqa: SIM115 (lives for the child's lifetime)
+    if sys.stdout is None:
+        sys.stdout = sink
+    if sys.stderr is None:
+        sys.stderr = sink
+    # Silence the compute's own INFO/WARNING lines (the parent owns
+    # observability) AND route them to devnull, never the inherited stdout.
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(_CHILD_LOG_FLOOR),
+        logger_factory=structlog.PrintLoggerFactory(file=sink),
+    )
     try:
         while True:
             try:
@@ -143,10 +160,11 @@ def _compute_server_main(conn: Connection) -> None:
             except Exception as exc:
                 # Forward the FULL traceback, not just str(exc): the child is a
                 # separate OS process, so this pipe is the parent's ONLY window
-                # into a failure. Without it a numba/llvmlite break in a frozen
-                # spawn child reads as a bare "cannot create weak reference to
-                # 'NoneType' object" with no frame (the v0.1.3 Windows field
-                # bug). Tuple shape: (short_message, full_traceback).
+                # into a failure. Without it the v0.1.3 Windows field bug read
+                # as a bare "cannot create weak reference to 'NoneType' object"
+                # with no frame — it was actually structlog's PrintLogger hitting
+                # the windowed child's None sys.stdout (fixed in
+                # _compute_server_main), NOT numba. Tuple: (short, traceback).
                 conn.send((_RESP_ERR, (str(exc), traceback.format_exc())))
                 continue
             conn.send((_RESP_OK, result))
@@ -163,12 +181,15 @@ class SubprocessHvsrComputeClient:
     lock is belt-and-suspenders against a stray concurrent call.
 
     **Degraded fallback.** If the spawn child cannot run the compute at all
-    (its ENVIRONMENT is broken — numba/llvmlite failing inside a frozen spawn
-    child on Windows, the v0.1.3 field bug), the client re-runs that compute
-    in-process and, on success, latches :attr:`subprocess_broken` so every
-    later compute skips the doomed child. This forfeits the GIL protection
-    (rule 1) on that platform but keeps HVSR FUNCTIONAL — a hard failure of the
-    whole feature is the worse outcome. See :meth:`_fallback_in_process`.
+    (its ENVIRONMENT is broken), the client re-runs that compute in-process
+    and, on success, latches :attr:`subprocess_broken` so every later compute
+    skips the doomed child. This forfeits the GIL protection (rule 1) on that
+    platform but keeps HVSR FUNCTIONAL — a hard failure of the whole feature is
+    the worse outcome. It is belt-and-suspenders: the one known break (the
+    v0.1.3 None-``sys.stdout`` structlog crash in a windowed frozen child) is
+    fixed at the source in :func:`_compute_server_main`, so on a current bundle
+    the child runs and this path never triggers. See
+    :meth:`_fallback_in_process`.
     """
 
     def __init__(self) -> None:
@@ -187,11 +208,10 @@ class SubprocessHvsrComputeClient:
     def subprocess_broken(self) -> bool:
         """True once the client has fallen back to in-process compute.
 
-        The off-process boundary is the GIL fix (rule 1); when it is structurally
-        impossible (numba/llvmlite breaking in a frozen spawn child on Windows —
-        the v0.1.3 field bug) the client degrades to in-process so HVSR still
-        WORKS. Callers (e.g. the packaged ``--check``) read this to surface that
-        the GIL protection is inactive without failing.
+        The off-process boundary is the GIL fix (rule 1); if the child cannot
+        run at all the client degrades to in-process so HVSR still WORKS.
+        Callers (e.g. the packaged ``--check``) read this to surface that the
+        GIL protection is inactive without failing.
         """
         return self._subprocess_broken
 
@@ -285,10 +305,9 @@ class SubprocessHvsrComputeClient:
 
         The child raised. Two causes are indistinguishable from the parent: a
         genuine INPUT error (a degenerate accumulator — in-process raises the
-        SAME ``HvsrError``) and a broken child ENVIRONMENT (numba/llvmlite
-        failing in a frozen spawn child on Windows — the v0.1.3 field bug;
-        numba in the PARENT process works, as it did before HVSR moved
-        off-process). So re-run the compute here:
+        SAME ``HvsrError``) and a broken child ENVIRONMENT (the parent process
+        computes fine — as HVSR did before it moved off-process). So re-run the
+        compute here:
 
         * in-process RAISES → it was a real input error: surface the child's
           (already-logged) message and keep the healthy child untouched.
