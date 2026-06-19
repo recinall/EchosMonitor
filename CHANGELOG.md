@@ -8,6 +8,8 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-06-19
+
 ### Fixed
 - **HVSR worked on Linux/macOS but was dead on Windows (critical).** The v0.1.3
   off-process HVSR child crashed on every compute on real Windows with
