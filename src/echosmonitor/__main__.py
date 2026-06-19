@@ -135,10 +135,21 @@ def _hvsr_subprocess_self_check() -> None:
     client = SubprocessHvsrComputeClient()
     try:
         result = client.compute(acc, should_stop=lambda: False)
+        # The compute MUST yield a finite result (HVSR is functional). Whether
+        # it ran off-process or fell back in-process is captured separately:
+        # a frozen spawn child can break (numba/llvmlite on Windows — the
+        # v0.1.3 field bug) yet the fallback keeps HVSR working, so this is a
+        # loud WARNING in the smoke log, NOT a build failure.
+        fell_back = client.subprocess_broken
     finally:
         client.close()
     if result is None or not bool(np.isfinite(result.frequency).any()):
         raise RuntimeError("HVSR subprocess compute self-check produced no result")
+    if fell_back:
+        structlog.get_logger(__name__).warning(
+            "hvsr_selfcheck_used_in_process_fallback",
+            detail="off-process HVSR unavailable in this bundle; GIL fix inactive",
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

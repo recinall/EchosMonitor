@@ -180,3 +180,110 @@ def test_in_process_client_ignores_should_stop() -> None:
     result = client.compute(_accumulator(), should_stop=lambda: True)
     assert result is not None  # should_stop is unobserved in-process
     client.close()  # no-op, no raise
+
+
+# --- degraded in-process fallback (v0.1.3 Windows frozen-spawn-child bug) ----
+#
+# When the spawn child's ENVIRONMENT is unusable (numba/llvmlite breaking in a
+# frozen spawn child on Windows) the child fails every compute the PARENT can
+# still complete in-process. The client must keep HVSR working by falling back,
+# and latch so it stops re-spawning the doomed child. These tests force that
+# branch with a fake child conn (no real broken numba needed) so they stay fast
+# and deterministic on every platform.
+
+
+class _FakeConn:
+    """A pipe end that always answers one canned (tag, payload)."""
+
+    def __init__(self, response: object) -> None:
+        self._response = response
+        self.sent: list[object] = []
+
+    def send(self, obj: object) -> None:
+        self.sent.append(obj)
+
+    def poll(self, timeout: float | None = None) -> bool:
+        return True
+
+    def recv(self) -> object:
+        return self._response
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeProc:
+    pid = 4321
+
+    def is_alive(self) -> bool:
+        return True
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+    def join(self, timeout: float | None = None) -> None:
+        return None
+
+
+def _wire_broken_child(client: SubprocessHvsrComputeClient, response: object) -> _FakeConn:
+    """Make ``_ensure_child`` hand back a fake child that returns ``response``."""
+    fake_conn = _FakeConn(response)
+
+    def _ensure() -> _FakeConn:
+        client._proc = _FakeProc()  # type: ignore[assignment]
+        client._conn = fake_conn  # type: ignore[assignment]
+        return fake_conn
+
+    client._ensure_child = _ensure  # type: ignore[method-assign]
+    return fake_conn
+
+
+def test_falls_back_in_process_when_child_environment_broken() -> None:
+    """Child fails a compute the parent completes in-process → degrade + latch."""
+    from echosmonitor.core import hvsr_compute as hc
+
+    client = SubprocessHvsrComputeClient()
+    try:
+        _wire_broken_child(
+            client, (hc._RESP_ERR, ("cannot create weak reference to 'NoneType' object", "tb"))
+        )
+        assert client.subprocess_broken is False
+
+        result = client.compute(_accumulator(), should_stop=_never_stop)
+        assert result is not None  # HVSR still works via the in-process fallback
+        assert client.subprocess_broken is True  # latched
+        assert client._proc is None  # doomed child dropped
+
+        # A second compute takes the latched fast path: no child is spawned.
+        again = client.compute(_accumulator(seed=1), should_stop=_never_stop)
+        assert again is not None
+        assert client._proc is None
+    finally:
+        client.close()
+
+
+def test_child_error_on_bad_input_propagates_and_does_not_latch() -> None:
+    """A real INPUT error (in-process raises the SAME way) must NOT latch."""
+    from echosmonitor.core import hvsr_compute as hc
+
+    empty = HvsrAccumulator(
+        _SETTINGS,
+        same_response=True,
+        same_response_detail="test",
+        device="dev",
+        station_key="XX.DEV",
+        provenance="archive",
+    )
+    client = SubprocessHvsrComputeClient()
+    try:
+        _wire_broken_child(client, (hc._RESP_ERR, ("no windows accumulated", "tb")))
+        with pytest.raises(HvsrError):
+            client.compute(empty, should_stop=_never_stop)
+        # In-process reproduced the failure → genuine input error, not a broken
+        # environment: the fallback must stay off.
+        assert client.subprocess_broken is False
+    finally:
+        client.close()
