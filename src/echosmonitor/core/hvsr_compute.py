@@ -335,7 +335,13 @@ class SubprocessHvsrComputeClient:
         return result
 
     def _compute_in_process(self, accumulator: HvsrAccumulator) -> HvsrResult:
-        """Run the compute on the calling thread (latched-fallback fast path)."""
+        """Run the compute on the calling thread (latched-fallback fast path).
+
+        Like :class:`InProcessHvsrComputeClient`, ``should_stop`` is unobserved
+        here: numba cannot be unwound mid-flight, so a cancel waits out the
+        whole compute (rule 7 is degraded in this already-degraded path). The
+        worker's latest-wins checks AROUND the call still hold between computes.
+        """
         try:
             return accumulator.compute()
         except HvsrError:

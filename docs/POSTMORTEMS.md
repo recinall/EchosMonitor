@@ -50,6 +50,47 @@ heading slug from comments that reference an invariant defended here.
 
 ## Entries
 
+### 2026-06-19 — HVSR dead on Windows: structlog's PrintLogger weakref'd a None sys.stdout in the spawn child
+
+- **Symptom** — On real Windows 10 22H2 the v0.1.3 portable launched fine
+  (`main_window_ready`) but EVERY HVSR compute failed, and the packaged
+  `echosmonitor.exe --check` exited non-zero ~9–21 s in with
+  `HvsrError: cannot create weak reference to 'NoneType' object`. CI's
+  `--check` on `windows-latest` PASSED, so the broken bundle shipped — the
+  release gate had a blind spot. Reproduced 100 % via SSH on a field box;
+  not reproducible in `uv run` or on the Linux/macOS bundles.
+- **Root cause** — The off-process HVSR child (`core/hvsr_compute._compute_server_main`,
+  a `multiprocessing` *spawn* process) re-runs the **windowed** (`console=False`)
+  PyInstaller exe, where `sys.stdout is None`. The child called
+  `structlog.configure(wrapper_class=…)` but left the **default**
+  `PrintLoggerFactory`, which targets `sys.stdout`. The first log line inside
+  `HvsrAccumulator.compute()` (`hvsr_compute_start`) lazily built a
+  `PrintLogger(file=None)` → structlog's `_get_lock_for_file(None)` →
+  `weakref.ref(None)` → `TypeError`. The numba `@njit(cache=True)` smoothing
+  was a red herring: the crash happened on the first log call, *before* numba
+  ran (the ~12–21 s was matplotlib font-cache + the child's import graph). CI
+  passed because its runners attach a console, so `sys.stdout` is a real stream.
+- **Fix** — Commits `5472cf8` (root cause) + `ec536e2` (belt-and-braces), files
+  `core/hvsr_compute.py`, `__main__.py`. Layers: (1) `_compute_server_main`
+  redirects `None` `sys.stdout`/`sys.stderr` to `os.devnull` AND pins the
+  child's structlog `logger_factory` to that devnull file, so the child never
+  reaches for `sys.stdout`; (2) `SubprocessHvsrComputeClient` gains an
+  in-process fallback — on a child compute error it re-runs in-process and, if
+  that succeeds (broken child environment), latches `subprocess_broken` so
+  later computes skip the doomed child (degraded, GIL-bound, but HVSR WORKS);
+  (3) the child now forwards the full traceback over the pipe (it is a separate
+  process — the pipe was the only window into the failure), and `--check` logs
+  a loud WARNING when it falls back instead of failing the build. Verified on
+  the field box: `0.1.4.dev2` logs `hvsr_subprocess_compute_done` (off-process,
+  no fallback) and `check_ok`.
+- **Lesson learned** — A spawned/forked child of a `--windowed` frozen app MUST
+  assume `sys.stdout`/`sys.stderr` are `None` and give every logging/printing
+  library an explicit sink before first use; never rely on a default factory
+  that writes to `sys.stdout`. And a cross-process worker MUST forward the
+  child's full traceback, not `str(exc)` — the pipe is the only diagnostic
+  channel. CI runners have a console; field GUIs do not, so a packaged smoke
+  that must catch this has to run without an attached console.
+
 ### 2026-06-18 — Stall watchdog cried wolf: an in-process GIL freeze read as a "silent" device
 
 - **Symptom** — v0.1.2 logged `seedlink_stream_stalled` (`silent_s` ~5.2–5.8,
