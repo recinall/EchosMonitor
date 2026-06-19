@@ -8,6 +8,24 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-06-19
+
+### Fixed
+- **HVSR worked on Linux/macOS but was dead on Windows (critical).** The v0.1.3
+  off-process HVSR child crashed on every compute on real Windows with
+  `cannot create weak reference to 'NoneType' object`, and the packaged
+  `--check` failed — yet CI passed, so the broken bundle shipped. Cause: a
+  windowed (`console=False`) PyInstaller **spawn** child has `sys.stdout is
+  None`, and the child's structlog used the default `PrintLogger` (writes to
+  `sys.stdout`), so the first compute log line blew up before numba even ran.
+  CI runners attach a console, hiding it. The child now gives `None` std
+  streams a `devnull` sink and pins structlog to it, so off-process HVSR works
+  on Windows again (GIL protection restored). As belt-and-braces, the compute
+  client now falls back to an in-process compute if the spawn child cannot run
+  at all (degraded — GIL-bound — but HVSR stays functional), forwards the
+  child's full traceback over the pipe, and `--check` logs a loud warning when
+  it falls back. (See docs/POSTMORTEMS.md, 2026-06-19.)
+
 ## [0.1.3] — 2026-06-18
 
 ### Fixed

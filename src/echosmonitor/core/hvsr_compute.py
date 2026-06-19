@@ -47,8 +47,11 @@ from __future__ import annotations
 
 import contextlib
 import multiprocessing
+import os
+import sys
 import threading
 import time
+import traceback
 from typing import TYPE_CHECKING, Protocol
 
 import structlog
@@ -124,9 +127,24 @@ def _compute_server_main(conn: Connection) -> None:
     across the pipe — a failed compute is an ``("err", message)`` response, a
     closed pipe ends the loop.
     """
-    # The child's structlog is unconfigured; silence the compute's own
-    # INFO/WARNING lines so they do not interleave on the shared stderr.
-    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(_CHILD_LOG_FLOOR))
+    # A windowed (console=False) PyInstaller child has sys.stdout/sys.stderr ==
+    # None. structlog's DEFAULT PrintLogger writes to sys.stdout, so the first
+    # log line inside accumulator.compute() (and any matplotlib/hvsrpy print)
+    # blows up with "cannot create weak reference to 'NoneType' object" — the
+    # whole v0.1.3 Windows HVSR field bug, invisible on CI runners (which DO
+    # have a console). Two defences: give the streams a real sink, AND pin the
+    # child's structlog to that sink so it never reaches for sys.stdout at all.
+    sink = open(os.devnull, "w")  # noqa: SIM115 (lives for the child's lifetime)
+    if sys.stdout is None:
+        sys.stdout = sink
+    if sys.stderr is None:
+        sys.stderr = sink
+    # Silence the compute's own INFO/WARNING lines (the parent owns
+    # observability) AND route them to devnull, never the inherited stdout.
+    structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(_CHILD_LOG_FLOOR),
+        logger_factory=structlog.PrintLoggerFactory(file=sink),
+    )
     try:
         while True:
             try:
@@ -140,7 +158,14 @@ def _compute_server_main(conn: Connection) -> None:
             try:
                 result = payload.compute()
             except Exception as exc:
-                conn.send((_RESP_ERR, str(exc)))
+                # Forward the FULL traceback, not just str(exc): the child is a
+                # separate OS process, so this pipe is the parent's ONLY window
+                # into a failure. Without it the v0.1.3 Windows field bug read
+                # as a bare "cannot create weak reference to 'NoneType' object"
+                # with no frame — it was actually structlog's PrintLogger hitting
+                # the windowed child's None sys.stdout (fixed in
+                # _compute_server_main), NOT numba. Tuple: (short, traceback).
+                conn.send((_RESP_ERR, (str(exc), traceback.format_exc())))
                 continue
             conn.send((_RESP_OK, result))
     finally:
@@ -154,6 +179,17 @@ class SubprocessHvsrComputeClient:
     Owned by ONE worker thread (the caller of :meth:`compute`); :meth:`close`
     is called by the owner only after that thread has joined. The internal
     lock is belt-and-suspenders against a stray concurrent call.
+
+    **Degraded fallback.** If the spawn child cannot run the compute at all
+    (its ENVIRONMENT is broken), the client re-runs that compute in-process
+    and, on success, latches :attr:`subprocess_broken` so every later compute
+    skips the doomed child. This forfeits the GIL protection (rule 1) on that
+    platform but keeps HVSR FUNCTIONAL — a hard failure of the whole feature is
+    the worse outcome. It is belt-and-suspenders: the one known break (the
+    v0.1.3 None-``sys.stdout`` structlog crash in a windowed frozen child) is
+    fixed at the source in :func:`_compute_server_main`, so on a current bundle
+    the child runs and this path never triggers. See
+    :meth:`_fallback_in_process`.
     """
 
     def __init__(self) -> None:
@@ -162,6 +198,22 @@ class SubprocessHvsrComputeClient:
         self._proc: BaseProcess | None = None
         self._conn: Connection | None = None
         self._closed = False
+        # Latched True when the spawn child proves its ENVIRONMENT is unusable
+        # (it fails a compute the parent then completes in-process). Set once,
+        # never cleared: every later compute then skips the doomed child and
+        # runs in-process. See :meth:`_fallback_in_process`.
+        self._subprocess_broken = False
+
+    @property
+    def subprocess_broken(self) -> bool:
+        """True once the client has fallen back to in-process compute.
+
+        The off-process boundary is the GIL fix (rule 1); if the child cannot
+        run at all the client degrades to in-process so HVSR still WORKS.
+        Callers (e.g. the packaged ``--check``) read this to surface that the
+        GIL protection is inactive without failing.
+        """
+        return self._subprocess_broken
 
     def _ensure_child(self) -> Connection:
         proc = self._proc
@@ -188,6 +240,11 @@ class SubprocessHvsrComputeClient:
         with self._lock:
             if self._closed:
                 raise HvsrError("hvsr compute client is closed")
+            if self._subprocess_broken:
+                # Environment proven unusable on a prior compute: skip the
+                # doomed spawn and run in-process (degraded, GIL-bound). No
+                # log here — the fallback was announced once when it latched.
+                return self._compute_in_process(accumulator)
             conn = self._ensure_child()
             n_windows = accumulator.n_windows
             t0 = time.monotonic()
@@ -222,18 +279,75 @@ class SubprocessHvsrComputeClient:
                 raise HvsrError(f"hvsr compute subprocess recv failed: {exc}") from exc
             elapsed_ms = (time.monotonic() - t0) * 1000.0
             if tag == _RESP_ERR:
+                short, child_tb = (
+                    payload if isinstance(payload, tuple) else (str(payload), "")
+                )
                 _log.warning(
                     "hvsr_subprocess_compute_error",
-                    error=str(payload),
+                    error=short,
+                    child_traceback=child_tb,
                     elapsed_ms=round(elapsed_ms, 1),
                 )
-                raise HvsrError(str(payload))
+                # Distinguish a real input error from a broken child ENVIRONMENT
+                # by re-running in-process (see _fallback_in_process).
+                return self._fallback_in_process(accumulator, short)
             _log.info(
                 "hvsr_subprocess_compute_done",
                 n_windows=n_windows,
                 elapsed_ms=round(elapsed_ms, 1),
             )
             return payload  # type: ignore[no-any-return]
+
+    def _fallback_in_process(
+        self, accumulator: HvsrAccumulator, child_error: str
+    ) -> HvsrResult:
+        """Resolve a child compute failure by re-running in-process.
+
+        The child raised. Two causes are indistinguishable from the parent: a
+        genuine INPUT error (a degenerate accumulator — in-process raises the
+        SAME ``HvsrError``) and a broken child ENVIRONMENT (the parent process
+        computes fine — as HVSR did before it moved off-process). So re-run the
+        compute here:
+
+        * in-process RAISES → it was a real input error: surface the child's
+          (already-logged) message and keep the healthy child untouched.
+        * in-process SUCCEEDS → the child environment is unusable. Latch the
+          fallback (every later compute goes straight in-process), drop the
+          doomed child, and announce it once. Degraded — the compute is now
+          GIL-bound (rule 1's stutter) — but HVSR WORKS, which beats a hard
+          failure for the whole feature on that platform.
+
+        Caller holds ``self._lock``.
+        """
+        try:
+            result = accumulator.compute()
+        except Exception as exc:
+            raise HvsrError(child_error) from exc
+        if not self._subprocess_broken:
+            self._subprocess_broken = True
+            _log.warning(
+                "hvsr_subprocess_fallback_in_process",
+                reason="off-process compute failed but in-process succeeded",
+                detail="GIL protection (rule 1) is now inactive for HVSR",
+                child_error=child_error,
+            )
+            self._drop_child()
+        return result
+
+    def _compute_in_process(self, accumulator: HvsrAccumulator) -> HvsrResult:
+        """Run the compute on the calling thread (latched-fallback fast path).
+
+        Like :class:`InProcessHvsrComputeClient`, ``should_stop`` is unobserved
+        here: numba cannot be unwound mid-flight, so a cancel waits out the
+        whole compute (rule 7 is degraded in this already-degraded path). The
+        worker's latest-wins checks AROUND the call still hold between computes.
+        """
+        try:
+            return accumulator.compute()
+        except HvsrError:
+            raise
+        except Exception as exc:
+            raise HvsrError(f"in-process hvsr compute failed: {exc}") from exc
 
     def close(self, *, timeout_s: float = _CLOSE_JOIN_S) -> None:
         with self._lock:
