@@ -27,7 +27,12 @@ from echosmonitor.config.schema import (
     UiConfig,
 )
 from echosmonitor.core.models import StreamID
-from echosmonitor.core.streaming_engine import StreamingEngine
+from echosmonitor.core.streaming_engine import (
+    _REPLAY_MIN_OVERLAP_S,
+    StreamingEngine,
+    _replay_action,
+    _windows_match,
+)
 from tests.core.fakes import FakeSeedLinkServer, FakeSeedLinkServerConfig
 from tests.core.test_seedlink_worker import fake_server, loop_thread  # noqa: F401
 from tests.core.test_streaming_engine_multi import (
@@ -574,3 +579,325 @@ def test_resolve_archive_root_platformdirs_fallback() -> None:
     resolved = engine._resolve_archive_root(cfg.devices[0])
     assert resolved == resolve_base_archive_root(cfg)
     assert resolved.name == "archive"
+
+
+# ---------------------------------------------------------------------------
+# Reconnect-replay dedup (verified 2026-07-01: overlaps >= 3 s are
+# byte-identical re-sends of the device ring buffer after a reconnect; the
+# append-only writer would otherwise persist them as backward-timestamped
+# overlaps). See ``_replay_action`` / ``_REPLAY_MIN_OVERLAP_S``.
+# ---------------------------------------------------------------------------
+
+_FS = 500.0
+
+
+def test_replay_action_passes_forward_and_jitter() -> None:
+    fs = _FS
+    wm = 1000.0  # frontier at t=1000 s
+    dt = 1.0 / fs
+    # Strictly forward (next sample after frontier).
+    assert _replay_action(wm, wm + dt, wm + dt + 0.2, fs) == ("pass", None)
+    # A legitimate forward gap is never touched.
+    assert _replay_action(wm, wm + 5.0, wm + 5.2, fs) == ("pass", None)
+    # Device stamp jitter of -2 samples (M6.5-B territory) stays a pass.
+    assert _replay_action(wm, wm - 2 * dt, wm + 0.2, fs) == ("pass", None)
+    # A sub-threshold (chronic ~1 s) overlap is left alone — those samples
+    # are NOT clean duplicates, so dedup would drop real data.
+    assert _replay_action(wm, wm - 1.0, wm + 0.2, fs) == ("pass", None)
+    assert _replay_action(wm, wm - (_REPLAY_MIN_OVERLAP_S - 0.01), wm + 0.2, fs) == ("pass", None)
+
+
+def test_replay_action_drops_full_replay() -> None:
+    fs = _FS
+    wm = 1000.0
+    # A block that starts 9.6 s behind the frontier and ends before it:
+    # a full reconnect replay of data we already hold.
+    action, arg = _replay_action(wm, wm - 9.6, wm - 6.0, fs)
+    assert action == "drop"
+    assert arg is None
+
+
+def test_replay_action_trims_partial_replay() -> None:
+    fs = _FS
+    wm = 1000.0
+    # Starts 4 s behind the frontier but its tail runs 1 s past it: keep only
+    # the tail, trimming at the frontier + half a sample.
+    action, trim_start = _replay_action(wm, wm - 4.0, wm + 1.0, fs)
+    assert action == "trim"
+    assert trim_start == pytest.approx(wm + 0.5 / fs)
+
+
+def _feed_forward(engine: StreamingEngine, t0, n_packets: int, npts: int):
+    """Inject ``n_packets`` contiguous forward packets; return the next start."""
+    from obspy import Trace
+
+    for i in range(n_packets):
+        tr = Trace(
+            data=(np.arange(npts, dtype=np.int32) % 100),
+            header={
+                "network": "XX",
+                "station": "RPL",
+                "location": "00",
+                "channel": "HHZ",
+                "sampling_rate": _FS,
+                "starttime": t0 + i * npts / _FS,
+            },
+        )
+        engine._on_packet("dev", tr)
+    return t0 + n_packets * npts / _FS
+
+
+@pytest.fixture
+def _replay_engine(tmp_path: Path) -> Iterator[tuple[StreamingEngine, Path]]:
+    archive_root = tmp_path / "archive"
+    cfg = _make_root_cfg(
+        devices=[
+            DeviceConfig(
+                name="dev",
+                host="192.0.2.1",  # unroutable: only injected packets flow
+                port=18000,
+                reconnect=ReconnectConfig(
+                    initial_delay_s=3600.0, max_delay_s=3600.0, connect_timeout_s=0.5
+                ),
+                selectors=[
+                    StreamSelectorConfig(
+                        network="XX", station="RPL", location="00", channel="HHZ"
+                    )
+                ],
+                archive=ArchiveConfig(enabled=True, fsync_interval_s=0.5),
+            )
+        ],
+        archive_root=archive_root,
+    )
+    engine = StreamingEngine(cfg)
+    engine.start_session("rpl", ["dev"])
+    try:
+        yield engine, archive_root
+    finally:
+        engine.stop()
+
+
+def _on_disk(archive_root: Path) -> Stream:
+    merged = Stream()
+    for f in archive_root.rglob("*RPL*"):
+        if f.is_file():
+            merged += read(str(f))
+    return merged
+
+
+def test_reconnect_replay_dropped_from_archive(
+    qtbot, _replay_engine, capture_structlog
+) -> None:
+    """A full reconnect replay (>= 3 s behind the frontier) never reaches the
+    SDS: the archive stays exactly the forward stream, one contiguous segment,
+    and the drop is logged."""
+    from obspy import Trace, UTCDateTime
+
+    engine, archive_root = _replay_engine
+    npts = 100
+    t0 = UTCDateTime("2026-06-30T00:00:00")
+    # 20 forward packets → 4.0 s of data; frontier at t0 + 3.998 s.
+    nxt = _feed_forward(engine, t0, 20, npts)
+
+    # Reconnect replay: a block starting 3.6 s behind the frontier, wholly
+    # behind it — a byte-identical re-send of data already written.
+    replay = Trace(
+        data=(np.arange(npts, dtype=np.int32) % 100),
+        header={
+            "network": "XX",
+            "station": "RPL",
+            "location": "00",
+            "channel": "HHZ",
+            "sampling_rate": _FS,
+            "starttime": t0 + 0.4,
+        },
+    )
+    engine._on_packet("dev", replay)
+
+    # Streaming resumes forward from where it left off.
+    _feed_forward(engine, nxt, 2, npts)
+
+    assert _wait_until(
+        lambda: sum(tr.stats.npts for tr in _on_disk(archive_root)) >= 22 * npts,
+        timeout_s=15.0,
+        qtbot=qtbot,
+    )
+    merged = _on_disk(archive_root)
+    merged.merge(method=0)
+    assert len(merged) == 1, f"replay fragmented the archive into {len(merged)} segments"
+    assert not np.ma.is_masked(merged[0].data)
+    # Exactly the forward samples — the 100-sample replay was dropped, not
+    # appended (which would show 23 * npts and an overlap).
+    assert merged[0].stats.npts == 22 * npts
+    drops = [
+        r
+        for r in capture_structlog
+        if r.get("event") == "streaming_engine_reconnect_replay" and r.get("action") == "drop"
+    ]
+    assert drops, "a dropped reconnect replay must be logged (rule 5)"
+
+
+def test_partial_reconnect_replay_trimmed_to_new_tail(qtbot, _replay_engine) -> None:
+    """A replay that overlaps >= 3 s but whose tail extends past the frontier
+    is trimmed to its new tail: the archive gains the fresh samples with no
+    duplicated overlap."""
+    from obspy import Trace, UTCDateTime
+
+    engine, archive_root = _replay_engine
+    npts = 100
+    t0 = UTCDateTime("2026-06-30T00:00:00")
+    _feed_forward(engine, t0, 20, npts)  # frontier at t0 + 3.998 s
+
+    # 5.0 s block starting 3.6 s behind the frontier: [t0+0.4, t0+5.398].
+    # Its head duplicates the forward stream; its ~1.4 s tail is new.
+    tail_npts = 2500
+    replay = Trace(
+        data=(np.arange(tail_npts, dtype=np.int32) % 100),
+        header={
+            "network": "XX",
+            "station": "RPL",
+            "location": "00",
+            "channel": "HHZ",
+            "sampling_rate": _FS,
+            "starttime": t0 + 0.4,
+        },
+    )
+    engine._on_packet("dev", replay)
+
+    # Coverage is [t0, t0+5.398] → 2700 samples, one contiguous segment.
+    expected = round(5.398 * _FS) + 1
+    assert _wait_until(
+        lambda: sum(tr.stats.npts for tr in _on_disk(archive_root)) >= 20 * npts + 100,
+        timeout_s=15.0,
+        qtbot=qtbot,
+    )
+    merged = _on_disk(archive_root)
+    merged.merge(method=0)
+    assert len(merged) == 1, f"trimmed replay left {len(merged)} segments"
+    assert not np.ma.is_masked(merged[0].data)
+    # More than the forward stream (tail added) but far less than forward +
+    # full replay (2000 + 2500) — the duplicated head was trimmed away.
+    assert 20 * npts < merged[0].stats.npts < 20 * npts + tail_npts
+    # Exact contiguous coverage: the trim leaves no duplicated boundary sample
+    # and no gap at the seam.
+    assert merged[0].stats.npts == expected
+
+
+def test_monitoring_stop_clears_replay_watermark(tmp_path: Path) -> None:
+    """A MONITORING-only device (no writer) must have its replay frontier
+    cleared on stop. Regression for the auditor finding (2026-07-01): the
+    watermark is populated unconditionally in ``_on_packet``, so if cleanup
+    lived only in the archive-writer teardown, a stop→restart across the
+    device's nightly backward clock resync (~00:23 UTC, -8..-12 s) would
+    classify the fresh live packets as a >= 3 s replay and silently drop
+    them. A mere reconnect never calls ``_stop_device``, so the frontier
+    still persists across reconnects (covered by the drop/trim tests)."""
+    from obspy import UTCDateTime
+
+    from echosmonitor.core.models import device_stream_key
+
+    cfg = _make_root_cfg(
+        devices=[
+            DeviceConfig(
+                name="dev",
+                host="192.0.2.1",
+                port=18000,
+                reconnect=ReconnectConfig(
+                    initial_delay_s=3600.0, max_delay_s=3600.0, connect_timeout_s=0.5
+                ),
+                selectors=[
+                    StreamSelectorConfig(
+                        network="XX", station="RPL", location="00", channel="HHZ"
+                    )
+                ],
+                archive=ArchiveConfig(enabled=False),  # monitoring only — no writer
+            )
+        ],
+        archive_root=tmp_path / "archive",
+    )
+    engine = StreamingEngine(cfg)
+    key = device_stream_key("dev", "XX.RPL.00.HHZ")
+    npts = 100
+    t0 = UTCDateTime("2026-06-30T00:00:00")
+    _feed_forward(engine, t0, 20, npts)  # builds the frontier at ~t0 + 4 s
+    assert key in engine._replay_watermark
+
+    engine._stop_device("dev")
+    assert key not in engine._replay_watermark, (
+        "a monitoring-only stop must clear the replay frontier"
+    )
+
+    # Restart after a ~10 s backward clock resync. Without the clear these
+    # would be dropped against the stale ~t0+4 s frontier; with it the
+    # frontier is rebuilt from the fresh (earlier) stamps.
+    _feed_forward(engine, t0 - 10.0, 3, npts)
+    assert key in engine._replay_watermark
+    assert engine._replay_watermark[key] < t0, (
+        "fresh backward-stepped packets were dropped instead of accepted"
+    )
+
+
+def test_windows_match_confirms_replay_rejects_new_data() -> None:
+    rng = np.random.default_rng(1)
+    w = rng.standard_normal(500).astype(np.float32)
+    # Identical → match; shifted by 1 sample (sub-sample-jitter proxy) → match.
+    assert _windows_match(w, w.copy())
+    assert _windows_match(w[1:], w[:-1])
+    # A different waveform → rejected (this is the science-path guard).
+    assert not _windows_match(w, rng.standard_normal(500).astype(np.float32))
+    # Too few samples to confirm → rejected.
+    assert not _windows_match(w[:10], w[:10].copy())
+    # Constant windows: exact-equality fallback, offset-invariance must NOT
+    # make two different constants match.
+    c = np.full(200, 3.0, dtype=np.float32)
+    assert _windows_match(c, c.copy())
+    assert not _windows_match(c, np.full(200, 4.0, dtype=np.float32))
+
+
+def test_unconfirmed_backward_step_is_kept_not_dropped(
+    qtbot, _replay_engine, capture_structlog
+) -> None:
+    """A >= 3 s backward step whose samples do NOT match already-held data is a
+    genuine device clock reset carrying new content — it must be KEPT (deferred
+    to the gap detector), never dropped as a phantom replay. Guards the
+    code-review blocker: the 3 s magnitude gate alone must not decide."""
+    from obspy import Trace, UTCDateTime
+
+    engine, archive_root = _replay_engine
+    npts = 100
+    t0 = UTCDateTime("2026-06-30T00:00:00")
+    _feed_forward(engine, t0, 20, npts)  # ramp data; frontier at t0 + 3.998 s
+
+    # A block 3.6 s behind the frontier but carrying DIFFERENT samples
+    # (random, not the ring's ramp) — a real reset, not a re-send.
+    rng = np.random.default_rng(42)
+    reset = Trace(
+        data=rng.integers(-1000, 1000, npts).astype(np.int32),
+        header={
+            "network": "XX",
+            "station": "RPL",
+            "location": "00",
+            "channel": "HHZ",
+            "sampling_rate": _FS,
+            "starttime": t0 + 0.4,
+        },
+    )
+    engine._on_packet("dev", reset)
+
+    assert _wait_until(
+        lambda: sum(tr.stats.npts for tr in _on_disk(archive_root)) >= 21 * npts,
+        timeout_s=15.0,
+        qtbot=qtbot,
+    )
+    total = sum(tr.stats.npts for tr in _on_disk(archive_root))
+    assert total == 21 * npts, "genuine-reset samples must be kept, not dropped"
+    dedups = [
+        r
+        for r in capture_structlog
+        if r.get("event") == "streaming_engine_reconnect_replay"
+        and r.get("action") in ("drop", "trim")
+    ]
+    assert not dedups, "an unconfirmed backward step must not be dedup'd"
+    # The gap detector's clock-jump handling still fires — observability of the
+    # real event is preserved.
+    assert any(r.get("event") == "gap_detector_clock_jump" for r in capture_structlog)

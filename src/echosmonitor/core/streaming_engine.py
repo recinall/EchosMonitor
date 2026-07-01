@@ -119,6 +119,118 @@ _CHAIN_QUEUE_MAX_SAMPLES = 20000
 # float32 = 4 bytes per sample; used for the ring-buffer memory-cost log.
 _BYTES_PER_SAMPLE = 4
 
+
+# Only a backward step of at least this many seconds is treated as a
+# reconnect replay. Empirical basis (2026-07-01, sessions Notte7 + Monitor1,
+# 500 Hz x 3 ch): EVERY overlap >= 3 s cross-correlates at 1.0000@lag0 with
+# the data already on disk — a byte-identical re-send of the device ring
+# buffer after a reconnect. Overlaps < 2 s are a different, mid-stream
+# phenomenon (per-packet catch-up blocks) whose overlapping samples are NOT
+# clean duplicates (scattered xcorr 0.6-0.98); dedup'ing those would DROP
+# real data. The 2-3 s band is near-empty (0 of 340 in Notte7). 3 s sits in
+# that empty gap and stays comfortably above device stamp jitter (+/-2
+# samples = 4 ms), so it also leaves the M6.5-B rectification path untouched.
+_REPLAY_MIN_OVERLAP_S = 3.0
+
+
+def _replay_action(
+    watermark_ts: float,
+    start_ts: float,
+    end_ts: float,
+    fs: float,
+    min_overlap_s: float = _REPLAY_MIN_OVERLAP_S,
+) -> tuple[str, float | None]:
+    """Classify an incoming packet against the per-stream replay frontier.
+
+    A SeedLink reconnect makes the device re-stream its ring buffer — data
+    already written — which obspy delivers as a backward-timestamped Trace.
+    ``watermark_ts`` is the end time of the last sample already forwarded for
+    this stream; a packet whose first sample sits ``min_overlap_s`` or more
+    behind it is a verified reconnect replay (see ``_REPLAY_MIN_OVERLAP_S``).
+    All args are POSIX-epoch seconds; ``fs`` is the sampling rate. Pure (no
+    obspy/Qt) so it is unit-testable in isolation.
+
+    Returns one of:
+
+    * ``("pass", None)`` — forward data, device stamp jitter, or a
+      sub-threshold (< ``min_overlap_s``) overlap: left exactly as-is, so
+      neither a legitimate forward gap nor the mid-stream catch-up overlaps
+      are ever disturbed.
+    * ``("drop", None)`` — a full replay wholly at/behind the frontier;
+      the caller discards the whole trace.
+    * ``("trim", trim_start_ts)`` — a partial replay whose tail extends past
+      the frontier; the caller keeps only samples after ``trim_start_ts``.
+    """
+    if watermark_ts - start_ts < min_overlap_s:
+        return ("pass", None)
+    half = 0.5 / fs
+    if end_ts <= watermark_ts + half:
+        return ("drop", None)
+    return ("trim", watermark_ts + half)
+
+
+# Content confirmation for a candidate replay. Before dropping/trimming any
+# science-path data we require its overlapping samples to actually MATCH what
+# the ring buffer already holds. This makes the dedup safe against a genuine
+# device clock reset that carries NEW data: such a >= 3 s backward step fails
+# the match, is left untouched, and defers to the GapDetector's clock-jump
+# handling (which keeps it and logs ``gap_detector_clock_jump``). The re-send
+# can be sub-sample jittered by 1-2 samples (xcorr ~1.0 at a small lag), so the
+# match is a normalized correlation over a small integer-lag search; genuinely
+# different ground motion stays well below the threshold.
+_REPLAY_CONFIRM_MIN_SAMPLES = 50
+_REPLAY_CONFIRM_CORR = 0.95
+# Lag headroom for the correlation search. It must cover TWO effects that add:
+# the systematic +1-sample offset baked into ``_confirm_replay`` (``read_last``
+# returns ring indices 1..M against replay indices 0..M-1) PLUS the device's
+# own ±2-sample stamp jitter — so a true match can land at lag 3. Anything
+# beyond simply falls out as "keep" (fail-safe), so do not shrink this without
+# re-deriving that budget.
+_REPLAY_CONFIRM_MAX_LAG = 3
+
+
+def _windows_match(
+    a: np.ndarray,
+    b: np.ndarray,
+    max_lag: int = _REPLAY_CONFIRM_MAX_LAG,
+    threshold: float = _REPLAY_CONFIRM_CORR,
+) -> bool:
+    """True if float windows ``a`` and ``b`` are the same waveform within a
+    small integer lag (a byte-identical-ish re-send).
+
+    Normalized cross-correlation, peak over ``[-max_lag, max_lag]``. A
+    (near-)constant window has undefined correlation, so those fall back to
+    exact equality. Pure (no obspy/Qt) — unit-testable in isolation.
+    """
+    n = min(a.shape[0], b.shape[0])
+    if n < _REPLAY_CONFIRM_MIN_SAMPLES:
+        return False
+    ra = a[-n:].astype(np.float64)
+    rb = b[-n:].astype(np.float64)
+    best = 0.0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            x, y = ra[-lag:], rb[: n + lag]
+        elif lag > 0:
+            x, y = ra[: n - lag], rb[lag:]
+        else:
+            x, y = ra, rb
+        if x.shape[0] < _REPLAY_CONFIRM_MIN_SAMPLES:
+            continue
+        xd = x - x.mean()
+        yd = y - y.mean()
+        dx = float(np.dot(xd, xd))
+        dy = float(np.dot(yd, yd))
+        if dx == 0.0 or dy == 0.0:
+            # A constant window has undefined correlation; a bit-identical
+            # constant re-send is exactly equal, a different constant is not.
+            if np.array_equal(x, y):
+                return True
+            continue
+        c = float(np.dot(xd, yd)) / (dx * dy) ** 0.5
+        best = max(best, c)
+    return best >= threshold
+
 # Stall watchdog (Bug 2). The expected packet cadence is derived from the
 # stream itself — a device emits one ~``npts``-sample packet every ``npts/fs``
 # seconds of data — so the stall threshold ADAPTS to the sampling rate instead
@@ -644,6 +756,21 @@ class StreamingEngine(QObject):
         self._archive_jitter_tol_s: dict[str, float] = {}
         self._rect_pending: dict[str, tuple[int, float]] = {}
         self._rect_last_log: dict[str, float] = {}
+        # Reconnect-replay dedup (verified 2026-07-01). A SeedLink reconnect
+        # makes the device re-send its ring buffer — data we already hold —
+        # which obspy delivers as a backward-timestamped Trace. The
+        # append-only SDS writer cannot dedup (it only appends), so an
+        # untrimmed replay lands as a multi-second overlap and the ring
+        # buffer ingests it out of order. ``_replay_watermark`` maps composite
+        # stream key → end time of the last sample forwarded; anything at or
+        # behind it is dropped/trimmed in ``_on_packet`` before ANY consumer
+        # sees it. It PERSISTS across reconnects (the worker reconnects; the
+        # engine stays up — that persistence is what catches the replay) and
+        # is cleared on device stop / session swap alongside the GapDetector.
+        # ``_replay_drop_pending`` throttles the drop log like ``_rect_*``.
+        self._replay_watermark: dict[str, UTCDateTime] = {}
+        self._replay_drop_pending: dict[str, tuple[int, float]] = {}
+        self._replay_last_log: dict[str, float] = {}
         # Distinct SDS paths the writer has touched this session per
         # device. ``len(set)`` populates ``DeviceStatus.archive_files_open``.
         self._archive_paths_seen: dict[str, set[Path]] = {}
@@ -1004,6 +1131,9 @@ class StreamingEngine(QObject):
         self._pending_gaps.clear()
         self._rect_pending.clear()
         self._rect_last_log.clear()
+        self._replay_watermark.clear()
+        self._replay_drop_pending.clear()
+        self._replay_last_log.clear()
         # A detection open across a DAO swap stays an open row in the
         # closing DB (crash-equivalent semantics) and its later close
         # lands as a separate closed row in the next DB. Rare (STA/LTA
@@ -1609,12 +1739,13 @@ class StreamingEngine(QObject):
         nslc = sid.nslc
         key = device_stream_key(device_name, nslc)
         fs = float(trace.stats.sampling_rate)
-        endtime = trace.stats.endtime
-        samples = np.ascontiguousarray(trace.data, dtype=np.float32)
 
         # Stall watchdog (Bug 2): record arrival + the sampling-rate-derived
         # expected cadence (one ~npts-sample packet every npts/fs s of data).
         # A device flagged stalled that produces a packet has recovered.
+        # This runs BEFORE the replay dedup below on purpose: a reconnect's
+        # replayed packet still proves the connection is alive, so it must
+        # clear the stall flag even if its samples are subsequently dropped.
         self._last_packet_monotonic[device_name] = time.monotonic()
         if fs > 0.0:
             self._expected_packet_interval_s[device_name] = float(trace.stats.npts) / fs
@@ -1622,6 +1753,44 @@ class StreamingEngine(QObject):
             self._stalled.discard(device_name)
             _log.info("seedlink_stream_resumed", device=device_name)
             self.streamStalled.emit(device_name, False)
+
+        # Reconnect-replay dedup (see ``_replay_watermark`` init / rule 8). A
+        # >= 3 s backward step is treated as a replay ONLY once its overlapping
+        # samples are confirmed to match (cross-correlation, small-lag) what the
+        # ring buffer already holds (``_confirm_replay``). A confirmed full
+        # replay is dropped and a partial one trimmed BEFORE the ring buffer,
+        # DSP, gap detector or the append-only writer see it. An UNCONFIRMED
+        # big backward step is a
+        # genuine device clock reset carrying new data: it is left untouched
+        # (the GapDetector keeps it and logs the clock jump) and its timeline
+        # is adopted as the new frontier. Forward data and sub-threshold jitter
+        # always pass.
+        wm = self._replay_watermark.get(key)
+        reset = False
+        if wm is not None and fs > 0.0:
+            action, trim_start = _replay_action(
+                wm.timestamp,
+                trace.stats.starttime.timestamp,
+                trace.stats.endtime.timestamp,
+                fs,
+            )
+            if action != "pass":
+                overlap_s = float(wm - trace.stats.starttime)
+                if self._confirm_replay(key, trace, wm, fs):
+                    self._note_replay(device_name, nslc, key, overlap_s, action)
+                    if action == "drop":
+                        return
+                    trace = trace.slice(starttime=_UTCDateTime(trim_start))
+                    if trace.stats.npts == 0:
+                        return
+                else:
+                    reset = True
+
+        endtime = trace.stats.endtime
+        samples = np.ascontiguousarray(trace.data, dtype=np.float32)
+        # Advance the frontier: monotonic for forward data and trimmed replay
+        # tails; adopt the (earlier) timeline of an accepted clock reset.
+        self._replay_watermark[key] = endtime if (wm is None or reset) else max(wm, endtime)
 
         if key not in self._buffers:
             capacity = max(1, int(self._window_seconds * fs * 2))
@@ -2246,6 +2415,31 @@ class StreamingEngine(QObject):
         self._last_packet_monotonic.pop(name, None)
         self._expected_packet_interval_s.pop(name, None)
         self._stalled.discard(name)
+        # Reconnect-replay frontier + throttle state. Populated
+        # UNCONDITIONALLY in ``_on_packet`` (monitoring AND recording), so it
+        # must be cleared here on EVERY device stop — not in
+        # ``_teardown_archive_writer``, which a monitoring-only device never
+        # reaches. Leaving a stale watermark would make a stop→restart across
+        # the device's nightly backward clock resync (~00:23 UTC, -8..-12 s)
+        # look like a >=3 s replay and silently drop the fresh live packets.
+        # A mere SeedLink reconnect never enters ``_stop_device``, so the
+        # frontier still persists across reconnects — which is what catches
+        # the real replay.
+        prefix = f"{name}{DEVICE_KEY_SEP}"
+        for stale_key in [k for k in self._replay_watermark if k.startswith(prefix)]:
+            self._replay_watermark.pop(stale_key, None)
+        for stale_key in [k for k in self._replay_drop_pending if k.startswith(prefix)]:
+            residual_count, residual_max = self._replay_drop_pending.pop(stale_key)
+            _log.info(
+                "streaming_engine_reconnect_replay",
+                device=name,
+                nslc=stale_key[len(prefix) :],
+                n_packets=residual_count,
+                max_overlap_s=round(residual_max, 3),
+                at="device_stop",
+            )
+        for stale_key in [k for k in self._replay_last_log if k.startswith(prefix)]:
+            self._replay_last_log.pop(stale_key, None)
         # Tear down the archive writer for this device. Per-device
         # writers are independent — stopping one's writer does not
         # affect the others. The writer's flush/close happens before
@@ -2850,6 +3044,61 @@ class StreamingEngine(QObject):
                 event.t_end,
                 event.samples_missing,
                 event.kind,
+            )
+
+    def _confirm_replay(self, key: str, trace: Trace, wm: UTCDateTime, fs: float) -> bool:
+        """Confirm a candidate replay by matching its overlapping head against
+        the ring buffer.
+
+        The trace's samples over ``[start, min(end, watermark)]`` are the
+        region that duplicates already-forwarded data; we compare them to the
+        ring samples covering the same span. Returns False — i.e. KEEP the
+        data — whenever the match cannot be positively established (no ring,
+        too few samples, or the ring no longer reaches back to ``start``). That
+        conservative default is what protects the science path: only a
+        re-send whose samples match already-held data (``_windows_match``) is
+        ever dropped.
+        """
+        ring = self._buffers.get(key)
+        if ring is None:
+            return False
+        start_ts = trace.stats.starttime.timestamp
+        ov_len = round((min(trace.stats.endtime.timestamp, wm.timestamp) - start_ts) * fs)
+        if ov_len < _REPLAY_CONFIRM_MIN_SAMPLES:
+            return False
+        depth = round((wm.timestamp - start_ts) * fs)
+        tail = ring.read_last(depth)
+        if tail.shape[0] < depth:
+            # Ring no longer holds data all the way back to ``start`` — the
+            # first ``ov_len`` samples would be misaligned. Can't confirm.
+            return False
+        head = np.ascontiguousarray(trace.data[:ov_len], dtype=np.float32)
+        return _windows_match(tail[:ov_len], head)
+
+    def _note_replay(
+        self, device_name: str, nslc: str, key: str, overlap_s: float, action: str
+    ) -> None:
+        """Accumulate a reconnect-replay drop/trim and log it, throttled.
+
+        Mirrors the ``_rect_*`` throttle (rule 5): at most one INFO line per
+        stream per ``_DROP_LOG_INTERVAL_S``, carrying the count, the largest
+        overlap and the most recent action (``drop``/``trim``) in the window.
+        The residual tally is flushed on stop in :meth:`_stop_device` so
+        session totals stay exact.
+        """
+        count, max_ov = self._replay_drop_pending.get(key, (0, 0.0))
+        self._replay_drop_pending[key] = (count + 1, max(max_ov, overlap_s))
+        now = time.monotonic()
+        if now - self._replay_last_log.get(key, 0.0) >= _DROP_LOG_INTERVAL_S:
+            logged_count, logged_max = self._replay_drop_pending.pop(key)
+            self._replay_last_log[key] = now
+            _log.info(
+                "streaming_engine_reconnect_replay",
+                device=device_name,
+                nslc=nslc,
+                action=action,
+                n_packets=logged_count,
+                max_overlap_s=round(logged_max, 3),
             )
 
     def _observe_gap(self, device_name: str, nslc: str, key: str, fs: float, trace: Trace) -> None:
