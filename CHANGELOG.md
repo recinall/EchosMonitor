@@ -8,6 +8,25 @@ milestone plan and decision log.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-07-01
+
+### Fixed
+- **Recurring multi-second overlaps in the SDS archive (reconnect replays).**
+  On a WiFi/AP loss the SeedLink connection drops; on reconnect the Echos
+  device re-streams its ring buffer — data already written — and obspy delivers
+  it as a backward-timestamped trace. The append-only writer could not
+  deduplicate, so it persisted these as multi-second overlaps (the deterministic
+  ~00:23 and ~12:23 UTC events, initially misread as a device clock resync, plus
+  any post-reconnect replay). The overlapping samples are byte-identical to the
+  data already on disk (cross-correlation ≈ 1.0). The streaming engine now keeps
+  a per-stream frontier and, for a backward step ≥ 3 s, **confirms the
+  overlapping samples match what the ring buffer already holds** before dropping
+  the full replay or trimming a partial one — ahead of the ring buffer, DSP, gap
+  detector and writer. A large backward step whose samples do **not** match is a
+  genuine clock reset carrying new data: it is kept and handled by the existing
+  clock-jump path, so no live data can ever be silently dropped. (See
+  docs/POSTMORTEMS.md, 2026-07-01.)
+
 ## [0.1.4] — 2026-06-19
 
 ### Fixed
@@ -134,6 +153,8 @@ Highlights, by milestone:
 - **M0:** the entire AI subsystem (agents/seisbench/torch/phasenet) and the
   generic-dashboard branding; the package was renamed to `echosmonitor`.
 
-[Unreleased]: https://github.com/recinall/EchosMonitor/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/recinall/EchosMonitor/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/recinall/EchosMonitor/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/recinall/EchosMonitor/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/recinall/EchosMonitor/compare/v0.1.2...v0.1.3
 [0.1.0]: https://github.com/recinall/EchosMonitor/releases/tag/v0.1.0

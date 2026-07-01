@@ -50,6 +50,49 @@ heading slug from comments that reference an invariant defended here.
 
 ## Entries
 
+### 2026-07-01 — Recurring multi-second SDS overlaps were reconnect replays, first misread as clock resyncs
+
+- **Symptom** — Archive browsing and gap analysis showed large backward
+  timestamp steps (−8 to −12 s, some −3 to −6 s) recurring deterministically
+  at ~00:23 and ~12:23 UTC across many sessions (Notte2/3/6/7, Temporale,
+  Monitor1), plus similar steps right after any device reconnect. `get_gaps`
+  reported them as overlaps, not gaps; obspy `merge` had to dedup them. My
+  first analysis attributed the 00:23/12:23 events to a device NTP/clock
+  resync (a backward clock correction) — plausible but wrong.
+- **Root cause** — They are **reconnect replays**, not clock steps. On WiFi/AP
+  loss the SeedLink connection drops; on reconnect the Echos device
+  re-streams its ring buffer — data the client already wrote — and obspy
+  delivers it as a backward-timestamped `Trace`. The append-only MSEED writer
+  (rule 8) cannot deduplicate; it only appends, so the replayed block landed
+  in the SDS as a multi-second overlap, and the ring buffer ingested it out of
+  order. The distinguishing evidence: the overlapping samples cross-correlate
+  at **1.0000@lag0** (byte-identical, equal std) with the data already on
+  disk — a clock resync would relabel *ongoing* (different) data, giving low
+  correlation. The engine had no per-stream frontier to notice the re-send.
+- **Fix** — Content-verified dedup in `StreamingEngine._on_packet`
+  (`core/streaming_engine.py`): a per-stream `_replay_watermark` (last
+  forwarded end-time; persists across reconnects, cleared in `_stop_device`),
+  a `>= 3 s` backward-step gate (`_replay_action` / `_REPLAY_MIN_OVERLAP_S`),
+  and — before dropping/trimming any data — `_confirm_replay`, which matches
+  the candidate's overlapping head against the ring-buffer samples for the
+  same span (`_windows_match`: normalized xcorr ≥ 0.95 over a ±3-sample lag).
+  Confirmed replay → dropped (full) / trimmed to its new tail (partial) before
+  ring/DSP/gap-detector/writer see it; UNCONFIRMED big step → kept and
+  deferred to the GapDetector's `gap_detector_clock_jump` handling, watermark
+  adopts the new timeline. Throttled `streaming_engine_reconnect_replay` log
+  (rule 5). Reviewed by qt-concurrency-auditor + code-reviewer.
+- **Lesson learned** — A backward-timestamped packet must be reconciled
+  against a per-stream frontier before it reaches the append-only persistence
+  boundary; the writer cannot fix what the engine forwards out of order.
+  Dropping duplicate data is only safe when the duplicate is **content-
+  confirmed** against what is already held — magnitude alone cannot separate a
+  redundant re-send from a genuine clock reset carrying new samples (both live
+  in the same 8–12 s band), and the fail-safe default on any doubt is to KEEP
+  and defer to the clock-jump path. And: verify a timing anomaly's *cause*
+  from the samples (cross-correlate the overlap) before naming it — "clock
+  resync" and "reconnect replay" look identical in a gap table but demand
+  opposite fixes.
+
 ### 2026-06-19 — HVSR dead on Windows: structlog's PrintLogger weakref'd a None sys.stdout in the spawn child
 
 - **Symptom** — On real Windows 10 22H2 the v0.1.3 portable launched fine
